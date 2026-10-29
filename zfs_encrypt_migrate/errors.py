@@ -21,6 +21,10 @@ class MigrationError(Exception):
         self.hints = tuple(hints)
 
 
+class Interrupted(MigrationError):  # noqa: N818
+    """The operator pressed Ctrl-C; the CLI exits 130 after printing the recovery hints."""
+
+
 class ZfsError(MigrationError):
     """A zfs or zpool command failed."""
 
