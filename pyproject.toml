@@ -1,0 +1,91 @@
+[project]
+name = "zfs-encrypt-migrate"
+dynamic = ["version"]
+description = "Migrate existing unencrypted OpenZFS datasets to native encryption in place, one at a time"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Bas Nijholt", email = "bas@nijho.lt" }]
+keywords = ["zfs", "openzfs", "nixos", "encryption", "migration", "native-encryption"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Systems Administration",
+    "Typing :: Typed",
+]
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.0",
+]
+
+[project.scripts]
+zfs-encrypt-migrate = "zfs_encrypt_migrate.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/basnijholt/zfs-encrypt-migrate"
+Documentation = "https://zfs-encrypt-migrate.nijho.lt"
+Repository = "https://github.com/basnijholt/zfs-encrypt-migrate"
+Issues = "https://github.com/basnijholt/zfs-encrypt-migrate/issues"
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "zfs_encrypt_migrate/_version.py"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.0",
+    "mypy>=1.0",
+    "ruff>=0.8",
+]
+docs = [
+    "markdown-code-runner>=2.7.0",
+    "markdown-gfm-admonition",
+    "zensical",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "T20",
+    "S101",
+    "S603",
+    "ANN401",
+    "PLR0913",
+    "FBT002",  # Boolean-typed keyword-only argument in function definition
+    "S106",    # Possible hardcoded password assigned to argument
+    "CPY001",  # Missing copyright notice at top of file (license lives in LICENSE)
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = [
+    "--cov=zfs_encrypt_migrate",
+    "--cov-report=term",
+    "--cov-report=html",
+    "--cov-report=xml",
+    "--no-cov-on-fail",
+    "-v",
+]

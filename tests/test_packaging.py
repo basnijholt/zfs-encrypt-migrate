@@ -1,0 +1,56 @@
+"""Packaging tests for installed zfs-encrypt-migrate wheels."""
+
+from __future__ import annotations
+
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+
+def test_built_wheel_reports_distribution_version(tmp_path: Path) -> None:
+    """Installed wheels expose the same version through the CLI module."""
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv is not installed")
+
+    repo = Path(__file__).resolve().parents[1]
+    dist = tmp_path / "dist"
+    build = subprocess.run(
+        [uv, "build", "--wheel", "--out-dir", str(dist)],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert build.returncode == 0, build.stderr
+
+    wheels = list(dist.glob("zfs_encrypt_migrate-*.whl"))
+    assert len(wheels) == 1
+
+    check = subprocess.run(
+        [
+            uv,
+            "run",
+            "--isolated",
+            "--with",
+            str(wheels[0]),
+            "python",
+            "-c",
+            (
+                "import importlib.metadata;"
+                "import sys;"
+                "import zfs_encrypt_migrate;"
+                "assert zfs_encrypt_migrate.__all__ == ['__version__'], zfs_encrypt_migrate.__all__;"
+                "assert 'zfs_encrypt_migrate.cli' not in sys.modules, sorted(sys.modules);"
+                "assert zfs_encrypt_migrate.__version__ == importlib.metadata.version('zfs-encrypt-migrate'), "
+                "(zfs_encrypt_migrate.__version__, importlib.metadata.version('zfs-encrypt-migrate'))"
+            ),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert check.returncode == 0, check.stderr
