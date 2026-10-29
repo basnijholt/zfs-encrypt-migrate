@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import os
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -16,6 +17,12 @@ if TYPE_CHECKING:
 # Bound the wait for a terminated child so a process stuck in an uninterruptible
 # kernel sleep cannot hang the cleanup path.
 _TERMINATE_WAIT_SECONDS = 5.0
+
+
+def _child_env() -> dict[str, str]:
+    # Callers match English zfs messages ("does not exist", "busy"), so never
+    # let the operator's locale translate them.
+    return {**os.environ, "LC_ALL": "C"}
 
 
 @dataclass(frozen=True)
@@ -74,6 +81,7 @@ class SubprocessRunner:
                 encoding="utf-8",
                 errors="replace",
                 check=False,
+                env=_child_env(),
             )
         except OSError as exc:
             return _startup_failure(exc)
@@ -90,6 +98,7 @@ class SubprocessRunner:
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=err1,
+                    env=_child_env(),
                 )
             except OSError as exc:
                 return _startup_failure(exc), CommandResult(
@@ -104,6 +113,7 @@ class SubprocessRunner:
                         stdin=producer.stdout,
                         stdout=out2,
                         stderr=err2,
+                        env=_child_env(),
                     )
                 except OSError as exc:
                     _terminate(producer)

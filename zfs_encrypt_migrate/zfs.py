@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import typer
@@ -13,6 +14,9 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     from .process import CommandResult, CommandRunner
+
+# -13 from subprocess, 128 + 13 when the kill is reported through a shell.
+_SIGPIPE_RETURNCODES = frozenset({-13, 141})
 
 
 def validate_name(name: str) -> str:
@@ -72,10 +76,15 @@ class Zfs:
         send = ["zfs", "send", *send_args]
         recv = ["zfs", "recv", *recv_args]
         sent, received = self.runner.pipeline(send, recv)
+        if received.returncode != 0:
+            # A failing recv kills send with SIGPIPE; that is a symptom, not a second failure.
+            if sent.returncode == 0 or (sent.returncode in _SIGPIPE_RETURNCODES and not sent.stderr.strip()):
+                raise ZfsError(received, recv)
+            send_detail = sent.stderr.strip() or f"exit {sent.returncode}"
+            both = replace(received, stderr=f"{received.stderr.strip()}; zfs send also failed: {send_detail}")
+            raise ZfsError(both, recv)
         if sent.returncode != 0:
             raise ZfsError(sent, send)
-        if received.returncode != 0:
-            raise ZfsError(received, recv)
 
     def rename(self, old: str, new: str) -> None:
         """Rename without mounting anything."""

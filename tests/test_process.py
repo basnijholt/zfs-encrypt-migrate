@@ -103,3 +103,15 @@ def test_pipeline_terminates_both_children_on_keyboard_interrupt(tmp_path: Path)
         pid = int(pid_file.read_text())
         with pytest.raises(ProcessLookupError):
             os.kill(pid, 0)
+
+
+def test_children_see_c_locale() -> None:
+    """Both run and pipeline force LC_ALL=C so zfs messages stay English."""
+    script = ["sh", "-c", 'printf %s "$LC_ALL"']
+    runner = SubprocessRunner()
+
+    assert runner.run(script).stdout == "C"
+    first, second = runner.pipeline(script, ["cat"])
+    assert first.returncode == 0
+    assert second.stdout == "C"
+    assert runner.pipeline(["true"], script)[1].stdout == "C"

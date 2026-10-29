@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import pytest
 import typer
 
@@ -9,6 +11,9 @@ from zfs_encrypt_migrate.errors import ZfsError
 from zfs_encrypt_migrate.zfs import Zfs, validate_name
 
 from .conftest import FakeRunner, fail, ok
+
+if TYPE_CHECKING:
+    from zfs_encrypt_migrate.process import CommandResult
 
 
 def test_exists_true_and_false() -> None:
@@ -135,3 +140,31 @@ def test_validate_name_rejects(name: str) -> None:
     """Option-like, snapshot, whitespace and trailing-newline names are refused."""
     with pytest.raises(typer.BadParameter):
         validate_name(name)
+
+
+def _pipeline_results(send: CommandResult, recv: CommandResult) -> Zfs:
+    return Zfs(FakeRunner(queue=[send, recv]))
+
+
+def test_send_recv_reports_recv_when_send_died_of_sigpipe() -> None:
+    """A recv failure is reported with its stderr even though send was killed by SIGPIPE."""
+    for code in (-13, 141):
+        zfs = _pipeline_results(fail("", code), fail("cannot receive: out of space\n"))
+        with pytest.raises(ZfsError, match=r"zfs recv .* failed: cannot receive: out of space") as info:
+            zfs.send_recv(["x"], ["y"])
+        assert "send" not in str(info.value).split("failed:")[1]
+
+
+def test_send_recv_reports_send_failure_when_recv_sees_eof() -> None:
+    """A real send failure is reported when recv succeeded on the truncated stream."""
+    with pytest.raises(ZfsError, match=r"zfs send .* failed: no such snapshot"):
+        _pipeline_results(fail("no such snapshot\n"), ok()).send_recv(["x"], ["y"])
+
+
+def test_send_recv_includes_both_stderrs_when_both_fail() -> None:
+    """A real send failure plus a recv failure reports both messages."""
+    with pytest.raises(ZfsError) as info:
+        _pipeline_results(fail("send broke\n"), fail("recv broke\n")).send_recv(["x"], ["y"])
+
+    assert "recv broke" in str(info.value)
+    assert "send broke" in str(info.value)
