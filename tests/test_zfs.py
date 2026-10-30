@@ -42,7 +42,7 @@ def test_subtree_lists_filesystems_and_volumes() -> None:
     runner = FakeRunner(queue=[ok("tank/a\ntank/a/b\n")])
 
     assert Zfs(runner).subtree("tank/a") == ["tank/a", "tank/a/b"]
-    assert runner.calls == [("zfs", "list", "-rH", "-t", "filesystem,volume", "-o", "name", "tank/a")]
+    assert runner.calls == [("zfs", "list", "-rH", "-t", "filesystem,volume", "-o", "name", "-s", "name", "tank/a")]
 
 
 def test_snapshot_recursive_flag() -> None:

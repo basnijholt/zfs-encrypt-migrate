@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import contextlib
+import signal
 import stat
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self
 
 from .errors import Interrupted, MigrationError
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
     from types import TracebackType
 
@@ -17,6 +21,22 @@ if TYPE_CHECKING:
 ENCRYPTION = "aes-256-gcm"
 SEED_SNAPSHOT = "enc-seed"
 FINAL_SNAPSHOT = "enc-final"
+# Signals that end a run; the CLI turns each into a KeyboardInterrupt so the abort guard always runs.
+INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+
+
+@contextlib.contextmanager
+def signals_ignored() -> Iterator[None]:
+    """Ignore the interrupt signals so a second one cannot skip the cleanup inside."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    saved = {number: signal.signal(number, signal.SIG_IGN) for number in INTERRUPT_SIGNALS}
+    try:
+        yield
+    finally:
+        for number, handler in saved.items():
+            signal.signal(number, handler)
 
 
 @dataclass(frozen=True)
@@ -81,7 +101,9 @@ class AbortGuard:
         """Clean up and re-raise failures as a MigrationError carrying the hints."""
         if exc is None:
             return
-        hints = self._unload_hint() + self._phase_hints()
+        with signals_ignored():
+            hints = self._unload_hint()
+        hints += self._phase_hints()
         if isinstance(exc, MigrationError):
             error = exc
         elif isinstance(exc, KeyboardInterrupt):
@@ -188,7 +210,8 @@ def check_free_space(zfs: Zfs, settings: Settings, dataset: str, size_props: str
 def preflight_seed(zfs: Zfs, settings: Settings, dataset: str, size_props: str = "used") -> None:
     """Refuse to seed unless the key, the dataset, the stage and the free space are in order."""
     key_file = settings.key_file
-    # Anything other than a private regular file could leak the passphrase.
+    # Anything other than a private regular file could leak the passphrase. Symlinks (secret
+    # managers use them) are followed: the target must be the regular file with mode 600.
     if not key_file.is_file():
         msg = f"key file {key_file} not found"
         raise MigrationError(msg)
@@ -338,6 +361,12 @@ def cutover(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
         raise MigrationError(msg)
     leaf = leaf_of(dataset)
     staged = f"{settings.stage}/{leaf}"
+    if pool_of(dataset) != pool_of(settings.stage):
+        msg = (
+            f"{dataset} is on pool {pool_of(dataset)} but the stage is on {pool_of(settings.stage)}; "
+            "cutover cannot rename across pools"
+        )
+        raise MigrationError(msg)
     if not zfs.exists(staged):
         msg = f"{staged} does not exist; run seed first"
         raise MigrationError(msg)

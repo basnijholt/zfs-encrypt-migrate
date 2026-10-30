@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import signal
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated
@@ -10,7 +11,7 @@ import typer
 
 from .audit import find_unencrypted
 from .errors import Interrupted, MigrationError
-from .migrate import Settings, catchup, cutover, seed
+from .migrate import INTERRUPT_SIGNALS, Settings, catchup, cutover, seed
 from .output import console, print_error
 from .process import CommandRunner, SubprocessRunner
 from .sizes import parse_size
@@ -19,6 +20,7 @@ from .zfs import Zfs, validate_name
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from types import FrameType
 
 
 def _version_callback(value: bool) -> None:  # noqa: FBT001
@@ -45,6 +47,17 @@ def _validate_size(value: str) -> str:
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
     return value
+
+
+def _validate_keylocation(value: str) -> str:
+    # zfs only rejects a bad keylocation at the final swap step, after both renames.
+    scheme, _, rest = value.partition("://")
+    if value == "prompt" or (scheme == "file" and rest.startswith("/") and len(rest) > 1):
+        return value
+    if scheme in {"http", "https"} and rest:
+        return value
+    msg = f"invalid keylocation {value!r}: use prompt, file:///absolute/path or an http(s):// URL"
+    raise typer.BadParameter(msg)
 
 
 def _validate_name(value: str) -> str:
@@ -102,6 +115,7 @@ FinalKeylocationOption = Annotated[
         "--final-keylocation",
         envvar="ZFS_ENCRYPT_MIGRATE_FINAL_KEYLOCATION",
         help="Keylocation set on the dataset after the swap, e.g. prompt or file:///path",
+        callback=_validate_keylocation,
     ),
 ]
 DatasetArgument = Annotated[str, typer.Argument(help="Dataset to migrate", callback=_validate_name, show_default=False)]
@@ -112,6 +126,11 @@ def _run_migration(
     settings: Settings,
     dataset: str,
 ) -> None:
+    def interrupt(_signum: int, _frame: FrameType | None) -> None:
+        raise KeyboardInterrupt
+
+    # A dropped ssh session (SIGHUP) or a kill (SIGTERM) must unload the staged key like Ctrl-C does.
+    previous = {number: signal.signal(number, interrupt) for number in INTERRUPT_SIGNALS}
     try:
         lines = command(Zfs(_runner()), settings, dataset)
     except Interrupted as error:
@@ -123,6 +142,9 @@ def _run_migration(
     except KeyboardInterrupt as error:
         print_error("interrupted")
         raise typer.Exit(130) from error
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
     for line in lines:
         console.print(line, markup=False, highlight=False, soft_wrap=True)
 

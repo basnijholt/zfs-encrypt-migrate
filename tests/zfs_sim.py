@@ -11,7 +11,19 @@ if TYPE_CHECKING:
 
     from zfs_encrypt_migrate.process import CommandResult
 
-WRITE_VERBS = {"snapshot", "rename", "set", "mount", "unmount", "load-key", "unload-key", "create", "inherit", "recv"}
+WRITE_VERBS = {
+    "snapshot",
+    "rename",
+    "set",
+    "mount",
+    "unmount",
+    "load-key",
+    "unload-key",
+    "create",
+    "inherit",
+    "send",
+    "recv",
+}
 DEFAULTS = {
     "encryption": "off",
     "canmount": "on",
@@ -34,7 +46,8 @@ class ZfsSim:
         self.avail = avail
         self.busy: set[str] = set()
         self.roots: list[str] = []
-        self._sending = ""
+        self.log: list[tuple[str, ...]] = []
+        self._sent: tuple[Sequence[str], str, str] | None = None
 
     def prop(self, name: str, prop: str, value: str) -> None:
         """Set a property value."""
@@ -57,8 +70,20 @@ class ZfsSim:
             return self.snapshots[name]
         return self.props.get((name, prop), DEFAULTS.get(prop, "0"))
 
-    def answer(self, args: Sequence[str]) -> CommandResult:  # noqa: C901, PLR0911, PLR0912
-        """Answer one command."""
+    def ops(self) -> list[tuple[str, ...]]:
+        """Return the ordered log of commands that matter for safety: writes, streams, syncs, written@ reads."""
+        return [
+            call
+            for call in self.log
+            if call[0] == "zpool" or call[1] in WRITE_VERBS or (call[1] == "get" and call[-2].startswith("written@"))
+        ]
+
+    def answer(self, args: Sequence[str]) -> CommandResult:
+        """Log and answer one command."""
+        self.log.append(tuple(args))
+        return self._answer(args)
+
+    def _answer(self, args: Sequence[str]) -> CommandResult:  # noqa: C901, PLR0911, PLR0912
         verb = args[1]
         if args[0] == "zpool":
             return ok()
@@ -72,6 +97,11 @@ class ZfsSim:
         if verb == "list":
             return ok("".join(f"{d}\n" for d in self._under(args[-1])))
         if verb == "get":
+            if (
+                args[-2].startswith("written@")
+                and f"{args[-1]}@{args[-2].removeprefix('written@')}" not in self.snapshots
+            ):
+                return fail(f"cannot open '{args[-1]}@{args[-2].removeprefix('written@')}': snapshot does not exist\n")
             return ok("".join(f"{self._get(p, args[-1])}\n" for p in args[-2].split(",")))
         if verb == "snapshot":
             name = args[-1]
@@ -94,9 +124,9 @@ class ZfsSim:
             prop, value = args[2].split("=", 1)
             self.prop(args[-1], prop, value)
         elif verb == "send":
-            self._sending = args[-1]
+            return self._send(args)
         elif verb == "recv":
-            self._recv(args)
+            return self._recv(args)
         elif verb == "create":
             self.datasets.add(args[-1])
         elif verb == "rename":
@@ -110,17 +140,64 @@ class ZfsSim:
             }
         return ok()
 
-    def _recv(self, args: Sequence[str]) -> None:
+    def _send(self, args: Sequence[str]) -> CommandResult:
+        """Accept a stream only when its snapshots exist."""
+        source, snap = args[-1].split("@")
+        missing = [args[-1]]
+        if "-I" in args:
+            missing.append(f"{source}{args[args.index('-I') + 1]}")
+        for name in missing:
+            if name not in self.snapshots:
+                self._sent = None
+                return fail(f"cannot open '{name}': dataset does not exist\n")
+        self._sent = (args, source, snap)
+        return ok()
+
+    def _recv(self, args: Sequence[str]) -> CommandResult:
         """Mirror the sent snapshot (and descendants) under the target, which becomes its encryption root."""
+        sent, self._sent = self._sent, None
         target = args[-1]
-        source, snap = self._sending.split("@")
+        if sent is None:
+            return fail("cannot receive: failed to read from stream\n")
+        send_args, source, snap = sent
+        encrypting = any(arg.startswith("encryption=") for arg in args)
+        if encrypting:
+            if target in self.datasets:
+                return fail(f"cannot receive new filesystem stream: destination '{target}' exists\n")
+        else:
+            if target not in self.datasets:
+                return fail(f"cannot receive incremental stream: destination '{target}' does not exist\n")
+            if self._get("encryption", target) != "off" and self._get("keystatus", target) != "available":
+                return fail("cannot receive incremental stream: key must be loaded\n")
+            base = send_args[send_args.index("-I") + 1].removeprefix("@") if "-I" in send_args else None
+            if base is not None and f"{target}@{base}" not in self.snapshots:
+                return fail(
+                    "cannot receive incremental stream: most recent snapshot does not match incremental source\n",
+                )
+        encrypted = encrypting or self._get("encryption", target) != "off"
         for name in self._under(source):
             staged = target + name.removeprefix(source)
+            created = staged not in self.datasets
             self.datasets.add(staged)
             self.snapshot(f"{staged}@{snap}")
             self.prop(staged, "encryptionroot", target)
+            if encrypted:
+                self.prop(staged, "encryption", "aes-256-gcm")
+                if created:
+                    self.prop(staged, "keystatus", "available")
+        return ok()
 
 
-def mutations(calls: Sequence[Sequence[str]]) -> list[tuple[str, ...]]:
-    """Filter recorded commands down to those that change state."""
-    return [tuple(c) for c in calls if c[0] == "zpool" or c[1] in WRITE_VERBS]
+def staged_ready(sim: ZfsSim, stage: str = "tank/stage", *, final: bool = False) -> None:
+    """Set up the state after a seed of tank/data: encrypted staged tree, key unloaded."""
+    sim.datasets |= {stage, f"{stage}/old", f"{stage}/data", f"{stage}/data/child"}
+    pairs = [("tank/data", f"{stage}/data"), ("tank/data/child", f"{stage}/data/child")]
+    for source, staged in pairs:
+        sim.snapshot(f"{source}@enc-seed")
+        sim.snapshot(f"{staged}@enc-seed")
+        sim.prop(staged, "encryptionroot", f"{stage}/data")
+        sim.prop(staged, "encryption", "aes-256-gcm")
+        sim.prop(staged, "keystatus", "unavailable")
+        if final:
+            sim.snapshot(f"{source}@enc-final")
+            sim.snapshot(f"{staged}@enc-final")

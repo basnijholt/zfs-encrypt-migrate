@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import signal
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -21,7 +23,7 @@ from zfs_encrypt_migrate.migrate import (
 from zfs_encrypt_migrate.zfs import Zfs
 
 from .conftest import FakeRunner, fail
-from .zfs_sim import ZfsSim, mutations
+from .zfs_sim import ZfsSim, staged_ready
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -110,19 +112,9 @@ def fail_on(*prefix: str) -> Callable[[Sequence[str]], CommandResult | None]:
     return responder
 
 
-def staged_ready(sim: ZfsSim, *, final: bool = False) -> None:
-    """Stage state after a seed: encrypted staged tree with the key unloaded."""
-    sim.datasets |= {STAGE, f"{STAGE}/old", f"{STAGE}/data", f"{STAGE}/data/child"}
-    for name in ("tank/data", "tank/data/child"):
-        sim.snapshot(f"{name}@enc-seed")
-        sim.snapshot(f"{name.replace('tank/data', f'{STAGE}/data')}@enc-seed")
-    for name in (f"{STAGE}/data", f"{STAGE}/data/child"):
-        sim.prop(name, "encryptionroot", f"{STAGE}/data")
-        sim.prop(name, "encryption", "aes-256-gcm")
-        sim.prop(name, "keystatus", "unavailable")
-    if final:
-        for name in ("tank/data", "tank/data/child", f"{STAGE}/data", f"{STAGE}/data/child"):
-            sim.snapshot(f"{name}@enc-final")
+def written(name: str) -> tuple[str, ...]:
+    """Return the read of written@enc-final that cutover issues."""
+    return ("zfs", "get", "-H", "-p", "-o", "value", "written@enc-final", name)
 
 
 # --- seed ---
@@ -135,12 +127,17 @@ def test_seed_exact_commands(sim: ZfsSim, settings: Settings, key_file: Path) ->
     assert seed(zfs, settings, "tank/data") == []
 
     assert runner.pipelines == [(("zfs", "send", "-R", "tank/data@enc-seed"), recv_args(key_file, f"{STAGE}/data"))]
-    assert [c for c in mutations(runner.calls) if c[1] != "recv"] == [
+    assert sim.ops() == [
         ("zfs", "create", "-o", "canmount=off", STAGE),
         ("zfs", "create", "-o", "canmount=off", f"{STAGE}/old"),
         ("zfs", "snapshot", "-r", "tank/data@enc-seed"),
+        ("zfs", "send", "-R", "tank/data@enc-seed"),
+        recv_args(key_file, f"{STAGE}/data"),
         ("zfs", "unload-key", "-r", f"{STAGE}/data"),
     ]
+    # An encrypted receive leaves the key loaded; only the final unload makes this true.
+    assert sim.props[f"{STAGE}/data", "keystatus"] == "unavailable"
+    assert sim.props[f"{STAGE}/data/child", "keystatus"] == "unavailable"
 
 
 def test_seed_uses_keyformat_setting(sim: ZfsSim, settings: Settings, key_file: Path) -> None:
@@ -401,11 +398,15 @@ def test_catchup_exact_commands(sim: ZfsSim, settings: Settings) -> None:
             ("zfs", "recv", "-u", "-x", "encryption", f"{STAGE}/data"),
         ),
     ]
-    assert [c for c in mutations(runner.calls) if c[1] != "recv"] == [
+    assert sim.ops() == [
         ("zfs", "load-key", f"{STAGE}/data"),
         ("zfs", "snapshot", "-r", "tank/data@enc-final"),
+        ("zfs", "send", "-R", "-I", "@enc-seed", "tank/data@enc-final"),
+        ("zfs", "recv", "-u", "-x", "encryption", f"{STAGE}/data"),
         ("zfs", "unload-key", "-r", f"{STAGE}/data"),
     ]
+    assert sim.props[f"{STAGE}/data", "keystatus"] == "unavailable"
+    assert sim.props[f"{STAGE}/data/child", "keystatus"] == "unavailable"
 
 
 def test_catchup_skips_load_when_key_loaded(sim: ZfsSim, settings: Settings) -> None:
@@ -524,11 +525,13 @@ def test_cutover_skips_catchup_when_finals_match(sim: ZfsSim, settings: Settings
 
     assert runner.pipelines == []
     assert lines == [f"cutover done; once verified, free the old copy with: zfs destroy -r {STAGE}/old/data"]
-    assert mutations(runner.calls) == [
+    assert sim.ops() == [
         ("zfs", "load-key", f"{STAGE}/data"),
         ("zfs", "unmount", "tank/data/child"),
         ("zfs", "unmount", "tank/data"),
         ("zpool", "sync", "tank"),
+        written("tank/data"),
+        written("tank/data/child"),
         ("zfs", "set", "canmount=noauto", "tank/data"),
         ("zfs", "set", "canmount=noauto", "tank/data/child"),
         ("zfs", "rename", "-u", "tank/data", f"{STAGE}/old/data"),
@@ -557,8 +560,25 @@ def test_cutover_runs_catchup_when_finals_missing(sim: ZfsSim, settings: Setting
     cutover(zfs, settings, "tank/data")
 
     assert len(runner.pipelines) == 1
-    assert runner.pipelines[0][0] == ("zfs", "send", "-R", "-I", "@enc-seed", "tank/data@enc-final")
-    assert ("zfs", "rename", "-u", "tank/data", f"{STAGE}/old/data") in runner.calls
+    assert sim.ops() == [
+        ("zfs", "load-key", f"{STAGE}/data"),
+        ("zfs", "unmount", "tank/data/child"),
+        ("zfs", "unmount", "tank/data"),
+        ("zfs", "snapshot", "-r", "tank/data@enc-final"),
+        ("zfs", "send", "-R", "-I", "@enc-seed", "tank/data@enc-final"),
+        ("zfs", "recv", "-u", "-x", "encryption", f"{STAGE}/data"),
+        ("zpool", "sync", "tank"),
+        written("tank/data"),
+        written("tank/data/child"),
+        ("zfs", "set", "canmount=noauto", "tank/data"),
+        ("zfs", "set", "canmount=noauto", "tank/data/child"),
+        ("zfs", "rename", "-u", "tank/data", f"{STAGE}/old/data"),
+        ("zfs", "set", "readonly=on", f"{STAGE}/old/data"),
+        ("zfs", "rename", "-u", f"{STAGE}/data", "tank/data"),
+        ("zfs", "set", "keylocation=prompt", "tank/data"),
+        ("zfs", "mount", "tank/data"),
+        ("zfs", "mount", "tank/data/child"),
+    ]
 
 
 def test_cutover_diverged_finals_fall_back_to_catchup_and_refuse(sim: ZfsSim, settings: Settings) -> None:
@@ -811,6 +831,8 @@ def test_abort_guard_success_does_nothing(sim: ZfsSim, settings: Settings) -> No
 
 def test_dirty_since_lists_written_datasets(sim: ZfsSim) -> None:
     """Datasets with written@snap other than 0 are returned."""
+    sim.snapshot("tank/data@s")
+    sim.snapshot("tank/data/child@s")
     sim.prop("tank/data", "written@s", "1")
     zfs, _ = make(sim)
 
@@ -827,3 +849,115 @@ def test_snaps_match_false_when_snapshot_missing(sim: ZfsSim) -> None:
     sim.snapshot("tank/data@enc-final")
     sim.snapshot("tank/data/child@enc-final")
     assert snaps_match(zfs, "tank/data", f"{STAGE}/data", "enc-final") is False
+
+
+def test_dirty_since_missing_snapshot_is_an_error(sim: ZfsSim) -> None:
+    """Reading written@ of a missing snapshot fails instead of reading clean."""
+    zfs, _ = make(sim)
+
+    with pytest.raises(MigrationError, match="snapshot does not exist"):
+        dirty_since(zfs, "tank/data", "nope")
+
+
+# --- simulator strictness (what the ordering tests rely on) ---
+
+
+def test_sim_rejects_send_of_missing_snapshot_and_orphan_recv(sim: ZfsSim) -> None:
+    """A send of a missing snapshot fails and its recv has nothing to read."""
+    zfs, _ = make(sim)
+
+    with pytest.raises(MigrationError, match=r"zfs send .* failed"):
+        zfs.send_recv(["-R", "tank/data@nope"], ["-u", f"{STAGE}/data"])
+
+
+def test_sim_rejects_recv_into_locked_or_baseless_target(sim: ZfsSim) -> None:
+    """An incremental recv needs the target key loaded and the base snapshot present."""
+    staged_ready(sim)
+    sim.snapshot("tank/data@enc-final")
+    zfs, _ = make(sim)
+    send = ["-R", "-I", "@enc-seed", "tank/data@enc-final"]
+    recv = ["-u", "-x", "encryption", f"{STAGE}/data"]
+
+    with pytest.raises(MigrationError, match="key must be loaded"):
+        zfs.send_recv(send, recv)
+
+    sim.prop(f"{STAGE}/data", "keystatus", "available")
+    del sim.snapshots[f"{STAGE}/data@enc-seed"]
+    with pytest.raises(MigrationError, match="most recent snapshot does not match"):
+        zfs.send_recv(send, recv)
+
+
+# --- cutover pool, key file links, signals ---
+
+
+def test_cutover_refuses_dataset_on_other_pool_than_stage(settings: Settings) -> None:
+    """The swap renames, which cannot cross pools; refuse before any zfs call."""
+    zfs, runner = make(ZfsSim(["ssd", "ssd/data"]))
+
+    with pytest.raises(
+        MigrationError,
+        match=r"ssd/data is on pool ssd but the stage is on tank; cutover cannot rename across pools",
+    ):
+        cutover(zfs, settings, "ssd/data")
+    assert runner.calls == []
+
+
+def test_seed_and_catchup_work_across_pools(settings: Settings, key_file: Path) -> None:
+    """Only the swap needs one pool; seed copies from any pool into the stage."""
+    simulator = ZfsSim(["tank", "ssd", "ssd/data"])
+    simulator.roots = ["ssd/data", f"{STAGE}/data"]
+    zfs, runner = make(simulator)
+
+    seed(zfs, settings, "ssd/data")
+
+    assert runner.pipelines[0][1] == recv_args(key_file, f"{STAGE}/data")
+
+
+def test_key_file_symlink_to_private_file_is_accepted(sim: ZfsSim, settings: Settings, tmp_path: Path) -> None:
+    """Symlinked secrets are followed; the target must be a regular file with mode 600."""
+    link = tmp_path / "link"
+    link.symlink_to(settings.key_file)
+    zfs, _ = make(sim)
+
+    seed(zfs, replace(settings, key_file=link), "tank/data")
+
+
+def test_key_file_symlink_to_open_file_is_refused(sim: ZfsSim, settings: Settings, tmp_path: Path) -> None:
+    """A link to a world-readable file is refused like the file itself."""
+    target = tmp_path / "open"
+    target.write_text("secret")
+    target.chmod(0o644)
+    link = tmp_path / "link"
+    link.symlink_to(target)
+    zfs, _ = make(sim)
+
+    with pytest.raises(MigrationError, match="must have mode 600"):
+        seed(zfs, replace(settings, key_file=link), "tank/data")
+
+
+@pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM, signal.SIGHUP])
+def test_cleanup_ignores_signals_and_restores_handlers(sim: ZfsSim, settings: Settings, signum: signal.Signals) -> None:
+    """A signal arriving while the key is unloaded cannot skip the cleanup."""
+    previous = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    signal.signal(signal.SIGTERM, signal.default_int_handler)
+    signal.signal(signal.SIGHUP, signal.default_int_handler)
+    sim.datasets.add(f"{STAGE}/data")
+    sim.prop(f"{STAGE}/data", "keystatus", "available")
+
+    def second_signal(args: Sequence[str]) -> CommandResult | None:
+        if args[1] == "unload-key":
+            signal.raise_signal(signum)
+        return None
+
+    zfs, runner = make(sim, second_signal)
+    try:
+        with pytest.raises(MigrationError, match=MSG), abort_guard(zfs, settings, f"{STAGE}/data"):
+            raise MigrationError(MSG)
+        assert sim.props[f"{STAGE}/data", "keystatus"] == "unavailable"
+        assert signal.getsignal(signal.SIGTERM) is signal.default_int_handler
+        assert signal.getsignal(signal.SIGHUP) is signal.default_int_handler
+        assert signal.getsignal(signal.SIGINT) is previous[signal.SIGINT]
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+    assert ("zfs", "unload-key", "-r", f"{STAGE}/data") in runner.calls

@@ -64,7 +64,7 @@ class Zfs:
 
     def subtree(self, name: str) -> list[str]:
         """List a dataset and its descendants, parents first."""
-        result = self._run(["zfs", "list", "-rH", "-t", "filesystem,volume", "-o", "name", name])
+        result = self._run(["zfs", "list", "-rH", "-t", "filesystem,volume", "-o", "name", "-s", "name", name])
         return result.stdout.split()
 
     def snapshot(self, name: str, *, recursive: bool) -> None:

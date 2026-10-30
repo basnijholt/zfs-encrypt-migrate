@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import signal
+import threading
 from typing import TYPE_CHECKING
 
 import pytest
@@ -9,12 +12,16 @@ from typer.testing import CliRunner
 
 from zfs_encrypt_migrate import cli
 from zfs_encrypt_migrate.constants import COMMAND_STARTUP_ERROR_RETURNCODE
+from zfs_encrypt_migrate.process import SubprocessRunner
 
 from .conftest import FakeRunner, fail, ok
-from .zfs_sim import ZfsSim
+from .zfs_sim import ZfsSim, staged_ready
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
     from pathlib import Path
+
+    from zfs_encrypt_migrate.process import CommandResult
 
 runner = CliRunner()
 
@@ -143,6 +150,10 @@ def test_options_override_env(sim: ZfsSim) -> None:
         ["seed", "tank/data", "--keyformat", "bogus"],
         ["seed", "tank/data", "--min-free", "lots"],
         ["seed", "tank/data", "--stage", "-x"],
+        ["seed", "tank/data", "--final-keylocation", "promt"],
+        ["seed", "tank/data", "--final-keylocation", "file://relative"],
+        ["seed", "tank/data", "--final-keylocation", "file:///"],
+        ["seed", "tank/data", "--final-keylocation", "https://"],
         ["seed", "-r"],
         ["seed", "tank/data@s"],
         ["catchup", "tank/a b"],
@@ -235,3 +246,53 @@ def test_migration_commands_are_in_their_own_help_panel() -> None:
     assert "Migration Commands" in result.output
     for name in ("seed", "catchup", "cutover"):
         assert name in result.output
+
+
+@pytest.mark.parametrize("value", ["prompt", "file:///etc/zfs/key", "https://keys.example/key", "http://k/x"])
+@pytest.mark.usefixtures("sim")
+def test_final_keylocation_accepts_zfs_forms(value: str) -> None:
+    """Prompt, absolute file URLs and http(s) URLs pass validation."""
+    result = runner.invoke(cli.app, ["seed", "tank/data", "--final-keylocation", value])
+
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize("signum", [signal.SIGTERM, signal.SIGHUP, signal.SIGINT])
+def test_real_signal_mid_pipeline_cleans_up_and_exits_130(
+    sim: ZfsSim,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    signum: signal.Signals,
+) -> None:
+    """SIGTERM and SIGHUP take the Ctrl-C path: children stopped, key unloaded, hints, exit 130."""
+    staged_ready(sim)
+    sim.props["tank/stage/data", "keystatus"] = "available"
+    sim.props["tank/data", "mounted"] = "yes"
+    pid_files = (tmp_path / "first.pid", tmp_path / "second.pid")
+
+    class Blocking(FakeRunner):
+        def pipeline(self, first: Sequence[str], second: Sequence[str]) -> tuple[CommandResult, CommandResult]:
+            self.pipelines.append((tuple(first), tuple(second)))
+            return SubprocessRunner().pipeline(
+                ["sh", "-c", f"echo $$ > {pid_files[0]}; exec sleep 60"],
+                ["sh", "-c", f"echo $$ > {pid_files[1]}; exec sleep 60"],
+            )
+
+    blocking = Blocking(sim.answer)
+    monkeypatch.setattr(cli, "_runner", lambda: blocking)
+    before = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    timer = threading.Timer(1.0, os.kill, (os.getpid(), signum))
+    timer.start()
+    try:
+        result = runner.invoke(cli.app, ["cutover", "tank/data"])
+    finally:
+        timer.cancel()
+
+    assert result.exit_code == 130  # noqa: PLR2004
+    assert "interrupted" in result.output
+    assert "cutover aborted." in result.output
+    assert sim.props["tank/stage/data", "keystatus"] == "unavailable"
+    for pid_file in pid_files:
+        with pytest.raises(ProcessLookupError):
+            os.kill(int(pid_file.read_text()), 0)
+    assert {number: signal.getsignal(number) for number in before} == before
