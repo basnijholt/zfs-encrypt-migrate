@@ -94,6 +94,13 @@ zfs-encrypt-migrate tree-seed tank/backups
 This copies `tank/backups` itself (not its children) to an encrypted `tank/stage/backups` and unloads its key.
 Until `tree-finish`, this counts as the migration in flight under the stage.
 
+If a `tree-seed` is interrupted or fails, clean up before you run it again, as for `seed`:
+
+```bash
+zfs destroy tank/backups@enc-tree   # the tree snapshot on the source, which tree-seed takes without -r
+zfs destroy -r tank/stage/backups   # the partial copy, if there is one: on the stage, never the source
+```
+
 **2. Move each child, then destroy its source.**
 Stop whatever writes to the child first: `tree-move` unmounts it, and the child stays offline until `tree-finish`.
 
@@ -102,14 +109,21 @@ zfs-encrypt-migrate tree-move tank/backups host1
 ```
 
 ```text
+verify the key with: zfs load-key -n -L prompt tank/stage/backups
 moved tank/backups/host1; once verified, free it with: zfs destroy -r tank/backups/host1
 ```
 
-The tool has already compared the `@enc-tree` snapshot GUIDs on both sides and checked that the copy is encrypted under `tank/stage/backups`.
-Check that `tank/stage/backups/host1` is listed, then destroy the source to make room for the next child:
+Destroy the source only after `tree-move` printed `moved ...`.
+By then it has compared the `@enc-tree` snapshot GUIDs on both sides and checked that the copy is encrypted under `tank/stage/backups`.
+A run that was interrupted or failed can leave a partial copy at `tank/stage/backups/host1` instead; running `tree-move` again then refuses and prints the two `zfs destroy -r` commands that remove it and the tree snapshots, after which it starts over.
+
+Once you destroy the source, the staged copy is the only copy of that child, and the passphrase the only way into it.
+So check the passphrase before every destroy: `zfs load-key -n -L prompt` asks for it instead of reading the key file, and only checks it.
+Type it from where you stored it, not from the key file:
 
 ```bash
 zfs list -r -o name,used tank/stage/backups
+zfs load-key -n -L prompt tank/stage/backups   # asks for the passphrase and checks it
 zfs destroy -r tank/backups/host1
 ```
 
@@ -185,9 +199,10 @@ Pass each one as `-O property=value` to `zpool create` in the next step, except 
 **3. Destroy and recreate the pool encrypted.**
 
 > [!CAUTION]
-> This destroys the pool. `zpool destroy` is irreversible: after it, the only copy of the data on `ssd` is `tank/stage/ssd` (and your backups). Check the staged copy before you continue.
+> This destroys the pool. `zpool destroy` is irreversible: after it, the only copy of the data on `ssd` is `tank/stage/ssd` (and your backups), and the passphrase the only way into it. Check the staged copy, and that the passphrase you stored opens it, before you continue.
 
 ```bash
+zfs load-key -n -L prompt tank/stage/ssd   # asks for the passphrase and checks it
 udevadm settle
 zpool destroy ssd
 zpool create -O encryption=aes-256-gcm -O keyformat=passphrase \
@@ -196,6 +211,7 @@ zpool create -O encryption=aes-256-gcm -O keyformat=passphrase \
   ssd DEVICES...
 ```
 
+`zfs load-key -n -L prompt` asks for the passphrase instead of reading the key file, and only checks it; type it from where you stored it.
 Here `-O mountpoint=/ssd -O compression=zstd -O atime=off` stands for the properties from step 2.
 Recreate the pool with your original vdev layout and pool properties too; only the encryption options are new.
 `udevadm settle` lets udev finish with any volumes on the pool first.
@@ -264,6 +280,8 @@ zfs destroy -r tank/stage/ssd
 
 `cutover` sets `keylocation=prompt` on the migrated dataset (unless you passed `--final-keylocation`), so after a reboot it stays locked, and unmounted, until its key is loaded.
 The services that use it have to wait for that.
+Until the dataset is mounted, its mountpoint is an empty directory on the unencrypted parent: a service that starts first writes there in plaintext, and the dataset later mounts over those files, which hides them but leaves them unencrypted.
+So start such services only once the key is loaded and the dataset mounted, by hand or after [zfs-unlock](#with-zfs-unlock) has unlocked it.
 
 By hand:
 

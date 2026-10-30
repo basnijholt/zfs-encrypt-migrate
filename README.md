@@ -5,9 +5,9 @@
 [![Docs](https://img.shields.io/badge/docs-zfs--encrypt--migrate.nijho.lt-blue)](https://zfs-encrypt-migrate.nijho.lt)
 [![Nix](https://img.shields.io/badge/Nix-flake%20%2B%20NixOS%20module-5277C3?logo=nixos&logoColor=white)](#nixos-module)
 [![Tests](https://github.com/basnijholt/zfs-encrypt-migrate/actions/workflows/pytest.yml/badge.svg)](https://github.com/basnijholt/zfs-encrypt-migrate/actions/workflows/pytest.yml)
-[![License](https://img.shields.io/github/license/basnijholt/zfs-encrypt-migrate)](LICENSE)
+[![License](https://img.shields.io/github/license/basnijholt/zfs-encrypt-migrate)](https://github.com/basnijholt/zfs-encrypt-migrate/blob/main/LICENSE)
 
-<img src="docs/logo.svg" alt="ZFS Encrypt Migrate Logo" align="right" width="120" />
+<img src="https://raw.githubusercontent.com/basnijholt/zfs-encrypt-migrate/main/docs/logo.svg" alt="ZFS Encrypt Migrate Logo" align="right" width="120" />
 
 Move your existing unencrypted OpenZFS datasets onto native encryption one dataset at a time — same names, same mountpoints, same snapshots, no spare disks.
 
@@ -68,7 +68,7 @@ Some limits are worth stating plainly:
 - **You need free space for one dataset at a time** (or, with the tree commands, the parent plus one child), until you destroy the old copy.
 - **Plan for writer downtime during the cutover.** The dataset is unmounted for the final catch-up and the swap; stop the services that write to it first.
 - **NFS clients see stale file handles after a swap.** The path is now served by a different dataset; remount it on the clients.
-- **Children moved with `tree-move` get no old copy to bake in.** You destroy each source child once it's moved, and from then on the encrypted copy is the only one; only the parent lands in `<stage>/old`.
+- **Children moved with `tree-move` get no old copy to fall back on.** You destroy each source child once it's moved, and from then on the encrypted copy is the only one; only the parent lands in `<stage>/old`. So check the passphrase you stored first, with the `zfs load-key -n -L prompt` line that `tree-move` prints.
 - **On NixOS, keep the stage out of boot-time key loading.** With the default `boot.zfs.requestEncryptionCredentials = true`, a reboot while a staged copy exists makes the pool import fail with `Key load error`. Before the first `seed`, set it to `false` or to a list without the stage, and keep it that way until the stage is empty.
 - **Volumes move with their parent filesystem.** `cutover` refuses a volume on its own (a volume directly under the pool root needs the pool rebuild), and since a volume can't be unmounted, the tool can't tell that it's in use: stop whatever uses it first.
 - **It needs `zfs rename -u`**, which renames without remounting. It is tested on OpenZFS 2.4.

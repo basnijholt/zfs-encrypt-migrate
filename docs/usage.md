@@ -29,7 +29,7 @@ The six migration and tree commands take the same options.
 | Option | Environment variable | Default | Description |
 | --- | --- | --- | --- |
 | `--stage DATASET` | `ZFS_ENCRYPT_MIGRATE_STAGE` | required | Staging dataset, such as `tank/stage`. Never guessed. |
-| `--key-file PATH` | `ZFS_ENCRYPT_MIGRATE_KEY_FILE` | `/run/zfs-encrypt-migrate.key` | Key file for the staged tree; must have mode `600`. |
+| `--key-file PATH` | `ZFS_ENCRYPT_MIGRATE_KEY_FILE` | `/run/zfs-encrypt-migrate.key` | Key file for the staged tree, as an absolute path; must have mode `600`. |
 | `--min-free SIZE` | `ZFS_ENCRYPT_MIGRATE_MIN_FREE` | `1T` | Free space to keep on the stage pool after the copy. |
 | `--keyformat FORMAT` | `ZFS_ENCRYPT_MIGRATE_KEYFORMAT` | `passphrase` | Key format of the key file: `passphrase`, `hex` or `raw`. |
 | `--final-keylocation LOC` | `ZFS_ENCRYPT_MIGRATE_FINAL_KEYLOCATION` | `prompt` | `keylocation` set on the dataset after the swap. |
@@ -40,13 +40,14 @@ Encryption is always `aes-256-gcm`.
 The stage holds the staged copy at `<stage>/<leaf>` and the original, after the swap, at `<stage>/old/<leaf>`, where `<leaf>` is the last component of the dataset name.
 `seed` and `tree-seed` create `<stage>` and `<stage>/old` with `canmount=off` when they're missing.
 `cutover` and the tree commands rename between the dataset and the stage, so both must be on the same pool.
+The stage and the dataset may not overlap: every migration and tree command refuses, before any `zfs` command, a dataset that is the stage, contains it or lies inside it.
 Because staged names use only the leaf, `tank/a/data` and `tank/b/data` both stage as `tank/stage/data`: migrate one, destroy its old copy, then the other.
 
 **`--key-file`.**
 It must be a regular file with mode `600`; a symlink is followed, and its target must be that file.
 Only `seed` and `tree-seed` read it: they record it on the staged copy as `keylocation=file://<path>`, and later commands load the key from that keylocation.
 Keep the file in place until the swap.
-Give an absolute path: `zfs` rejects a relative `file://` keylocation, and only once `seed` has already taken its snapshots.
+It must be an absolute path; a relative one is a usage error, because `zfs` would reject the relative `file://` keylocation only after `seed` had taken its snapshots.
 
 **`--min-free`.**
 Plain bytes, or a number with a `K`, `M`, `G`, `T` or `P` suffix in powers of 1024, optionally followed by `B` or `iB`, in any case: `1099511627776`, `512M`, `1T`, `2GiB`.
@@ -80,6 +81,7 @@ Copies the dataset and everything under it to an encrypted staged tree, while th
 | --- | --- |
 | `key file PATH not found` | Create the key file. |
 | `key file PATH must have mode 600` | `chmod 600 PATH` |
+| `DATASET overlaps the stage STAGE; neither may be or contain the other` | Use a stage outside the dataset, and don't migrate the stage or anything under it. |
 | `dataset DATASET does not exist` | Check the name. |
 | `DATASET is already encrypted` | Nothing to do. |
 | `a migration is already in flight under STAGE` | Finish (or clean up) the migration whose staged copy is under the stage. |
@@ -87,7 +89,7 @@ Copies the dataset and everything under it to an encrypted staged tree, while th
 | `STAGE/old/LEAF already exists` | Destroy the old copy of an earlier dataset with the same leaf first. |
 | `free space on POOL (AVAIL) minus size of DATASET (USED) is below floor MIN_FREE` | Free space, or lower `--min-free`. Sizes are in bytes; `USED` is the dataset's `used`, which includes its children and snapshots. |
 
-`seed` also works on a pool root and with a stage on another pool; `cutover` then refuses, but [rebuilding a pool encrypted](guides.md#rebuilding-a-whole-pool-encrypted) uses exactly that.
+`seed` also works on a pool root, with a stage on another pool; `cutover` then refuses, but [rebuilding a pool encrypted](guides.md#rebuilding-a-whole-pool-encrypted) uses exactly that.
 
 ### catchup
 
@@ -196,21 +198,31 @@ Copies one direct child, with everything under it, beneath the staged parent:
 On success it prints:
 
 ```text
+verify the key with: zfs load-key -n -L prompt STAGE/LEAF
 moved DATASET/CHILD; once verified, free it with: zfs destroy -r DATASET/CHILD
 ```
 
+Destroy the source child only after a run that printed `moved ...`.
+Once it's destroyed, the staged copy is the only one, while its key still comes from the key file.
+`-L prompt` makes `zfs load-key -n` ask for the passphrase instead of reading that file, so it checks the passphrase you stored; run it before every destroy.
+
 The source child stays where it is, unmounted, until you destroy it.
 It keeps its `canmount`, so `zfs mount -a` or a reboot mounts it again; destroy it soon after you've checked the copy.
+
+When the child is already staged, a rerun of `tree-move` checks the staged copy instead of copying:
+
+- If every dataset under `DATASET/CHILD` has an `@enc-tree` with the same GUID as its counterpart under `STAGE/LEAF/CHILD`, and everything there is encrypted under `STAGE/LEAF`, the child was already moved: it prints `DATASET/CHILD was already moved to STAGE/LEAF/CHILD`, then the two lines above, and exits 0.
+- Otherwise the staged copy is partial, left by a run that was interrupted or failed, and it refuses with the commands that remove it.
 
 | Message | Fix |
 | --- | --- |
 | `DATASET is on pool POOL but the stage is on OTHER; tree-move cannot rename across pools` | Use a stage on the dataset's pool. |
 | `STAGE/LEAF@enc-tree does not exist; run tree-seed first` | Run `tree-seed`. |
 | `dataset DATASET/CHILD does not exist` | Check the name. |
-| `STAGE/LEAF/CHILD already exists` | That child was already moved. |
+| `STAGE/LEAF/CHILD already exists but is not a complete copy of DATASET/CHILD; a tree-move was interrupted or failed` | Only a run that printed `moved ...` finished the child; don't destroy the source. Run the two commands it prints, `zfs destroy -r DATASET/CHILD@enc-tree` and `zfs destroy -r STAGE/LEAF/CHILD`, then rerun. |
 | `free space on POOL (AVAIL) minus size of DATASET/CHILD (USED) is below floor MIN_FREE` | Free space, or lower `--min-free`. |
 | `cannot unmount NAME; a writer is probably still running` | Stop the writer and rerun. |
-| `enc-tree snapshots of DATASET/CHILD and STAGE/LEAF/CHILD differ`, or `NAME is not encrypted under STAGE/LEAF` | The received copy doesn't match; investigate before retrying. |
+| `enc-tree snapshots of DATASET/CHILD and STAGE/LEAF/CHILD differ`, or `NAME is not encrypted under STAGE/LEAF` | The received copy doesn't match; investigate, then run the two `zfs destroy -r` commands it prints and rerun. |
 | `written since the tree snapshot:` followed by the datasets | Run the two `zfs destroy -r` commands it prints (the stale snapshot and the partial copy), then rerun. |
 
 ### tree-finish
@@ -298,6 +310,9 @@ Once `cutover`, `tree-move` or `tree-finish` has started on the source dataset, 
 | Original renamed aside | `the original is at STAGE/old/LEAF (canmount=noauto, readonly=on); put it back with:` `zfs rename -u STAGE/old/LEAF DATASET`, `zfs inherit readonly DATASET`, the `canmount=on` lines, and `zfs mount -a` |
 | Staged copy renamed into place | `the swap completed; only the final steps failed. Finish with:` `zfs set keylocation=LOC DATASET` and `zfs mount -a` |
 
+Once `tree-move` has taken its `@enc-tree` snapshots, a failure or interrupt also prints `STAGE/LEAF/CHILD may hold a partial copy; remove it and the tree snapshots, then rerun tree-move:`, followed by `zfs destroy -r DATASET/CHILD@enc-tree` and `zfs destroy -r STAGE/LEAF/CHILD`.
+Until both have run, a rerun refuses.
+
 ### Stale snapshots
 
 When a retry is blocked by an `@enc-final` or `@enc-tree-final` left over from an earlier attempt, the tool prints commands that rename it aside, on both sides, to the first `-N` suffix that neither side uses yet:
@@ -338,7 +353,8 @@ And its limits:
 - **You need free space for one dataset at a time** (or the parent plus one child), until you destroy the old copy.
 - **Plan for writer downtime during the cutover.** The dataset is unmounted for the final catch-up and the swap.
 - **NFS clients see stale file handles after a swap.** The path is now served by a different dataset; remount it on the clients.
-- **Children moved with `tree-move` get no old copy to bake in.** Once you destroy a moved source child, the encrypted copy is the only one; only the parent lands in `<stage>/old`.
+- **Children moved with `tree-move` get no old copy to fall back on.** Once you destroy a moved source child, the encrypted copy is the only one; only the parent lands in `<stage>/old`. Check the passphrase you stored first, with the `zfs load-key -n -L prompt STAGE/LEAF` line that `tree-move` prints.
+- **A dataset whose last component is `old` can't be migrated.** Its staged copy would be `<stage>/old`, where the old copies live.
 - **On NixOS, keep the stage out of boot-time key loading.** With the default `boot.zfs.requestEncryptionCredentials = true`, a reboot while a staged copy exists makes the pool import fail with `Key load error`. Before the first `seed`, set it to `false` or to a list without the stage, and keep it that way until the stage is empty; see [NixOS boot prompts](guides.md#nixos-boot-prompts).
 - **Volumes move with their parent filesystem.** `cutover` refuses a volume on its own (a volume directly under the pool root needs the pool rebuild), and since a volume can't be unmounted, the tool can't tell that it's in use: stop whatever uses it first.
 - **It needs `zfs rename -u`.** It is tested on OpenZFS 2.4.
