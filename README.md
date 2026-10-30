@@ -176,7 +176,7 @@ zfs-encrypt-migrate --help
 <!-- export NO_COLOR=1 -->
 <!-- export TERM=dumb -->
 <!-- export TERMINAL_WIDTH=100 -->
-<!-- export COLUMNS=100 -->
+<!-- export LINES=50 -->
 <!-- echo '```bash' -->
 <!-- uv run zfs-encrypt-migrate --help -->
 <!-- echo '```' -->
@@ -224,7 +224,7 @@ zfs-encrypt-migrate seed --help
 <!-- export NO_COLOR=1 -->
 <!-- export TERM=dumb -->
 <!-- export TERMINAL_WIDTH=100 -->
-<!-- export COLUMNS=100 -->
+<!-- export LINES=50 -->
 <!-- echo '```bash' -->
 <!-- uv run zfs-encrypt-migrate seed --help -->
 <!-- echo '```' -->
