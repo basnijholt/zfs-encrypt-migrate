@@ -46,6 +46,7 @@ Because staged names use only the leaf, `tank/a/data` and `tank/b/data` both sta
 It must be a regular file with mode `600`; a symlink is followed, and its target must be that file.
 Only `seed` and `tree-seed` read it: they record it on the staged copy as `keylocation=file://<path>`, and later commands load the key from that keylocation.
 Keep the file in place until the swap.
+Give an absolute path: `zfs` rejects a relative `file://` keylocation, and only once `seed` has already taken its snapshots.
 
 **`--min-free`.**
 Plain bytes, or a number with a `K`, `M`, `G`, `T` or `P` suffix in powers of 1024, optionally followed by `B` or `iB`, in any case: `1099511627776`, `512M`, `1T`, `2GiB`.
@@ -106,13 +107,14 @@ Sends what changed since the seed, without unmounting the dataset:
 
 `catchup` is optional: `cutover` runs the same catch-up itself, unless `@enc-final` already matches on both sides.
 Running it separately lets you check the incremental step before the downtime.
-If anything is written to the dataset after `catchup`, `cutover` refuses; drop the two `@enc-final` snapshots it prints and rerun `cutover`, which then catches up again.
+If anything is written to the dataset after `catchup`, `cutover` refuses and prints two `zfs rename -r` commands that move both `@enc-final` snapshots aside; run them and rerun `cutover`, which then catches up again.
+See [stale snapshots](#stale-snapshots) for why they're renamed rather than destroyed.
 
 | Message | Fix |
 | --- | --- |
 | `STAGE/LEAF does not exist; run seed first` | Run `seed`. |
 | `DATASET@enc-seed does not exist; run seed first` | Run `seed`. |
-| `NAME@enc-final already exists; drop it with: zfs destroy -r NAME@enc-final` | One line per side; run the commands shown. |
+| `NAME@enc-final already exists; rename it aside with: zfs rename -r NAME@enc-final @enc-final-N` | One line per side, with the same free suffix `N`; run the commands shown, then rerun. |
 | `enc-final snapshots of DATASET and STAGE/LEAF differ` | The receive didn't produce matching snapshots; investigate before retrying. |
 | `NAME is not encrypted under STAGE/LEAF` | A dataset arrived outside the staged encryption root; investigate before retrying. |
 
@@ -129,26 +131,31 @@ Stop everything that writes to the dataset first.
 2. Unmounts the dataset and its descendants, children first, never forcing.
 3. Catches up as `catchup` does, unless `@enc-final` already matches on both sides.
 4. `zpool sync POOL`, then refuses if `written@enc-final` is non-zero anywhere in the tree.
-5. Sets `canmount=noauto` on every dataset in the tree.
+5. Sets `canmount=noauto` on every filesystem in the tree. Volumes have no `canmount`; they just move with the renames.
 6. `zfs rename -u DATASET STAGE/old/LEAF`, then `readonly=on` on it.
 7. `zfs rename -u STAGE/LEAF DATASET`
 8. Sets `keylocation` to `--final-keylocation`.
-9. Mounts, parents first, every dataset with `canmount=on` whose mountpoint isn't `none` or `legacy`.
+9. Mounts, parents first, every filesystem with `canmount=on` whose mountpoint isn't `none` or `legacy`.
 
 On success it prints:
 
 ```text
+verify the key with: zfs load-key -n DATASET
 cutover done; once verified, free the old copy with: zfs destroy -r STAGE/old/LEAF
 ```
+
+`zfs load-key -n` asks for the passphrase and checks it without changing anything.
+Run it before you destroy the old copy: after that, the encrypted dataset is the only copy.
 
 | Message | Fix |
 | --- | --- |
 | `DATASET is a pool root; cutover is not supported` | See [rebuilding a pool encrypted](guides.md#rebuilding-a-whole-pool-encrypted). |
 | `DATASET is on pool POOL but the stage is on OTHER; cutover cannot rename across pools` | Use a stage on the dataset's pool. |
 | `STAGE/LEAF does not exist; run seed first` | Run `seed`. |
+| `DATASET is a volume; cutover swaps filesystems only, with any volumes under them` | Migrate the volume with its parent filesystem (`cutover` of the parent, or `tree-move`); one directly under the pool root needs [the pool rebuild](guides.md#rebuilding-a-whole-pool-encrypted). |
 | `cannot unmount NAME; a writer is probably still running` | Stop the writer and rerun. |
 | Any [`catchup`](#catchup) message | As for `catchup`. |
-| `written since catchup:` followed by the datasets | Run the two `zfs destroy -r ...@enc-final` commands it prints, then rerun `cutover`. |
+| `written since catchup:` followed by the datasets | Run the two `zfs rename -r ...@enc-final @enc-final-N` commands it prints, then rerun `cutover`. |
 
 ## Tree Commands
 
@@ -225,6 +232,7 @@ Once every child has been moved and destroyed, sends the parent's last changes a
 On success it prints:
 
 ```text
+verify the key with: zfs load-key -n DATASET
 tree-finish done; once verified, free the old copy with: zfs destroy -r STAGE/old/LEAF
 ```
 
@@ -235,10 +243,10 @@ tree-finish done; once verified, free the old copy with: zfs destroy -r STAGE/ol
 | `STAGE/LEAF@enc-tree does not exist; run tree-seed first` | Run `tree-seed`. |
 | `DATASET@enc-tree does not exist; run tree-seed first` | Run `tree-seed`. |
 | `children remain under DATASET; move each with tree-move and destroy it first` | Finish moving the children. |
-| `NAME@enc-tree-final already exists; drop it with: zfs destroy NAME@enc-tree-final` | One line per side; run the commands shown. |
+| `NAME@enc-tree-final already exists; rename it aside with: zfs rename NAME@enc-tree-final @enc-tree-final-N` | One line per side, with the same free suffix `N`; run the commands shown, then rerun. |
 | `cannot unmount NAME; a writer is probably still running` | Stop the writer and rerun. |
 | `enc-tree-final snapshots of DATASET and STAGE/LEAF differ` | The received copy doesn't match; investigate before retrying. |
-| `written since the final snapshot:` followed by the dataset | Run the two `zfs destroy` commands it prints, then rerun. |
+| `written since the final snapshot:` followed by the dataset | Run the two `zfs rename ...@enc-tree-final @enc-tree-final-N` commands it prints, then rerun. |
 
 ## Audit
 
@@ -269,7 +277,7 @@ When a `zfs` or `zpool` command fails, the message is the command followed by `f
 | `0` | Success; for `audit`, nothing unencrypted outside the allowlists. |
 | `1` | A refusal or a failed `zfs` command; for `audit`, an unencrypted dataset or a pool it couldn't list. |
 | `2` | Usage error: a missing `--stage`, an invalid name, size or keylocation, or no pool for `audit`. |
-| `130` | Interrupted by Ctrl-C, SIGTERM or SIGHUP. |
+| `130` | A migration or tree command interrupted by Ctrl-C, SIGTERM or SIGHUP. `audit` has nothing to clean up: Ctrl-C ends it with 1, and SIGTERM or SIGHUP end it like any other process. |
 
 ## Recovery Hints
 
@@ -290,22 +298,37 @@ Once `cutover`, `tree-move` or `tree-finish` has started on the source dataset, 
 | Original renamed aside | `the original is at STAGE/old/LEAF (canmount=noauto, readonly=on); put it back with:` `zfs rename -u STAGE/old/LEAF DATASET`, `zfs inherit readonly DATASET`, the `canmount=on` lines, and `zfs mount -a` |
 | Staged copy renamed into place | `the swap completed; only the final steps failed. Finish with:` `zfs set keylocation=LOC DATASET` and `zfs mount -a` |
 
+### Stale snapshots
+
+When a retry is blocked by an `@enc-final` or `@enc-tree-final` left over from an earlier attempt, the tool prints commands that rename it aside, on both sides, to the first `-N` suffix that neither side uses yet:
+
+```text
+zfs rename -r tank/data@enc-final @enc-final-1
+zfs rename -r tank/stage/data@enc-final @enc-final-1
+```
+
+Renaming, not destroying, is what makes the retry work.
+The staged copy still matches its newest snapshot, so the next incremental receive can build on it; destroy that snapshot and `zfs recv` refuses the staged copy as modified, which leaves only a fresh `seed`.
+A renamed snapshot keeps its GUID, so the retry's receive skips it instead of sending it again.
+`@enc-tree-final` is renamed without `-r`, because `tree-finish` snapshots only the parent.
+Once the migration is done, the renamed snapshots are ordinary snapshots you can destroy.
+
 ### Interrupts and hangups
 
 Ctrl-C (SIGINT), SIGTERM and SIGHUP all take the same path: a running `zfs send` and `zfs recv` are stopped, the staged key is unloaded, `error: interrupted` and the hints are printed, and the exit status is 130.
-While it cleans up, further signals are ignored, so a second Ctrl-C can't cut the cleanup short.
+While it unloads the key, further signals are ignored, so a second Ctrl-C can't skip the unload.
 
 A signal that was already ignored when the tool started stays ignored.
 For a long seed over SSH, `nohup zfs-encrypt-migrate seed ...` therefore survives a dropped connection instead of aborting.
 
 ## Safety Model
 
-- **It never destroys anything.** It never runs `zfs destroy`. Stale snapshots, old copies and moved children are left for you, with the exact command printed.
+- **It never destroys anything.** It never runs `zfs destroy`. Old copies and moved children are left for you, with the exact command printed; stale snapshots get a printed rename instead.
 - **Staged keys stay unloaded.** The staged copy keeps every mountpoint set locally in the original tree, so its key is loaded only while the tool works on it. `seed`, `catchup`, `tree-seed` and `tree-move` unload it when they finish, and any failure or interrupt part way through unloads it too.
 - **One migration in flight.** `seed` and `tree-seed` refuse while anything other than `<stage>`, `<stage>/old` and the old copies under it exists under the stage.
 - **A free-space floor.** `seed`, `tree-seed` and `tree-move` refuse unless the stage pool's free space minus the size of what they copy stays at least `--min-free`.
 - **No lost writes.** `cutover`, `tree-move` and `tree-finish` unmount the source first and refuse if it's busy. After the final snapshot they run `zpool sync` and refuse if `written@<snapshot>` is non-zero anywhere in the tree.
-- **Nothing lands unencrypted.** Receives into the staged copy use `-x encryption`. After each catch-up and each `tree-move`, every dataset in the received tree is checked to have the staged copy as its `encryptionroot`, and snapshots are compared by GUID.
+- **Nothing lands unencrypted.** Catch-up and `tree-move` receives use `-x encryption`. After each catch-up and each `tree-move`, every dataset in the received tree is checked to have the staged copy as its `encryptionroot`, and snapshots are compared by GUID.
 - **Recovery hints that match the failure.** See [recovery hints](#recovery-hints).
 - **Signals are cleanups, not crashes.** See [interrupts and hangups](#interrupts-and-hangups).
 
@@ -316,6 +339,8 @@ And its limits:
 - **Plan for writer downtime during the cutover.** The dataset is unmounted for the final catch-up and the swap.
 - **NFS clients see stale file handles after a swap.** The path is now served by a different dataset; remount it on the clients.
 - **Children moved with `tree-move` get no old copy to bake in.** Once you destroy a moved source child, the encrypted copy is the only one; only the parent lands in `<stage>/old`.
+- **On NixOS, keep the stage out of boot-time key loading.** With the default `boot.zfs.requestEncryptionCredentials = true`, a reboot while a staged copy exists makes the pool import fail with `Key load error`. Before the first `seed`, set it to `false` or to a list without the stage, and keep it that way until the stage is empty; see [NixOS boot prompts](guides.md#nixos-boot-prompts).
+- **Volumes move with their parent filesystem.** `cutover` refuses a volume on its own (a volume directly under the pool root needs the pool rebuild), and since a volume can't be unmounted, the tool can't tell that it's in use: stop whatever uses it first.
 - **It needs `zfs rename -u`.** It is tested on OpenZFS 2.4.
 
 ## NixOS Module Options

@@ -53,12 +53,12 @@ An `audit` command lists every dataset that is still unencrypted, for a timer or
 
 The tool runs as root against your only copy of the data, so it is built to stop rather than improvise:
 
-- **It never destroys anything.** It never runs `zfs destroy`. When something needs to go — a stale snapshot, the old copy after a cutover, a moved child — it prints the exact command and leaves it to you.
+- **It never destroys anything.** It never runs `zfs destroy`. When something needs to go — the old copy after a cutover, a moved child — it prints the exact command and leaves it to you. A stale snapshot that blocks a retry gets a printed command that renames it aside instead.
 - **Staged keys stay unloaded.** The staged copy keeps every mountpoint set locally in the original tree, so its key is loaded only while the tool works on it. `seed`, `catchup`, `tree-seed` and `tree-move` unload it when they finish, and any failure or Ctrl-C part way through unloads it too.
 - **One migration in flight.** `seed` and `tree-seed` refuse while anything other than the `old` copies sits under the stage.
 - **A free-space floor.** `seed`, `tree-seed` and `tree-move` refuse unless the stage pool's free space, minus the size of what they copy, stays at least `--min-free` (default `1T`).
 - **No lost writes.** `cutover`, `tree-move` and `tree-finish` unmount the source first and refuse if it's busy (they never force). After the final snapshot they run `zpool sync` and refuse if `written@<snapshot>` is non-zero anywhere in the tree.
-- **Nothing lands unencrypted.** Receives into the staged copy use `-x encryption`, so a child created after the seed, or moved with `tree-move`, inherits encryption instead of arriving in plaintext. After each catch-up and each `tree-move`, every dataset in the received tree is checked to have the staged copy as its `encryptionroot`, and the snapshots on both sides are compared by GUID.
+- **Nothing lands unencrypted.** Catch-up and `tree-move` receives use `-x encryption`, so a child created after the seed, or moved with `tree-move`, inherits encryption instead of arriving in plaintext. After each catch-up and each `tree-move`, every dataset in the received tree is checked to have the staged copy as its `encryptionroot`, and the snapshots on both sides are compared by GUID.
 - **Recovery hints that match the failure.** If a swap fails part way, the error lists the commands for the exact step it reached: remount, restore `canmount`, rename the original back, or finish setting the keylocation.
 - **Signals are cleanups, not crashes.** SIGINT, SIGTERM and SIGHUP (a dropped SSH session) all take the Ctrl-C path: a running `zfs send`/`zfs recv` is stopped, the staged key is unloaded, the hints are printed, and the exit status is 130. A signal that was already ignored when the tool started, as under `nohup`, stays ignored, so a `nohup` run survives a hangup.
 
@@ -69,6 +69,8 @@ Some limits are worth stating plainly:
 - **Plan for writer downtime during the cutover.** The dataset is unmounted for the final catch-up and the swap; stop the services that write to it first.
 - **NFS clients see stale file handles after a swap.** The path is now served by a different dataset; remount it on the clients.
 - **Children moved with `tree-move` get no old copy to bake in.** You destroy each source child once it's moved, and from then on the encrypted copy is the only one; only the parent lands in `<stage>/old`.
+- **On NixOS, keep the stage out of boot-time key loading.** With the default `boot.zfs.requestEncryptionCredentials = true`, a reboot while a staged copy exists makes the pool import fail with `Key load error`. Before the first `seed`, set it to `false` or to a list without the stage, and keep it that way until the stage is empty.
+- **Volumes move with their parent filesystem.** `cutover` refuses a volume on its own (a volume directly under the pool root needs the pool rebuild), and since a volume can't be unmounted, the tool can't tell that it's in use: stop whatever uses it first.
 - **It needs `zfs rename -u`**, which renames without remounting. It is tested on OpenZFS 2.4.
 
 ## Table of Contents
@@ -122,6 +124,9 @@ install -m 600 /dev/null /run/zfs-encrypt-migrate.key
 read -rs passphrase && printf '%s' "$passphrase" > /run/zfs-encrypt-migrate.key && unset passphrase
 ```
 
+Store the passphrase somewhere safe as well: once the migration is done, it is the only way into your data.
+On NixOS, first take the stage out of boot-time key loading (see the [limits](#safety-model) above).
+
 Copy the dataset to an encrypted staged copy while it stays in use:
 
 ```bash
@@ -132,13 +137,21 @@ Stop whatever writes to `tank/data`, then swap the encrypted copy into place:
 
 ```bash
 zfs-encrypt-migrate cutover tank/data
+# verify the key with: zfs load-key -n tank/data
 # cutover done; once verified, free the old copy with: zfs destroy -r tank/stage/old/data
 ```
 
-Check the result, start your services again, and free the space when you're satisfied:
+Check the result, start your services again, and check that your passphrase opens the new dataset (`-n` only verifies it; nothing changes):
 
 ```bash
 zfs get -r encryption,encryptionroot,keylocation tank/data
+zfs load-key -n tank/data
+```
+
+Destroying the old copy is the point of no return: from then on, the encrypted dataset is the only copy.
+Free the space once you're satisfied:
+
+```bash
 zfs destroy -r tank/stage/old/data
 ```
 
@@ -257,7 +270,7 @@ zfs-encrypt-migrate seed --help
 
 <!-- OUTPUT:END -->
 
-Exit status is 0 on success, 1 on a refusal or failure, 2 on a usage error, and 130 after an interrupt.
+Exit status is 0 on success, 1 on a refusal or failure, 2 on a usage error, and 130 when a migration or tree command is interrupted.
 
 ## NixOS Module
 

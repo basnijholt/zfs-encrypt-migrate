@@ -94,7 +94,7 @@ zfs-encrypt-migrate audit --exact tank --subtree tank/stage tank
 ## NixOS Support
 
 Nix is optional.
-The Python CLI runs on any Linux host with OpenZFS, and the flake adds a NixOS module that installs it and runs the audit on a timer.
+The Python CLI runs on any Linux host whose OpenZFS supports `zfs rename -u` (tested on OpenZFS 2.4), and the flake adds a NixOS module that installs it and runs the audit on a timer.
 
 ## Background
 

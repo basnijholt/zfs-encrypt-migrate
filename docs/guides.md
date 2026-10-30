@@ -10,6 +10,8 @@ All commands here run as root, with the stage set in the environment:
 export ZFS_ENCRYPT_MIGRATE_STAGE=tank/stage
 ```
 
+On NixOS, take the stage out of boot-time key loading before the first `seed`; see [NixOS boot prompts](#nixos-boot-prompts).
+
 ## Migrating One Dataset
 
 This walks `tank/media` onto encryption: a dataset that a service writes to and that is exported over NFS.
@@ -25,7 +27,13 @@ The seed sends the whole dataset, so it can take hours.
 Over SSH, run it in tmux or screen, or under `nohup`: a dropped connection sends SIGHUP, which the tool treats like Ctrl-C, aborting the seed.
 Under `nohup` the hangup stays ignored and the seed carries on.
 
-If a seed is interrupted or fails, clean up before you run it again: the tool never destroys anything, so the `@enc-seed` snapshots on `tank/media` (`zfs destroy -r tank/media@enc-seed`), and any partial `tank/stage/media`, stay behind and make the next `seed` fail until they're gone.
+If a seed is interrupted or fails, clean up before you run it again.
+The tool never destroys anything, so the `@enc-seed` snapshots and any partial staged copy stay behind and make the next `seed` fail until they're gone:
+
+```bash
+zfs destroy -r tank/media@enc-seed   # the seed snapshots on the source
+zfs destroy -r tank/stage/media      # the partial copy, if there is one: on the stage, never the source
+```
 
 If the host reboots before the cutover, the default key file on `/run` is gone.
 Write the same passphrase back to the same path before you continue; the staged copy loads its key from there.
@@ -44,14 +52,24 @@ This sends what changed since the seed, refuses if anything was still written, a
 The downtime is the time that last catch-up and the swap take, usually short after a recent seed.
 
 `catchup` is optional.
-It sends the same changes without unmounting anything, so you can check the incremental step beforehand; but anything written after it makes `cutover` refuse until you drop the two `@enc-final` snapshots it prints.
-If you use it, run it after stopping the writers, right before `cutover`.
+It sends the same changes without unmounting anything, so you can check the incremental step beforehand.
+Anything written after it makes `cutover` refuse and print two `zfs rename -r` commands that move the stale `@enc-final` snapshots aside; run them and rerun `cutover`.
+To skip that round trip, run `catchup` after stopping the writers, right before `cutover`.
 
 **4. Bring it back.**
 Start the services, re-export the share, and remount it on the NFS clients: they see stale file handles, because the path is now a different dataset.
 
-**5. Clean up.**
-Once you're satisfied, free the old copy:
+**5. Check the passphrase.**
+`cutover` prints `verify the key with: zfs load-key -n tank/media`.
+Run it: it asks for the passphrase and checks it, without changing anything.
+
+```bash
+zfs load-key -n tank/media
+```
+
+**6. Clean up.**
+Destroying the old copy is the point of no return: from then on, the encrypted dataset is the only copy, and the passphrase the only way in.
+Once you're satisfied, free the space:
 
 ```bash
 zfs destroy -r tank/stage/old/media
@@ -98,7 +116,7 @@ zfs destroy -r tank/backups/host1
 Don't wait long: the unmounted source keeps its `canmount`, so `zfs mount -a` or a reboot mounts it again, and anything written to it then is not in the copy.
 
 Repeat for every child.
-Children keep their properties and snapshots, including a `mountpoint=none` or `readonly=on` they had, and volumes move the same way.
+Children keep their properties and snapshots, including a `mountpoint=none` or `readonly=on` they had, and volumes move the same way (stop whatever uses a volume first).
 
 **3. Finish the parent.**
 Stop whatever writes to `tank/backups`, then:
@@ -111,9 +129,10 @@ zfs-encrypt-migrate tree-finish tank/backups
 It then sends the parent's last changes and swaps `tank/stage/backups`, with the moved children under it, into place, exactly like `cutover`.
 Afterwards, every child has `tank/backups` as its encryption root.
 
-**4. Clean up.**
+**4. Check the passphrase, then clean up.**
 
 ```bash
+zfs load-key -n tank/backups
 zfs destroy -r tank/stage/old/backups
 ```
 
@@ -127,7 +146,7 @@ The recipe below stages the whole pool `ssd` on another pool, `tank`, recreates 
 It's rehearsed step for step in the project's NixOS VM test (`nix/integration-test.nix`).
 
 You need room on `tank` for everything on `ssd`, plus the `--min-free` floor.
-The send-back moves the pool root's **children**; anything stored directly in the root dataset of `ssd` isn't part of it, so move such files into a child first.
+The send-back moves the pool root's **children**; anything stored directly in the root dataset of `ssd` isn't part of it, so move such files into a child before step 1.
 
 **1. Seed and catch up the pool.**
 `seed` and `catchup` accept a pool root and a stage on another pool:
@@ -143,14 +162,27 @@ zfs-encrypt-migrate catchup ssd
 ```
 
 `tank/stage/ssd` now holds an encrypted copy of the whole pool, up to `@enc-final`, with its key unloaded.
-Anything written to `ssd` from here on is lost when the pool is destroyed; this read-only check should print a `0` for every dataset:
+Anything written to `ssd` from here on is lost when the pool is destroyed, so check that nothing was:
 
 ```bash
 zpool sync ssd
-zfs get -rH -t filesystem,volume -o name,value written@enc-final ssd
+zfs get -rHp -t filesystem,volume -o name,value written@enc-final ssd
 ```
 
-**2. Destroy and recreate the pool encrypted.**
+Every value must be `0`.
+If any isn't, stop here and don't destroy the pool: stop whatever still writes, then run `catchup` again (it prints the `zfs rename -r` commands that move the stale `@enc-final` snapshots aside first).
+
+**2. Note the pool root's properties.**
+
+```bash
+zfs get -H -s received,local -o property,value all tank/stage/ssd
+```
+
+The staged root holds, as received properties, everything that was set on the old pool root, such as `mountpoint`, `compression`, `atime` or `acltype`.
+The children inherited those from the root, and after the rebuild they inherit from the new root, so the new root needs them too.
+Pass each one as `-O property=value` to `zpool create` in the next step, except `keylocation`: the seed set that on the staged copy itself.
+
+**3. Destroy and recreate the pool encrypted.**
 
 > [!CAUTION]
 > This destroys the pool. `zpool destroy` is irreversible: after it, the only copy of the data on `ssd` is `tank/stage/ssd` (and your backups). Check the staged copy before you continue.
@@ -160,21 +192,24 @@ udevadm settle
 zpool destroy ssd
 zpool create -O encryption=aes-256-gcm -O keyformat=passphrase \
   -O keylocation=file:///run/zfs-encrypt-migrate.key \
-  -O mountpoint=/ssd ssd DEVICES...
+  -O mountpoint=/ssd -O compression=zstd -O atime=off \
+  ssd DEVICES...
 ```
 
-Recreate it with your original vdev layout and pool properties; only the encryption options are new.
+Here `-O mountpoint=/ssd -O compression=zstd -O atime=off` stands for the properties from step 2.
+Recreate the pool with your original vdev layout and pool properties too; only the encryption options are new.
 `udevadm settle` lets udev finish with any volumes on the pool first.
 The recipe uses the staged copy's key file for the new pool root too, so one passphrase covers both.
 
-**3. Send each child back.**
+**4. Send each child back.**
 
 ```bash
 for d in $(zfs list -H -d1 -t filesystem,volume -o name tank/stage/ssd | tail -n +2); do
   c=${d#tank/stage/}
   zfs send -R -w "$d@enc-final" | zfs recv -u "$c" &&
     zfs load-key -L file:///run/zfs-encrypt-migrate.key "$c" &&
-    zfs change-key -i "$c"
+    zfs change-key -i "$c" ||
+    { echo "send-back of $d failed; stop and investigate" >&2; break; }
 done
 ```
 
@@ -185,28 +220,41 @@ For each direct child of `tank/stage/ssd`, say `tank/stage/ssd/docker`:
 - `zfs load-key -L file://...` loads that key, from the same key file.
 - `zfs change-key -i` makes it inherit the key of the pool root `ssd`, so one passphrase unlocks the whole pool.
 
-**4. Switch the pool to its final keylocation and mount.**
+If any step fails, the loop stops and names the child.
+Don't go on to the cleanup: `tank/stage/ssd` is still the only copy of that child and of every child after it.
+
+**5. Switch the pool to its final keylocation and mount.**
 
 ```bash
 zfs set keylocation=prompt ssd
 zfs mount -a
 ```
 
-**5. Verify.**
-Every dataset on the pool should have `ssd` as its encryption root; this prints nothing when that holds:
+**6. Verify.**
+Each of these must print nothing.
+Every snapshot of every child arrived, with its GUID (bash; the pool root's own snapshots are left out, because the root isn't sent back):
+
+```bash
+diff <(zfs list -rH -t snapshot -o name,guid tank/stage/ssd | sed 's|^tank/stage/||' | grep -v '^ssd@' | sort) \
+  <(zfs list -rH -t snapshot -o name,guid ssd | grep -v '^ssd@' | sort)
+```
+
+Every dataset on the pool has `ssd` as its encryption root:
 
 ```bash
 zfs get -rH -o name,value encryptionroot ssd | awk '$2 != "ssd"'
 ```
 
-The received snapshots keep their GUIDs, so you can compare any of them with the staged side:
+And your passphrase opens the pool:
 
 ```bash
-zfs get -H -o value guid ssd/docker@enc-final tank/stage/ssd/docker@enc-final
+zfs load-key -n ssd
 ```
 
-**6. Clean up.**
-Once you're satisfied:
+**7. Clean up.**
+
+> [!CAUTION]
+> This destroys the last copy outside the pool. After it, `ssd` is the only copy of its data (and your backups). Run it only once every check in step 6 passed.
 
 ```bash
 zfs destroy -r tank/stage/ssd
@@ -253,12 +301,27 @@ See the [zfs-unlock docs](https://zfs-unlock.nijho.lt/getting-started/) for the 
 
 ### NixOS boot prompts
 
-On NixOS, importing a pool asks for every `prompt` key it finds by default (`boot.zfs.requestEncryptionCredentials = true`) and waits for an answer indefinitely (`boot.zfs.passwordTimeout = 0`).
-If something else, like `zfs-unlock`, loads these keys, set `boot.zfs.requestEncryptionCredentials` to `false`, or to a list of only the datasets that must unlock at boot.
+**Before the first `seed`**, set `boot.zfs.requestEncryptionCredentials` to `false`, or to an explicit list of encryption roots that leaves out the stage, and keep it that way until the stage is empty:
 
-With the default `true`, the same import step also runs `zfs load-key` for every locked dataset whose keylocation is a file.
-That includes a staged copy in flight, whose keylocation is the key file.
-Keeping the key file on `/run`, the default, means it's gone at boot, so the staged copy stays locked as it should; an explicit list avoids the attempt altogether.
+```nix
+boot.zfs.requestEncryptionCredentials = false;
+# or only the datasets that must unlock at boot:
+# boot.zfs.requestEncryptionCredentials = [ "tank/media" ];
+```
+
+With the default `true`, importing a pool runs `zfs load-key` for every locked dataset whose keylocation is a file.
+That includes a staged copy in flight, whose keylocation is the key file, and after a reboot the key file on `/run` is gone.
+The load fails, and the pool import fails with it:
+
+```text
+Key load error: Failed to open key material file: No such file or directory
+```
+
+`zfs-import.target` is then never reached, and encrypted datasets after the staged copy don't get their keys loaded.
+For a pool imported in the initrd, such as the root pool, the same import runs during early boot.
+
+The same default also makes the import ask for every `prompt` key it finds, such as a migrated dataset's, and wait for the answer indefinitely (`boot.zfs.passwordTimeout = 0`).
+So if something else, like `zfs-unlock`, loads these keys, keep `requestEncryptionCredentials` at `false`, or at a list of only the datasets that must unlock at boot, after the migration too.
 
 ## Snapshot Tools: sanoid and syncoid
 
@@ -301,4 +364,4 @@ So after the cutover, syncoid finds the same common snapshot with the backup tar
 
 - syncoid's default sends aren't raw: they need the dataset's key loaded, and the backup target stays as it was (unencrypted, if it was before).
 - Raw sends (`--sendoptions=w`) are a different setup that this guide doesn't cover.
-- If you replicate a whole pool recursively, leave the stage out with syncoid's `--exclude-datasets` (a regular expression), for example `--exclude-datasets='^tank/stage'`.
+- If you replicate a whole pool recursively, leave the stage out with syncoid's `--exclude-datasets` (a regular expression), for example `--exclude-datasets='^tank/stage(/|$)'`, which matches the stage and everything under it but not, say, `tank/stage2`.

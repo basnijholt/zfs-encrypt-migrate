@@ -42,6 +42,7 @@ On NixOS, the flake's module installs it for you; see [NixOS module options](usa
 - **The host's own `zfs` and `zpool` on `PATH`.** The package doesn't bundle them, so they always match the loaded kernel module.
 - **`zfs rename -u`**, which renames a dataset without remounting it. The tool is tested on OpenZFS 2.4.
 - **Free space on the same pool** for one dataset at a time, plus the `--min-free` floor (default `1T`).
+- **On NixOS, no boot-time key loading for the stage.** Before the first `seed`, set `boot.zfs.requestEncryptionCredentials` to `false` or to a list without the stage, and keep it that way until the stage is empty. Otherwise a reboot mid-migration makes the pool import fail with `Key load error`; see [NixOS boot prompts](guides.md#nixos-boot-prompts).
 
 ## Choose a Stage
 
@@ -74,7 +75,7 @@ With the default `--keyformat passphrase`, OpenZFS wants 8 to 512 bytes.
 Three things to know about this file:
 
 - `seed` records it on the staged copy as `keylocation=file:///run/zfs-encrypt-migrate.key`, and later commands load the key from there, so keep the file in place until the cutover.
-- Keep it on a tmpfs such as `/run`, which a reboot empties: then nothing at boot can unlock the staged copy (NixOS's pool import, for one, tries; see [NixOS boot prompts](guides.md#nixos-boot-prompts)). After a reboot mid-migration, write the same passphrase back before you continue.
+- Keep it on a tmpfs such as `/run`, which a reboot empties, so nothing at boot can unlock the staged copy (on NixOS, also see the [requirements](#requirements)). After a reboot mid-migration, write the same passphrase back before you continue.
 - `cutover` sets `keylocation=prompt` (or your `--final-keylocation`) on the migrated dataset. From then on, this passphrase is what unlocks it after a reboot, so store it somewhere safe.
 
 ## Your First Migration
@@ -96,6 +97,7 @@ zfs-encrypt-migrate cutover tank/data
 ```
 
 ```text
+verify the key with: zfs load-key -n tank/data
 cutover done; once verified, free the old copy with: zfs destroy -r tank/stage/old/data
 ```
 
@@ -103,6 +105,7 @@ cutover done; once verified, free the old copy with: zfs destroy -r tank/stage/o
 Then it moves the original to `tank/stage/old/data` (read-only, `canmount=noauto`), renames the encrypted copy to `tank/data`, sets the final keylocation and mounts it.
 
 If a step refuses, the error says why and what to run; fix that and run the same command again.
+For example, if something wrote to `tank/data` after a separate `catchup`, `cutover` prints two `zfs rename -r` commands that move the stale `@enc-final` snapshots aside.
 
 ## Verify
 
@@ -115,9 +118,14 @@ zfs list -r -t snapshot -o name tank/data
 
 # The original: unencrypted, read-only, not mounted
 zfs get -r encryption,readonly,canmount,mounted tank/stage/old/data
+
+# Your passphrase opens it: asks for it and checks it, without changing anything
+zfs load-key -n tank/data
 ```
 
-Start your services again.
+Start your services again, and make sure the passphrase is stored somewhere safe.
+
+Destroying the old copy is the point of no return: from then on, the encrypted dataset is the only copy.
 Once you're satisfied, free the space; the tool never destroys anything itself:
 
 ```bash
