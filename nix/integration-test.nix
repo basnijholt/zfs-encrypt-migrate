@@ -270,6 +270,32 @@ pkgs.testers.runNixOSTest {
         machine.succeed("test -f /tank/tf/a && test -f /tank/tf/b && test -f /tank/tf/c")
         assert get("encryptionroot", "tank/tf") == "tank/tf"
 
+    with subtest("tree-move rerun after writes since the tree snapshot refuses again until cleaned up"):
+        machine.succeed("zfs create tank/wv && zfs create -V 16M tank/wv/vol && udevadm settle")
+        machine.succeed(f"{M} zfs-encrypt-migrate tree-seed {S} tank/wv")
+        # A volume can't be unmounted, so only written@enc-tree catches a writer still using it.
+        machine.succeed(
+            'systemd-run --unit=zvol-writer -E PATH="$PATH" "$(command -v sh)" -c'
+            " 'while :; do dd if=/dev/urandom of=/dev/zvol/tank/wv/vol bs=4096 count=1 conv=fsync status=none; done'"
+        )
+        out = machine.fail(f"{M} zfs-encrypt-migrate tree-move {S} tank/wv vol 2>&1")
+        assert "written since the tree snapshot:\ntank/wv/vol" in out, out
+        machine.succeed("systemctl stop zvol-writer")
+        # The staged copy is complete but lacks those writes, so the rerun must refuse again, not call it moved.
+        out = machine.fail(f"{M} zfs-encrypt-migrate tree-move {S} tank/wv vol 2>&1")
+        assert "written since the tree snapshot:\ntank/wv/vol" in out and "already moved" not in out, out
+        cleanup = [line.strip() for line in out.splitlines() if line.strip().startswith("zfs destroy ")]
+        assert cleanup == ["zfs destroy -r tank/wv/vol@enc-tree", "zfs destroy -r tank/stage/wv/vol"], out
+        for command in cleanup:
+            machine.succeed(command)
+        expected = machine.succeed("sha256sum < /dev/zvol/tank/wv/vol")
+        assert "moved tank/wv/vol" in machine.succeed(f"{M} zfs-encrypt-migrate tree-move {S} tank/wv vol")
+        machine.succeed("udevadm settle && zfs destroy -r tank/wv/vol")
+        machine.succeed(f"{M} zfs-encrypt-migrate tree-finish {S} tank/wv")
+        assert get("encryptionroot", "tank/wv/vol") == "tank/wv"
+        machine.succeed("udevadm settle")
+        assert machine.succeed("sha256sum < /dev/zvol/tank/wv/vol") == expected
+
     with subtest("cutover of a tree with a volume keeps the volume's data"):
         machine.succeed("zfs create tank/vt && zfs create -V 16M tank/vt/vol && udevadm settle")
         # One pattern written before the seed, one after it, so the catch-up carries volume data too.

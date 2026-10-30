@@ -51,6 +51,13 @@ def _start_over(source: str, staged: str) -> list[str]:
     return [f"  zfs destroy -r {source}@{TREE_SNAPSHOT}", f"  zfs destroy -r {staged}"]
 
 
+def _start_over_hint(source: str, staged: str) -> list[str]:
+    return [
+        f"{staged} may hold a partial copy; remove it and the tree snapshots, then rerun tree-move:",
+        *_start_over(source, staged),
+    ]
+
+
 def _moved(source: str, staged_root: str) -> list[str]:
     # Destroying the source leaves the staged copy as the only one while its key still comes from the
     # key file, so the check asks for the passphrase as stored elsewhere instead of reading that file.
@@ -60,16 +67,36 @@ def _moved(source: str, staged_root: str) -> list[str]:
     ]
 
 
-def _earlier_move(zfs: Zfs, source: str, staged: str, staged_root: str) -> list[str]:
-    """Report a finished earlier move again; refuse the partial copy an interrupted or failed one left."""
+def _refuse_unfinished(zfs: Zfs, source: str, staged: str, staged_root: str) -> None:
+    """Refuse a staged child that is not a complete copy of ``source`` at its tree snapshot."""
+    # tree-move snapshots the source before it creates the staged child and never removes that snapshot,
+    # so a source without one was created after a finished move whose original source is gone.
+    if not zfs.exists(f"{source}@{TREE_SNAPSHOT}"):
+        msg = f"{staged} already exists but {source} has no @{TREE_SNAPSHOT}; {source} looks recreated"
+        raise MigrationError(
+            msg,
+            [
+                f"keep {staged}: it may be the only copy of the original data from an earlier move.",
+                f"Resolve this by hand, for example by renaming the new {source} aside with zfs rename.",
+            ],
+        )
     # An interrupted receive leaves the child with descendants or its newest snapshots missing.
-    if snaps_match(zfs, source, staged, TREE_SNAPSHOT) and outside_encryption_root(zfs, staged, staged_root) is None:
-        return [f"{source} was already moved to {staged}", *_moved(source, staged_root)]
-    msg = f"{staged} already exists but is not a complete copy of {source}; a tree-move was interrupted or failed"
-    raise MigrationError(
-        msg,
-        ["remove the partial copy and the tree snapshots, then rerun tree-move:", *_start_over(source, staged)],
-    )
+    complete = snaps_match(zfs, source, staged, TREE_SNAPSHOT)
+    if not complete or outside_encryption_root(zfs, staged, staged_root) is not None:
+        msg = f"{staged} already exists but is not a complete copy of {source}; a tree-move was interrupted or failed"
+        raise MigrationError(
+            msg,
+            ["remove the partial copy and the tree snapshots, then rerun tree-move:", *_start_over(source, staged)],
+        )
+
+
+def _refuse_written(zfs: Zfs, source: str) -> None:
+    """Flush the source's pool and refuse if anything under the source changed since the tree snapshot."""
+    zfs.pool_sync(pool_of(source))
+    dirty = dirty_since(zfs, source, TREE_SNAPSHOT)
+    if dirty:
+        # The guard's cleanup hint says how to start over.
+        raise MigrationError("written since the tree snapshot:\n" + "\n".join(dirty))
 
 
 def tree_seed(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
@@ -100,7 +127,15 @@ def tree_move(zfs: Zfs, settings: Settings, dataset: str, child: str) -> list[st
         msg = f"dataset {source} does not exist"
         raise MigrationError(msg)
     if zfs.exists(staged):
-        return _earlier_move(zfs, source, staged, staged_root)
+        _refuse_unfinished(zfs, source, staged, staged_root)
+        # A complete copy still misses writes made after a failed run or a remount, so it gets the same
+        # unmount, sync and written@ check as a move before the destroy hint is printed again.
+        with abort_guard(zfs, settings, staged_root, label="tree-move") as guard:
+            guard.source = source
+            unmount_subtree(zfs, source)
+            guard.cleanup = _start_over_hint(source, staged)
+            _refuse_written(zfs, source)
+        return [f"{source} was already moved to {staged}", *_moved(source, staged_root)]
     check_free_space(zfs, settings, source, "used")
     # Armed before the load so an interrupt while the key loads still unloads it; the remount hint only
     # applies once the source is about to be unmounted.
@@ -110,21 +145,14 @@ def tree_move(zfs: Zfs, settings: Settings, dataset: str, child: str) -> list[st
         unmount_subtree(zfs, source)
         zfs.snapshot(f"{source}@{TREE_SNAPSHOT}", recursive=True)
         # From here on a rerun refuses until the tree snapshots and any partial copy are gone.
-        guard.cleanup = [
-            f"{staged} may hold a partial copy; remove it and the tree snapshots, then rerun tree-move:",
-            *_start_over(source, staged),
-        ]
+        guard.cleanup = _start_over_hint(source, staged)
         # A replication stream received under an encrypted parent stays unencrypted unless told to inherit.
         zfs.send_recv(["-R", f"{source}@{TREE_SNAPSHOT}"], ["-u", "-x", "encryption", staged])
         if not snaps_match(zfs, source, staged, TREE_SNAPSHOT):
             msg = f"{TREE_SNAPSHOT} snapshots of {source} and {staged} differ"
             raise MigrationError(msg)
         check_encrypted_under(zfs, staged, staged_root)
-        zfs.pool_sync(pool_of(dataset))
-        dirty = dirty_since(zfs, source, TREE_SNAPSHOT)
-        if dirty:
-            # The guard's cleanup hint says how to start over.
-            raise MigrationError("written since the tree snapshot:\n" + "\n".join(dirty))
+        _refuse_written(zfs, source)
         zfs.unload_key(staged_root)
     return _moved(source, staged_root)
 

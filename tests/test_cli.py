@@ -472,6 +472,7 @@ def test_tree_move_interrupt_prints_tree_move_hints_and_exits_130(
 def test_tree_move_partial_copy_exits_1_with_cleanup(sim: ZfsSim) -> None:
     """A copy left by an interrupted run is refused with the commands that remove it."""
     _tree_state(sim)
+    sim.snapshot("tank/data/child@enc-tree")
     sim.datasets.add("tank/stage/data/child")
 
     result = runner.invoke(cli.app, ["tree-move", "tank/data", "child"])

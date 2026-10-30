@@ -240,8 +240,15 @@ def test_tree_move_refusals_write_nothing(sim: ZfsSim, settings: Settings, prepa
     assert info.value.hints == ()
 
 
+def start_over(sim: ZfsSim) -> None:
+    """Apply what the two printed zfs destroy -r commands remove."""
+    for name in (SOURCE, f"{SOURCE}/grand", STAGED, f"{STAGED}/grand"):
+        sim.snapshots.pop(f"{name}@enc-tree")
+    sim.datasets -= {STAGED, f"{STAGED}/grand"}
+
+
 def test_tree_move_rerun_after_a_finished_move_reports_it_again(sim: ZfsSim, settings: Settings) -> None:
-    """A complete, encrypted copy is reported as moved, with the key check and the destroy hint; nothing runs."""
+    """A complete, unchanged copy is reported as moved again after the same sync and written@ check as a move."""
     tree_seeded(sim)
     zfs, _ = make(sim)
     tree_move(zfs, settings, "tank/data", "child")
@@ -250,6 +257,78 @@ def test_tree_move_rerun_after_a_finished_move_reports_it_again(sim: ZfsSim, set
     lines = tree_move(zfs, settings, "tank/data", "child")
 
     assert lines == [f"{SOURCE} was already moved to {STAGED}", *MOVED]
+    # The source is still unmounted, the key is never loaded and nothing is written.
+    assert sim.ops() == [("zpool", "sync", "tank"), written(SOURCE), written(f"{SOURCE}/grand")]
+
+
+def test_tree_move_rerun_after_writes_refuses_again_until_cleaned_up(sim: ZfsSim, settings: Settings) -> None:
+    """A run refused for writes since the snapshot leaves a complete copy; the rerun refuses again, no destroy hint."""
+    tree_seeded(sim)
+    sim.prop(f"{SOURCE}/grand", "written@enc-tree", "4096")
+    zfs, _ = make(sim)
+
+    for _ in range(2):
+        with pytest.raises(MigrationError) as info:
+            tree_move(zfs, settings, "tank/data", "child")
+        assert info.value.message == f"written since the tree snapshot:\n{SOURCE}/grand"
+        assert info.value.hints == MAY_BE_PARTIAL
+
+    start_over(sim)
+    sim.props.pop((f"{SOURCE}/grand", "written@enc-tree"))
+    assert tree_move(zfs, settings, "tank/data", "child") == MOVED
+
+
+def test_tree_move_rerun_after_a_remount_unmounts_and_refuses_writes(sim: ZfsSim, settings: Settings) -> None:
+    """A source mounted again after the move, by a reboot or zfs mount -a, is unmounted and checked for writes."""
+    tree_seeded(sim)
+    zfs, _ = make(sim)
+    tree_move(zfs, settings, "tank/data", "child")
+    sim.prop(SOURCE, "mounted", "yes")
+    sim.prop(SOURCE, "written@enc-tree", "4096")
+    sim.log.clear()
+
+    with pytest.raises(MigrationError, match="written since the tree snapshot") as info:
+        tree_move(zfs, settings, "tank/data", "child")
+
+    assert info.value.hints == MAY_BE_PARTIAL
+    assert sim.ops()[:2] == [("zfs", "unmount", SOURCE), ("zpool", "sync", "tank")]
+    assert not [call for call in sim.ops() if call[1] in {"load-key", "destroy"}]
+
+
+def test_tree_move_rerun_with_busy_source_hints_only_the_remount(sim: ZfsSim, settings: Settings) -> None:
+    """A busy remounted source refuses like a move does: stop the writer and rerun, nothing to clean up yet."""
+    tree_seeded(sim)
+    zfs, _ = make(sim)
+    tree_move(zfs, settings, "tank/data", "child")
+    sim.prop(SOURCE, "mounted", "yes")
+    sim.busy.add(SOURCE)
+
+    with pytest.raises(MigrationError, match=f"cannot unmount {SOURCE}") as info:
+        tree_move(zfs, settings, "tank/data", "child")
+
+    assert info.value.hints == ("tree-move aborted.", f"{SOURCE} may be unmounted; remount with: zfs mount -a")
+
+
+def test_tree_move_refuses_a_recreated_source_without_destroy_hints(sim: ZfsSim, settings: Settings) -> None:
+    """A source without @enc-tree next to a staged child was created after a finished move: keep the staged copy."""
+    tree_seeded(sim)
+    zfs, _ = make(sim)
+    tree_move(zfs, settings, "tank/data", "child")
+    # The operator destroyed the source as told, then something (a backup push, say) created it again.
+    sim.datasets.discard(f"{SOURCE}/grand")
+    for name in (SOURCE, f"{SOURCE}/grand"):
+        sim.snapshots.pop(f"{name}@enc-tree")
+    sim.log.clear()
+
+    with pytest.raises(MigrationError) as info:
+        tree_move(zfs, settings, "tank/data", "child")
+
+    assert info.value.message == f"{STAGED} already exists but {SOURCE} has no @enc-tree; {SOURCE} looks recreated"
+    assert info.value.hints == (
+        f"keep {STAGED}: it may be the only copy of the original data from an earlier move.",
+        f"Resolve this by hand, for example by renaming the new {SOURCE} aside with zfs rename.",
+    )
+    assert not [hint for hint in info.value.hints if "destroy" in hint]
     assert sim.ops() == []
 
 
@@ -292,10 +371,7 @@ def test_tree_move_reruns_once_the_partial_copy_is_removed(sim: ZfsSim, settings
     tree_seeded(sim)
     zfs, _ = make(sim)
     tree_move(zfs, settings, "tank/data", "child")
-    # What the two printed zfs destroy -r commands remove.
-    for name in (SOURCE, f"{SOURCE}/grand", STAGED, f"{STAGED}/grand"):
-        sim.snapshots.pop(f"{name}@enc-tree")
-    sim.datasets -= {STAGED, f"{STAGED}/grand"}
+    start_over(sim)
 
     assert tree_move(zfs, settings, "tank/data", "child") == MOVED
 
