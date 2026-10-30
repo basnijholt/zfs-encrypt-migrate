@@ -33,6 +33,7 @@ if TYPE_CHECKING:
     from zfs_encrypt_migrate.process import CommandResult
 
 MSG = "x"
+R = "rename it aside with: zfs rename -r"
 
 
 def recv_args(key_file: Path, target: str, keyformat: str = "passphrase") -> tuple[str, ...]:
@@ -401,30 +402,46 @@ def test_catchup_requires_seed_snapshot(sim: ZfsSim, settings: Settings) -> None
         catchup(zfs, settings, "tank/data")
 
 
+SOURCE_STALE = f"tank/data@enc-final already exists; {R} tank/data@enc-final"
+STAGED_STALE = f"{STAGE}/data@enc-final already exists; {R} {STAGE}/data@enc-final"
+
+
 @pytest.mark.parametrize(
-    ("stale", "expected"),
+    ("stale", "taken", "expected"),
     [
-        (["tank/data"], ["zfs destroy -r tank/data@enc-final"]),
-        ([f"{STAGE}/data"], [f"zfs destroy -r {STAGE}/data@enc-final"]),
+        (["tank/data"], [], [f"{SOURCE_STALE} @enc-final-1"]),
+        ([f"{STAGE}/data"], [], [f"{STAGED_STALE} @enc-final-1"]),
+        (["tank/data", f"{STAGE}/data"], [], [f"{SOURCE_STALE} @enc-final-1", f"{STAGED_STALE} @enc-final-1"]),
         (
             ["tank/data", f"{STAGE}/data"],
-            ["zfs destroy -r tank/data@enc-final", f"zfs destroy -r {STAGE}/data@enc-final"],
+            ["tank/data@enc-final-1", f"{STAGE}/data@enc-final-1", f"{STAGE}/data@enc-final-2"],
+            [f"{SOURCE_STALE} @enc-final-3", f"{STAGED_STALE} @enc-final-3"],
         ),
     ],
+    ids=["source", "staged", "both", "next-free-suffix"],
 )
-def test_catchup_refuses_stale_final(sim: ZfsSim, settings: Settings, stale: list[str], expected: list[str]) -> None:
-    """An existing enc-final on either side is refused with every destroy hint, key unloaded."""
+def test_catchup_refuses_stale_final(
+    sim: ZfsSim,
+    settings: Settings,
+    stale: list[str],
+    taken: list[str],
+    expected: list[str],
+) -> None:
+    """An existing enc-final is refused with renames to a suffix free on both sides; key unloaded, nothing destroyed."""
     staged_ready(sim)
     sim.prop(f"{STAGE}/data", "keystatus", "available")
     for name in stale:
         sim.snapshot(f"{name}@enc-final")
+    for name in taken:
+        sim.snapshot(name)
     zfs, runner = make(sim)
 
     with pytest.raises(MigrationError) as info:
         catchup(zfs, settings, "tank/data")
 
-    assert all(line in info.value.message for line in expected)
+    assert info.value.message == "\n".join(expected)
     assert runner.pipelines == []
+    assert not [c for c in runner.calls if c[1] in {"rename", "destroy"}]
     assert sim.props[f"{STAGE}/data", "keystatus"] == "unavailable"
 
 
@@ -487,7 +504,10 @@ def test_cutover_skips_catchup_when_finals_match(sim: ZfsSim, settings: Settings
     lines = cutover(zfs, settings, "tank/data")
 
     assert runner.pipelines == []
-    assert lines == [f"cutover done; once verified, free the old copy with: zfs destroy -r {STAGE}/old/data"]
+    assert lines == [
+        "verify the key with: zfs load-key -n tank/data",
+        f"cutover done; once verified, free the old copy with: zfs destroy -r {STAGE}/old/data",
+    ]
     assert sim.ops() == [
         ("zfs", "load-key", f"{STAGE}/data"),
         ("zfs", "unmount", "tank/data/child"),
@@ -602,8 +622,9 @@ def test_cutover_busy_unmount_refuses_with_remount_hint(sim: ZfsSim, settings: S
 
 
 def test_cutover_refuses_writes_since_catchup(sim: ZfsSim, settings: Settings) -> None:
-    """Writes after enc-final list the datasets and both destroy hints; nothing is swapped."""
+    """Writes after enc-final list the datasets and the renames that set both finals aside; nothing is swapped."""
     staged_ready(sim, final=True)
+    sim.snapshot("tank/data@enc-final-1")
     sim.prop("tank/data/child", "written@enc-final", "4096")
     zfs, runner = make(sim)
 
@@ -612,14 +633,45 @@ def test_cutover_refuses_writes_since_catchup(sim: ZfsSim, settings: Settings) -
 
     assert info.value.message == "written since catchup:\ntank/data/child"
     assert info.value.hints[:3] == (
-        "drop the stale snapshots, then retry cutover:",
-        "  zfs destroy -r tank/data@enc-final",
-        f"  zfs destroy -r {STAGE}/data@enc-final",
+        "rename the stale snapshots aside, then retry cutover:",
+        "  zfs rename -r tank/data@enc-final @enc-final-2",
+        f"  zfs rename -r {STAGE}/data@enc-final @enc-final-2",
     )
     assert info.value.hints[3:] == ("cutover aborted.", "tank/data may be unmounted; remount with: zfs mount -a")
     assert ("zpool", "sync", "tank") in runner.calls
     assert not [c for c in runner.calls if c[1] == "rename"]
     assert sim.props[f"{STAGE}/data", "keystatus"] == "unavailable"
+
+
+def test_cutover_swap_leaves_volumes_to_the_renames(sim: ZfsSim, settings: Settings) -> None:
+    """Volumes have no canmount and never mount: the swap only moves them with the renames."""
+    staged_ready(sim, final=True)
+    for name in ("tank/data/vol", f"{STAGE}/data/vol"):
+        sim.datasets.add(name)
+        sim.volumes.add(name)
+        sim.snapshot(f"{name}@enc-seed")
+        sim.snapshot(f"{name}@enc-final")
+    zfs, runner = make(sim)
+
+    cutover(zfs, settings, "tank/data")
+
+    touched = [c for c in runner.calls if c[-1].endswith("/vol") and (c[1] in {"set", "mount"} or "canmount" in c)]
+    assert touched == []
+    assert {"tank/data/vol", f"{STAGE}/old/data/vol"} <= sim.volumes
+    assert ("zfs", "set", "canmount=noauto", "tank/data/child") in runner.calls
+
+
+def test_cutover_refuses_a_volume_before_touching_it(settings: Settings) -> None:
+    """A volume on its own is refused before the key loads: zfs rename -u would fail half way through the swap."""
+    sim = ZfsSim(["tank", "tank/vol", STAGE, f"{STAGE}/old", f"{STAGE}/vol"])
+    sim.volumes |= {"tank/vol", f"{STAGE}/vol"}
+    zfs, _ = make(sim)
+
+    with pytest.raises(MigrationError, match="tank/vol is a volume; cutover swaps filesystems only") as info:
+        cutover(zfs, settings, "tank/vol")
+
+    assert info.value.hints == ()
+    assert sim.ops() == []
 
 
 def test_cutover_never_destroys(sim: ZfsSim, settings: Settings) -> None:

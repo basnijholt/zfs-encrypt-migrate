@@ -45,6 +45,23 @@ def test_subtree_lists_filesystems_and_volumes() -> None:
     assert runner.calls == [("zfs", "list", "-rH", "-t", "filesystem,volume", "-o", "name", "-s", "name", "tank/a")]
 
 
+def test_filesystems_lists_filesystems_only() -> None:
+    """Filesystems leaves volumes out, so the swap never sets canmount on them."""
+    runner = FakeRunner(queue=[ok("tank/a\tfilesystem\ntank/a/vol\tvolume\ntank/a/b\tfilesystem\n")])
+
+    assert Zfs(runner).filesystems("tank/a") == ["tank/a", "tank/a/b"]
+    assert runner.calls == [
+        ("zfs", "list", "-rH", "-t", "filesystem,volume", "-o", "name,type", "-s", "name", "tank/a"),
+    ]
+
+
+def test_filesystems_of_a_volume_is_empty() -> None:
+    """A volume named as the root lists without error and yields no filesystems."""
+    runner = FakeRunner(queue=[ok("tank/vol\tvolume\n")])
+
+    assert Zfs(runner).filesystems("tank/vol") == []
+
+
 def test_snapshot_recursive_flag() -> None:
     """Snapshot adds -r only when asked."""
     runner = FakeRunner()

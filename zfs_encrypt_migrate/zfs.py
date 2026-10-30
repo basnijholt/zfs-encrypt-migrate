@@ -81,6 +81,13 @@ class Zfs:
         result = self._run(["zfs", "list", "-rH", "-t", "filesystem,volume", "-o", "name", "-s", "name", name])
         return result.stdout.split()
 
+    def filesystems(self, name: str) -> list[str]:
+        """List a dataset and its descendant filesystems, without volumes, parents first."""
+        # Filtered here: zfs list -t filesystem refuses a volume named as the root.
+        result = self._run(["zfs", "list", "-rH", "-t", "filesystem,volume", "-o", "name,type", "-s", "name", name])
+        rows = (line.split("\t") for line in result.stdout.splitlines() if line)
+        return [row[0] for row in rows if row[1] == "filesystem"]
+
     def children(self, name: str) -> list[str]:
         """List the filesystems and volumes directly under a dataset."""
         result = self._run(["zfs", "list", "-rH", "-t", "filesystem,volume", "-o", "name", "-d", "1", name])

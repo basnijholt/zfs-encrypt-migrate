@@ -375,7 +375,10 @@ def test_tree_finish_exact_commands(sim: ZfsSim, settings: Settings) -> None:
 
     lines = tree_finish(zfs, settings, "tank/data")
 
-    assert lines == [f"tree-finish done; once verified, free the old copy with: zfs destroy -r {STAGE}/old/data"]
+    assert lines == [
+        "verify the key with: zfs load-key -n tank/data",
+        f"tree-finish done; once verified, free the old copy with: zfs destroy -r {STAGE}/old/data",
+    ]
     assert runner.pipelines == [
         (("zfs", "send", "-p", "-I", "@enc-tree", "tank/data@enc-tree-final"), ("zfs", "recv", "-u", STAGED_ROOT)),
     ]
@@ -478,36 +481,40 @@ def test_tree_finish_lists_direct_children_only(sim: ZfsSim, settings: Settings)
     assert ("zfs", "list", "-rH", "-t", "filesystem,volume", "-o", "name", "-d", "1", "tank/data") in runner.calls
 
 
+SOURCE_STALE = "tank/data@enc-tree-final already exists; rename it aside with: zfs rename tank/data@enc-tree-final"
+STAGED_STALE = (
+    f"{STAGED_ROOT}@enc-tree-final already exists; rename it aside with: zfs rename {STAGED_ROOT}@enc-tree-final"
+)
+
+
 @pytest.mark.parametrize(
-    ("stale", "expected"),
+    ("stale", "taken", "expected"),
     [
+        (["tank/data@enc-tree-final"], [], [f"{SOURCE_STALE} @enc-tree-final-1"]),
+        ([f"{STAGED_ROOT}@enc-tree-final"], [], [f"{STAGED_STALE} @enc-tree-final-1"]),
         (
-            ["tank/data@enc-tree-final"],
-            ["tank/data@enc-tree-final already exists; drop it with: zfs destroy tank/data@enc-tree-final"],
-        ),
-        (
-            [f"{STAGED_ROOT}@enc-tree-final"],
-            [f"{STAGED_ROOT}@enc-tree-final already exists; drop it with: zfs destroy {STAGED_ROOT}@enc-tree-final"],
+            ["tank/data@enc-tree-final", f"{STAGED_ROOT}@enc-tree-final"],
+            [],
+            [f"{SOURCE_STALE} @enc-tree-final-1", f"{STAGED_STALE} @enc-tree-final-1"],
         ),
         (
             ["tank/data@enc-tree-final", f"{STAGED_ROOT}@enc-tree-final"],
-            [
-                "tank/data@enc-tree-final already exists; drop it with: zfs destroy tank/data@enc-tree-final",
-                f"{STAGED_ROOT}@enc-tree-final already exists; drop it with: zfs destroy {STAGED_ROOT}@enc-tree-final",
-            ],
+            [f"{STAGED_ROOT}@enc-tree-final-1"],
+            [f"{SOURCE_STALE} @enc-tree-final-2", f"{STAGED_STALE} @enc-tree-final-2"],
         ),
     ],
-    ids=["source", "staged", "both"],
+    ids=["source", "staged", "both", "next-free-suffix"],
 )
 def test_tree_finish_refuses_stale_final(
     sim: ZfsSim,
     settings: Settings,
     stale: list[str],
+    taken: list[str],
     expected: list[str],
 ) -> None:
-    """A leftover enc-tree-final on either side is refused with its destroy hint, before any write."""
+    """A leftover enc-tree-final is refused with non-recursive renames to a free suffix, before any write."""
     finish_ready(sim)
-    for name in stale:
+    for name in [*stale, *taken]:
         sim.snapshot(name)
     zfs, _ = make(sim)
 
@@ -549,7 +556,7 @@ def test_tree_finish_refuses_guid_mismatch(sim: ZfsSim, settings: Settings) -> N
 
 
 def test_tree_finish_refuses_writes_since_the_final_snapshot(sim: ZfsSim, settings: Settings) -> None:
-    """Writes after the final snapshot list the datasets and both destroy hints; nothing is swapped."""
+    """Writes after the final snapshot list the datasets and the renames that set both finals aside."""
     finish_ready(sim)
     sim.prop("tank/data", "written@enc-tree-final", "4096")
     zfs, runner = make(sim)
@@ -559,9 +566,9 @@ def test_tree_finish_refuses_writes_since_the_final_snapshot(sim: ZfsSim, settin
 
     assert info.value.message == "written since the final snapshot:\ntank/data"
     assert info.value.hints == (
-        "drop the stale snapshots, then retry tree-finish:",
-        "  zfs destroy tank/data@enc-tree-final",
-        f"  zfs destroy {STAGED_ROOT}@enc-tree-final",
+        "rename the stale snapshots aside, then retry tree-finish:",
+        "  zfs rename tank/data@enc-tree-final @enc-tree-final-1",
+        f"  zfs rename {STAGED_ROOT}@enc-tree-final @enc-tree-final-1",
         "tree-finish aborted.",
         "tank/data may be unmounted; remount with: zfs mount -a",
     )

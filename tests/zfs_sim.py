@@ -45,6 +45,7 @@ class ZfsSim:
         self.props: dict[tuple[str, str], str] = {}
         self.avail = avail
         self.busy: set[str] = set()
+        self.volumes: set[str] = set()
         self.roots: list[str] = []
         self.log: list[tuple[str, ...]] = []
         self._sent: tuple[Sequence[str], str, str] | None = None
@@ -68,6 +69,8 @@ class ZfsSim:
     def _get(self, prop: str, name: str) -> str:
         if "@" in name and prop == "guid":
             return self.snapshots[name]
+        if prop == "type":
+            return "volume" if name in self.volumes else "filesystem"
         return self.props.get((name, prop), DEFAULTS.get(prop, "0"))
 
     def ops(self) -> list[tuple[str, ...]]:
@@ -99,6 +102,8 @@ class ZfsSim:
             if "-d" in args:
                 # Only the dataset itself and its direct children, as zfs list -d 1 does.
                 names = [d for d in names if d == args[-1] or d.rsplit("/", 1)[0] == args[-1]]
+            if "name,type" in args:
+                return ok("".join(f"{d}\t{'volume' if d in self.volumes else 'filesystem'}\n" for d in names))
             return ok("".join(f"{d}\n" for d in names))
         if verb == "get":
             if (
@@ -135,9 +140,8 @@ class ZfsSim:
             self.datasets.add(args[-1])
         elif verb == "rename":
             old, new = args[-2:]
-            self.datasets = {
-                new + d.removeprefix(old) if d == old or d.startswith(f"{old}/") else d for d in self.datasets
-            }
+            self.datasets = {self._renamed(d, old, new) for d in self.datasets}
+            self.volumes = {self._renamed(d, old, new) for d in self.volumes}
             self.props = {(self._renamed(n, old, new), p): v for (n, p), v in self.props.items()}
             # Snapshots travel with their dataset.
             self.snapshots = {

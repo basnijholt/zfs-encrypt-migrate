@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Self
 from .errors import Interrupted, MigrationError
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterator, Sequence
     from pathlib import Path
     from types import TracebackType
 
@@ -301,9 +301,36 @@ def seed(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
     return []
 
 
-def _stale_final(zfs: Zfs, name: str, lines: list[str]) -> None:
-    if zfs.exists(f"{name}@{FINAL_SNAPSHOT}"):
-        lines.append(f"{name}@{FINAL_SNAPSHOT} already exists; drop it with: zfs destroy -r {name}@{FINAL_SNAPSHOT}")
+def free_snapshot_name(zfs: Zfs, snap: str, names: Sequence[str]) -> str:
+    """Return the first ``<snap>-N`` that none of ``names`` has, to rename a stale ``snap`` aside to."""
+    number = 1
+    while any(zfs.exists(f"{name}@{snap}-{number}") for name in names):
+        number += 1
+    return f"{snap}-{number}"
+
+
+def rename_aside_commands(zfs: Zfs, snap: str, names: Sequence[str], *, recursive: bool) -> list[str]:
+    """Commands that rename ``snap`` aside on every one of ``names``, all to the same free name.
+
+    Stale snapshots are renamed, never destroyed: the staged head still matches its stale snapshot,
+    so the next incremental receive can start from it, while after a destroy recv refuses the head as
+    modified. A renamed snapshot keeps its GUID, so recv skips it on the side that already has it.
+    """
+    aside = free_snapshot_name(zfs, snap, names)
+    flag = "-r " if recursive else ""
+    return [f"zfs rename {flag}{name}@{snap} @{aside}" for name in names]
+
+
+def refuse_stale(zfs: Zfs, snap: str, names: Sequence[str], *, recursive: bool) -> None:
+    """Refuse when any of ``names`` already has ``snap``, with the command that renames each one aside."""
+    stale = [name for name in names if zfs.exists(f"{name}@{snap}")]
+    if stale:
+        commands = rename_aside_commands(zfs, snap, stale, recursive=recursive)
+        lines = [
+            f"{name}@{snap} already exists; rename it aside with: {command}"
+            for name, command in zip(stale, commands, strict=True)
+        ]
+        raise MigrationError("\n".join(lines))
 
 
 def catchup_staged(zfs: Zfs, settings: Settings, dataset: str) -> None:
@@ -315,11 +342,7 @@ def catchup_staged(zfs: Zfs, settings: Settings, dataset: str) -> None:
     if not zfs.exists(f"{dataset}@{SEED_SNAPSHOT}"):
         msg = f"{dataset}@{SEED_SNAPSHOT} does not exist; run seed first"
         raise MigrationError(msg)
-    stale: list[str] = []
-    _stale_final(zfs, dataset, stale)
-    _stale_final(zfs, staged, stale)
-    if stale:
-        raise MigrationError("\n".join(stale))
+    refuse_stale(zfs, FINAL_SNAPSHOT, [dataset, staged], recursive=True)
     load_stage_key(zfs, staged)
     zfs.snapshot(f"{dataset}@{FINAL_SNAPSHOT}", recursive=True)
     # Children created after the seed arrive as full streams, which stay unencrypted unless told to inherit.
@@ -347,7 +370,8 @@ def swap_into_place(zfs: Zfs, settings: Settings, dataset: str, staged: str, gua
     old = f"{settings.stage}/old/{leaf_of(dataset)}"
     unmount_subtree(zfs, dataset)
     guard.phase = "canmount"
-    for name in zfs.subtree(dataset):
+    # Volumes have no canmount and never mount; they just move along with the renames.
+    for name in zfs.filesystems(dataset):
         if zfs.get("canmount", name) == "on":
             guard.canmount_on.append(name)
         zfs.set_prop(name, "canmount", "noauto")
@@ -357,7 +381,7 @@ def swap_into_place(zfs: Zfs, settings: Settings, dataset: str, staged: str, gua
     zfs.rename(staged, dataset)
     guard.phase = "renamed-new"
     zfs.set_prop(dataset, "keylocation", settings.final_keylocation)
-    for name in zfs.subtree(dataset):
+    for name in zfs.filesystems(dataset):
         if zfs.get("canmount", name) != "on":
             continue
         if zfs.get("mountpoint", name) in {"none", "legacy"}:
@@ -378,6 +402,10 @@ def cutover(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
     if not zfs.exists(staged):
         msg = f"{staged} does not exist; run seed first"
         raise MigrationError(msg)
+    # zfs rename -u refuses volumes, so the swap would stop half way; volumes inside a filesystem move with it.
+    if zfs.get("type", dataset) == "volume":
+        msg = f"{dataset} is a volume; cutover swaps filesystems only, with any volumes under them"
+        raise MigrationError(msg)
     # The guard is armed before the load so an interrupt while the key loads still unloads it; the
     # recovery hints only apply once the source is about to be touched.
     with abort_guard(zfs, settings, staged, label="cutover") as guard:
@@ -394,10 +422,15 @@ def cutover(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
             raise MigrationError(
                 "written since catchup:\n" + "\n".join(dirty),
                 [
-                    "drop the stale snapshots, then retry cutover:",
-                    f"  zfs destroy -r {dataset}@{FINAL_SNAPSHOT}",
-                    f"  zfs destroy -r {staged}@{FINAL_SNAPSHOT}",
+                    "rename the stale snapshots aside, then retry cutover:",
+                    *(
+                        f"  {command}"
+                        for command in rename_aside_commands(zfs, FINAL_SNAPSHOT, [dataset, staged], recursive=True)
+                    ),
                 ],
             )
         swap_into_place(zfs, settings, dataset, staged, guard)
-    return [f"cutover done; once verified, free the old copy with: zfs destroy -r {settings.stage}/old/{leaf}"]
+    return [
+        f"verify the key with: zfs load-key -n {dataset}",
+        f"cutover done; once verified, free the old copy with: zfs destroy -r {settings.stage}/old/{leaf}",
+    ]

@@ -66,6 +66,7 @@ pkgs.testers.runNixOSTest {
     M = "ZFS_ENCRYPT_MIGRATE_MIN_FREE=1M"
     S = "--stage tank/stage"
     get = lambda p, d: machine.succeed(f"zfs get -H -o value {p} {d}").strip()
+    RENAME = "rename it aside with: "
 
     with subtest("seed refuses without key file"):
         machine.succeed("zfs create tank/share && echo a > /tank/share/a && zfs snapshot tank/share@autosnap_1")
@@ -78,7 +79,11 @@ pkgs.testers.runNixOSTest {
     with subtest("M1 swap keeps data, snapshots and path"):
         machine.succeed(f"{M} zfs-encrypt-migrate seed {S} tank/share")
         machine.succeed("echo b > /tank/share/b")
-        machine.succeed(f"{M} zfs-encrypt-migrate cutover {S} tank/share")
+        out = machine.succeed(f"{M} zfs-encrypt-migrate cutover {S} tank/share")
+        assert "verify the key with: zfs load-key -n tank/share" in out, out
+        # The printed check works on the mounted dataset: the right passphrase verifies, a wrong one fails.
+        machine.succeed("zfs load-key -n tank/share < /run/zfs-encrypt-migrate.key")
+        machine.fail("printf wrong-passphrase | zfs load-key -n tank/share")
         assert get("encryption", "tank/share") == "aes-256-gcm"
         assert get("encryptionroot", "tank/share") == "tank/share"
         assert get("keylocation", "tank/share") == "prompt"
@@ -125,16 +130,28 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"{M} zfs-encrypt-migrate cutover {S} tank/two")
         assert get("encryptionroot", "tank/two") == "tank/two"
 
-    with subtest("cutover refuses writes made after catchup"):
-        machine.succeed("zfs create tank/three")
-        machine.succeed(f"{M} zfs-encrypt-migrate seed {S} tank/three && {M} zfs-encrypt-migrate catchup {S} tank/three")
-        machine.succeed("echo late > /tank/three/late")
+    with subtest("cutover refuses writes made after catchup and recovers once the finals are renamed aside"):
+        machine.succeed("zfs create tank/three && zfs create tank/three/kid")
+        machine.succeed(f"{M} zfs-encrypt-migrate seed {S} tank/three")
+        # Writes and a snapshot between seed and catchup: the staged side then has more than enc-seed.
+        machine.succeed("echo b > /tank/three/b && echo k > /tank/three/kid/k && zfs snapshot -r tank/three@autosnap_1")
+        machine.succeed("echo b2 > /tank/three/b2")
+        machine.succeed(f"{M} zfs-encrypt-migrate catchup {S} tank/three")
+        machine.succeed("echo late > /tank/three/late && echo k2 > /tank/three/kid/k2")
         out = machine.fail(f"{M} zfs-encrypt-migrate cutover {S} tank/three 2>&1")
-        assert "written since catchup" in out and "zfs destroy -r tank/three@enc-final" in out
-        assert "zfs destroy -r tank/stage/three@enc-final" in out
-        machine.succeed("zfs destroy -r tank/three@enc-final && zfs destroy -r tank/stage/three@enc-final")
+        assert "written since catchup" in out, out
+        renames = [line.strip() for line in out.splitlines() if line.strip().startswith("zfs rename ")]
+        assert renames == [
+            "zfs rename -r tank/three@enc-final @enc-final-1",
+            "zfs rename -r tank/stage/three@enc-final @enc-final-1",
+        ], out
+        for command in renames:
+            machine.succeed(command)
         machine.succeed(f"{M} zfs-encrypt-migrate cutover {S} tank/three")
-        machine.succeed("test -f /tank/three/late")
+        for f in ("b", "b2", "late", "kid/k", "kid/k2"):
+            machine.succeed(f"test -f /tank/three/{f}")
+        assert get("encryptionroot", "tank/three") == "tank/three"
+        assert get("encryptionroot", "tank/three/kid") == "tank/three"
 
     with subtest("snapshots taken between seed and cutover survive"):
         machine.succeed("zfs create tank/four && echo f > /tank/four/f")
@@ -143,13 +160,22 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"{M} zfs-encrypt-migrate cutover {S} tank/four")
         assert "tank/four@autosnap_mid" in machine.succeed("zfs list -H -t snapshot -o name tank/four")
 
-    with subtest("catchup refuses an existing enc-final"):
+    with subtest("catchup refuses an existing enc-final and recovers once it is renamed aside"):
         machine.succeed("zfs create tank/five")
         machine.succeed(f"{M} zfs-encrypt-migrate seed {S} tank/five && {M} zfs-encrypt-migrate catchup {S} tank/five")
+        machine.succeed("echo e > /tank/five/e")
         out = machine.fail(f"{M} zfs-encrypt-migrate catchup {S} tank/five 2>&1")
-        assert "zfs destroy -r tank/five@enc-final" in out
-        assert "zfs destroy -r tank/stage/five@enc-final" in out
+        renames = [line.split(RENAME, 1)[1] for line in out.splitlines() if RENAME in line]
+        assert renames == [
+            "zfs rename -r tank/five@enc-final @enc-final-1",
+            "zfs rename -r tank/stage/five@enc-final @enc-final-1",
+        ], out
+        for command in renames:
+            machine.succeed(command)
+        machine.succeed(f"{M} zfs-encrypt-migrate catchup {S} tank/five")
         machine.succeed(f"{M} zfs-encrypt-migrate cutover {S} tank/five")
+        machine.succeed("test -f /tank/five/e")
+        assert get("encryptionroot", "tank/five") == "tank/five"
 
     with subtest("failed catchup leaves the staged key unloaded"):
         machine.succeed("zfs create tank/six && zfs create tank/six/child")
@@ -185,7 +211,10 @@ pkgs.testers.runNixOSTest {
         machine.succeed(f"{M} zfs-encrypt-migrate tree-move {S} tank/backups v")
         assert get("keystatus", "tank/stage/backups") == "unavailable"
         assert "children remain" in machine.fail(f"{M} zfs-encrypt-migrate tree-finish {S} tank/backups 2>&1")
-        machine.succeed(f"zfs destroy -r tank/backups/b2 && zfs destroy -r tank/backups/v && {M} zfs-encrypt-migrate tree-finish {S} tank/backups")
+        machine.succeed("zfs destroy -r tank/backups/b2 && zfs destroy -r tank/backups/v")
+        out = machine.succeed(f"{M} zfs-encrypt-migrate tree-finish {S} tank/backups")
+        assert "verify the key with: zfs load-key -n tank/backups" in out, out
+        machine.succeed("zfs load-key -n tank/backups < /run/zfs-encrypt-migrate.key")
         assert get("encryptionroot", "tank/backups") == "tank/backups"
         assert get("keylocation", "tank/backups") == "prompt"
         for d in ("b1", "b2", "b2/c", "v"):
@@ -197,26 +226,88 @@ pkgs.testers.runNixOSTest {
         assert "tank/backups/b2@autosnap_x" in machine.succeed("zfs list -H -t snapshot -o name tank/backups/b2")
         machine.succeed("test -f /tank/backups/p && test -f /tank/backups/b1/x")
 
+    with subtest("tree-finish recovers from stale final snapshots once they are renamed aside"):
+        machine.succeed("zfs create tank/tf && echo a > /tank/tf/a")
+        machine.succeed(f"{M} zfs-encrypt-migrate tree-seed {S} tank/tf")
+        # A tree-finish that failed after its receive leaves enc-tree-final on both sides.
+        machine.succeed(
+            "echo b > /tank/tf/b && zfs snapshot tank/tf@enc-tree-final && zfs load-key tank/stage/tf"
+            " && zfs send -p -I @enc-tree tank/tf@enc-tree-final | zfs recv -u tank/stage/tf && zfs unload-key tank/stage/tf"
+        )
+        machine.succeed("echo c > /tank/tf/c")
+        out = machine.fail(f"{M} zfs-encrypt-migrate tree-finish {S} tank/tf 2>&1")
+        renames = [line.split(RENAME, 1)[1] for line in out.splitlines() if RENAME in line]
+        assert renames == [
+            "zfs rename tank/tf@enc-tree-final @enc-tree-final-1",
+            "zfs rename tank/stage/tf@enc-tree-final @enc-tree-final-1",
+        ], out
+        for command in renames:
+            machine.succeed(command)
+        machine.succeed(f"{M} zfs-encrypt-migrate tree-finish {S} tank/tf")
+        machine.succeed("test -f /tank/tf/a && test -f /tank/tf/b && test -f /tank/tf/c")
+        assert get("encryptionroot", "tank/tf") == "tank/tf"
+
+    with subtest("cutover of a tree with a volume keeps the volume's data"):
+        machine.succeed("zfs create tank/vt && zfs create -V 16M tank/vt/vol && udevadm settle")
+        # One pattern written before the seed, one after it, so the catch-up carries volume data too.
+        machine.succeed("head -c 2M /dev/urandom > /tmp/before && head -c 2M /dev/urandom > /tmp/after")
+        machine.succeed("dd if=/tmp/before of=/dev/zvol/tank/vt/vol bs=1M conv=fsync")
+        machine.succeed(f"{M} zfs-encrypt-migrate seed {S} tank/vt")
+        machine.succeed("dd if=/tmp/after of=/dev/zvol/tank/vt/vol bs=1M seek=8 conv=fsync")
+        machine.succeed(f"{M} zfs-encrypt-migrate cutover {S} tank/vt")
+        assert get("encryptionroot", "tank/vt/vol") == "tank/vt"
+        machine.succeed("udevadm settle")
+        machine.succeed("cmp -n 2097152 /tmp/before /dev/zvol/tank/vt/vol")
+        machine.succeed("cmp -n 2097152 -i 0:8388608 /tmp/after /dev/zvol/tank/vt/vol")
+        # A volume on its own is refused before anything changes: zfs rename -u does not apply to volumes.
+        machine.succeed(f"zfs create -V 16M tank/bvol && {M} zfs-encrypt-migrate seed {S} tank/bvol")
+        out = machine.fail(f"{M} zfs-encrypt-migrate cutover {S} tank/bvol 2>&1")
+        assert "tank/bvol is a volume; cutover swaps filesystems only" in out, out
+        assert get("keystatus", "tank/stage/bvol") == "unavailable"
+        machine.succeed("udevadm settle && zfs destroy -r tank/stage/bvol && zfs destroy -r tank/bvol")
+
     with subtest("M3 rehearsal: rebuild ssd encrypted and send back"):
         names = machine.succeed("zfs list -rH -o name tank/stage").split()
         assert all(n in ("tank/stage", "tank/stage/old") or n.startswith("tank/stage/old/") for n in names), names
         machine.succeed("zfs destroy -r ssd@enc-seed && zfs destroy -r ssd@enc-final")
         machine.succeed("zfs create ssd/docker/app && echo a > /ssd/docker/app/a && zfs snapshot ssd/docker/app@autosnap_app")
         machine.succeed("zfs create -V 16M ssd/vol")
+        # Properties set on the pool root, which the children inherit and the rebuilt root must carry again.
+        machine.succeed("zfs set compression=zstd ssd && zfs set atime=off ssd")
+        # The steps below follow docs/guides.md "Rebuilding a Whole Pool Encrypted".
         machine.succeed(f"{M} zfs-encrypt-migrate seed {S} ssd")
         machine.succeed("zfs create ssd/docker/new && echo n > /ssd/docker/new/n")
         machine.succeed(f"{M} zfs-encrypt-migrate catchup {S} ssd")
         assert get("encryptionroot", "tank/stage/ssd/docker/new") == "tank/stage/ssd"
+        machine.succeed("zpool sync ssd")
+        written = machine.succeed("zfs get -rHp -t filesystem,volume -o name,value written@enc-final ssd")
+        assert all(line.split("\t")[1] == "0" for line in written.splitlines()), written
+        props = machine.succeed("zfs get -H -s received,local -o property,value all tank/stage/ssd")
+        print(props)
+        # Every property but keylocation, which the seed set on the staged root itself.
+        root_options = " ".join(
+            "-O " + line.replace("\t", "=", 1) for line in props.splitlines() if line.split("\t")[0] != "keylocation"
+        )
+        assert "-O compression=zstd" in root_options and "-O mountpoint=/ssd" in root_options, root_options
         machine.succeed("udevadm settle && zpool destroy ssd")
-        machine.succeed("zpool create -f -O encryption=aes-256-gcm -O keyformat=passphrase -O keylocation=file:///run/zfs-encrypt-migrate.key -O mountpoint=/ssd ssd /dev/vdc")
-        # Runbook Phase 3 step 6, verbatim.
+        machine.succeed(
+            "zpool create -O encryption=aes-256-gcm -O keyformat=passphrase"
+            f" -O keylocation=file:///run/zfs-encrypt-migrate.key {root_options} ssd /dev/vdc"
+        )
         machine.succeed(
             'for d in $(zfs list -H -d1 -t filesystem,volume -o name tank/stage/ssd | tail -n +2); do c=''${d#tank/stage/}; '
-            'zfs send -R -w "$d@enc-final" | zfs recv -u "$c" && zfs load-key -L file:///run/zfs-encrypt-migrate.key "$c" && zfs change-key -i "$c"; done'
+            'zfs send -R -w "$d@enc-final" | zfs recv -u "$c" && zfs load-key -L file:///run/zfs-encrypt-migrate.key "$c" && zfs change-key -i "$c" '
+            '|| { echo "send-back of $d failed; stop and investigate" >&2; break; }; done'
         )
         assert get("keystatus", "tank/stage/ssd") == "unavailable"
         machine.succeed("zfs set keylocation=prompt ssd && zfs mount -a")
+        # Every snapshot of every child, with its GUID, arrived; prints nothing when complete.
+        assert machine.succeed(
+            "diff <(zfs list -rH -t snapshot -o name,guid tank/stage/ssd | sed 's|^tank/stage/||' | grep -v '^ssd@' | sort)"
+            " <(zfs list -rH -t snapshot -o name,guid ssd | grep -v '^ssd@' | sort)"
+        ) == ""
         assert machine.succeed("zfs get -rH -o name,value encryptionroot ssd | awk '$2 != \"ssd\"'") == ""
+        assert get("compression", "ssd/docker/app") == "zstd" and get("atime", "ssd/docker") == "off"
         for f in ("docker/d", "docker/app/a", "docker/new/n"):
             machine.succeed(f"test -f /ssd/{f}")
         assert machine.succeed("findmnt -n -o SOURCE /ssd/docker").strip() == "ssd/docker"

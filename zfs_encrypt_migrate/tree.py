@@ -17,6 +17,8 @@ from .migrate import (
     pool_of,
     preflight_seed,
     refuse_cross_pool,
+    refuse_stale,
+    rename_aside_commands,
     snaps_match,
     swap_into_place,
     unmount_subtree,
@@ -100,13 +102,6 @@ def tree_move(zfs: Zfs, settings: Settings, dataset: str, child: str) -> list[st
     return [f"moved {source}; once verified, free it with: zfs destroy -r {source}"]
 
 
-def _stale_final(zfs: Zfs, name: str, lines: list[str]) -> None:
-    if zfs.exists(f"{name}@{TREE_FINAL_SNAPSHOT}"):
-        lines.append(
-            f"{name}@{TREE_FINAL_SNAPSHOT} already exists; drop it with: zfs destroy {name}@{TREE_FINAL_SNAPSHOT}",
-        )
-
-
 def tree_finish(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
     """Send the parent's last changes and swap the staged tree, with the moved children, into place."""
     _refuse_pool_root(dataset)
@@ -118,11 +113,8 @@ def tree_finish(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
     if zfs.children(dataset):
         msg = f"children remain under {dataset}; move each with tree-move and destroy it first"
         raise MigrationError(msg)
-    stale: list[str] = []
-    _stale_final(zfs, dataset, stale)
-    _stale_final(zfs, staged, stale)
-    if stale:
-        raise MigrationError("\n".join(stale))
+    # The parent's final snapshot is taken without -r, so it is renamed aside without -r too.
+    refuse_stale(zfs, TREE_FINAL_SNAPSHOT, [dataset, staged], recursive=False)
     with abort_guard(zfs, settings, staged, label="tree-finish") as guard:
         load_stage_key(zfs, staged)
         guard.source = dataset
@@ -139,10 +131,20 @@ def tree_finish(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
             raise MigrationError(
                 "written since the final snapshot:\n" + "\n".join(dirty),
                 [
-                    "drop the stale snapshots, then retry tree-finish:",
-                    f"  zfs destroy {dataset}@{TREE_FINAL_SNAPSHOT}",
-                    f"  zfs destroy {staged}@{TREE_FINAL_SNAPSHOT}",
+                    "rename the stale snapshots aside, then retry tree-finish:",
+                    *(
+                        f"  {command}"
+                        for command in rename_aside_commands(
+                            zfs,
+                            TREE_FINAL_SNAPSHOT,
+                            [dataset, staged],
+                            recursive=False,
+                        )
+                    ),
                 ],
             )
         swap_into_place(zfs, settings, dataset, staged, guard)
-    return [f"tree-finish done; once verified, free the old copy with: zfs destroy -r {settings.stage}/old/{leaf}"]
+    return [
+        f"verify the key with: zfs load-key -n {dataset}",
+        f"tree-finish done; once verified, free the old copy with: zfs destroy -r {settings.stage}/old/{leaf}",
+    ]
