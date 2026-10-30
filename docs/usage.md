@@ -84,7 +84,7 @@ Copies the dataset and everything under it to an encrypted staged tree, while th
 | `DATASET overlaps the stage STAGE; neither may be or contain the other` | Use a stage outside the dataset, and don't migrate the stage or anything under it. |
 | `dataset DATASET does not exist` | Check the name. |
 | `DATASET is already encrypted` | Nothing to do. |
-| `a migration is already in flight under STAGE` | Finish (or clean up) the migration whose staged copy is under the stage. |
+| `a migration is already in flight under STAGE` | Finish the migration whose staged copy is under the stage, or clean up one whose `seed` or `tree-seed` was interrupted. Once a `tree-move` ran, never destroy the staged parent: it holds the moved children, whose sources are gone. |
 | `STAGE/LEAF already exists` | A staged copy with that leaf is in flight. |
 | `STAGE/old/LEAF already exists` | Destroy the old copy of an earlier dataset with the same leaf first. |
 | `free space on POOL (AVAIL) minus size of DATASET (USED) is below floor MIN_FREE` | Free space, or lower `--min-free`. Sizes are in bytes; `USED` is the dataset's `used`, which includes its children and snapshots. |
@@ -211,19 +211,21 @@ It keeps its `canmount`, so `zfs mount -a` or a reboot mounts it again; destroy 
 
 When the child is already staged, a rerun of `tree-move` checks the staged copy instead of copying:
 
-- If every dataset under `DATASET/CHILD` has an `@enc-tree` with the same GUID as its counterpart under `STAGE/LEAF/CHILD`, and everything there is encrypted under `STAGE/LEAF`, the child was already moved: it prints `DATASET/CHILD was already moved to STAGE/LEAF/CHILD`, then the two lines above, and exits 0.
-- Otherwise the staged copy is partial, left by a run that was interrupted or failed, and it refuses with the commands that remove it.
+- If `DATASET/CHILD` has no `@enc-tree`, it was created after an earlier move whose source was destroyed, so the staged child may be the only copy of the original data. It refuses without any cleanup commands; resolve it by hand, for example by renaming the new `DATASET/CHILD` aside.
+- If any dataset under `DATASET/CHILD` lacks an `@enc-tree` with the same GUID under `STAGE/LEAF/CHILD`, or anything there isn't encrypted under `STAGE/LEAF`, the staged copy is partial, left by a run that was interrupted or failed. It refuses with the commands that remove it.
+- Otherwise it checks the source as a move does: it unmounts it, runs `zpool sync` and refuses if `written@enc-tree` is non-zero anywhere under it, with the same two commands. Only if nothing was written was the child already moved: it prints `DATASET/CHILD was already moved to STAGE/LEAF/CHILD`, then the two lines above, and exits 0.
 
 | Message | Fix |
 | --- | --- |
 | `DATASET is on pool POOL but the stage is on OTHER; tree-move cannot rename across pools` | Use a stage on the dataset's pool. |
 | `STAGE/LEAF@enc-tree does not exist; run tree-seed first` | Run `tree-seed`. |
 | `dataset DATASET/CHILD does not exist` | Check the name. |
+| `STAGE/LEAF/CHILD already exists but DATASET/CHILD has no @enc-tree; DATASET/CHILD looks recreated` | Keep `STAGE/LEAF/CHILD`: it may be the only copy of the original data. Resolve it by hand, for example by renaming the new `DATASET/CHILD` aside with `zfs rename`, then rerun. |
 | `STAGE/LEAF/CHILD already exists but is not a complete copy of DATASET/CHILD; a tree-move was interrupted or failed` | Only a run that printed `moved ...` finished the child; don't destroy the source. Run the two commands it prints, `zfs destroy -r DATASET/CHILD@enc-tree` and `zfs destroy -r STAGE/LEAF/CHILD`, then rerun. |
 | `free space on POOL (AVAIL) minus size of DATASET/CHILD (USED) is below floor MIN_FREE` | Free space, or lower `--min-free`. |
 | `cannot unmount NAME; a writer is probably still running` | Stop the writer and rerun. |
 | `enc-tree snapshots of DATASET/CHILD and STAGE/LEAF/CHILD differ`, or `NAME is not encrypted under STAGE/LEAF` | The received copy doesn't match; investigate, then run the two `zfs destroy -r` commands it prints and rerun. |
-| `written since the tree snapshot:` followed by the datasets | Run the two `zfs destroy -r` commands it prints (the stale snapshot and the partial copy), then rerun. |
+| `written since the tree snapshot:` followed by the datasets | Stop the writer, run the two `zfs destroy -r` commands it prints (the stale snapshot and the copy without those writes), then rerun. |
 
 ### tree-finish
 
@@ -310,7 +312,7 @@ Once `cutover`, `tree-move` or `tree-finish` has started on the source dataset, 
 | Original renamed aside | `the original is at STAGE/old/LEAF (canmount=noauto, readonly=on); put it back with:` `zfs rename -u STAGE/old/LEAF DATASET`, `zfs inherit readonly DATASET`, the `canmount=on` lines, and `zfs mount -a` |
 | Staged copy renamed into place | `the swap completed; only the final steps failed. Finish with:` `zfs set keylocation=LOC DATASET` and `zfs mount -a` |
 
-Once `tree-move` has taken its `@enc-tree` snapshots, a failure or interrupt also prints `STAGE/LEAF/CHILD may hold a partial copy; remove it and the tree snapshots, then rerun tree-move:`, followed by `zfs destroy -r DATASET/CHILD@enc-tree` and `zfs destroy -r STAGE/LEAF/CHILD`.
+Once `tree-move` has unmounted the source and its `@enc-tree` snapshots exist, a failure or interrupt also prints `STAGE/LEAF/CHILD may hold a partial copy; remove it and the tree snapshots, then rerun tree-move:`, followed by `zfs destroy -r DATASET/CHILD@enc-tree` and `zfs destroy -r STAGE/LEAF/CHILD`.
 Until both have run, a rerun refuses.
 
 ### Stale snapshots

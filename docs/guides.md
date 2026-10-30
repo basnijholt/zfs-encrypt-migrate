@@ -94,12 +94,16 @@ zfs-encrypt-migrate tree-seed tank/backups
 This copies `tank/backups` itself (not its children) to an encrypted `tank/stage/backups` and unloads its key.
 Until `tree-finish`, this counts as the migration in flight under the stage.
 
-If a `tree-seed` is interrupted or fails, clean up before you run it again, as for `seed`:
+If `tree-seed` itself is interrupted or fails, clean up before you run it again, as for `seed`.
+This applies only before any `tree-move` ran:
 
 ```bash
 zfs destroy tank/backups@enc-tree   # the tree snapshot on the source, which tree-seed takes without -r
 zfs destroy -r tank/stage/backups   # the partial copy, if there is one: on the stage, never the source
 ```
+
+Once a child has been moved, `tank/stage/backups` holds it, and its source is gone after step 2, so never destroy `tank/stage/backups` then.
+A `tree-seed` rerun part way through, for example after a reboot, refuses with `a migration is already in flight under tank/stage`: that is this tree, so carry on with `tree-move` and `tree-finish` instead.
 
 **2. Move each child, then destroy its source.**
 Stop whatever writes to the child first: `tree-move` unmounts it, and the child stays offline until `tree-finish`.
@@ -116,6 +120,7 @@ moved tank/backups/host1; once verified, free it with: zfs destroy -r tank/backu
 Destroy the source only after `tree-move` printed `moved ...`.
 By then it has compared the `@enc-tree` snapshot GUIDs on both sides and checked that the copy is encrypted under `tank/stage/backups`.
 A run that was interrupted or failed can leave a partial copy at `tank/stage/backups/host1` instead; running `tree-move` again then refuses and prints the two `zfs destroy -r` commands that remove it and the tree snapshots, after which it starts over.
+A rerun for a child that was already moved checks again that nothing was written to the source since, and refuses the same way if something was.
 
 Once you destroy the source, the staged copy is the only copy of that child, and the passphrase the only way into it.
 So check the passphrase before every destroy: `zfs load-key -n -L prompt` asks for it instead of reading the key file, and only checks it.
