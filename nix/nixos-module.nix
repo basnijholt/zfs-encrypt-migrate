@@ -64,45 +64,50 @@ in
     };
   };
 
-  config = lib.mkIf cfg.enable {
-    assertions = [
-      {
-        assertion = !auditCfg.enable || auditCfg.pools != [ ];
-        message = "services.zfs-encrypt-migrate.audit.pools must name at least one pool when the audit is enabled.";
-      }
-    ];
+  config = lib.mkMerge [
+    (lib.mkIf cfg.enable {
+      environment.systemPackages = [ cfg.package ];
+    })
 
-    environment.systemPackages = [ cfg.package ];
+    # The audit does not depend on `enable`: that only installs the CLI for interactive use.
+    (lib.mkIf auditCfg.enable {
+      assertions = [
+        {
+          assertion = auditCfg.pools != [ ];
+          message = "services.zfs-encrypt-migrate.audit.pools must name at least one pool when the audit is enabled.";
+        }
+      ];
 
-    systemd.services.zfs-encrypt-migrate-audit = lib.mkIf auditCfg.enable {
-      description = "Audit ZFS pools for unencrypted datasets";
-      wants = [ "zfs-import.target" ];
-      after = [ "zfs-import.target" ];
-      # The host's own zfs: the pinned one may not match the loaded kernel module.
-      path = [ config.boot.zfs.package ];
-      unitConfig.OnFailure = auditCfg.onFailure;
-      serviceConfig = {
-        Type = "oneshot";
-        ExecStart = "${lib.getExe cfg.package} audit ${lib.escapeShellArgs auditArgs}";
-        # Needs root and read-write /dev/zfs, so no PrivateDevices and no User=.
-        # The audit only reads pool state, so the rest of the system can be read-only.
-        ProtectSystem = "strict";
-        ProtectHome = true;
-        PrivateTmp = true;
-        NoNewPrivileges = true;
-        ProtectControlGroups = true;
-        RestrictSuidSgid = true;
-        LockPersonality = true;
+      systemd.services.zfs-encrypt-migrate-audit = {
+        description = "Audit ZFS pools for unencrypted datasets";
+        wants = [ "zfs-import.target" ];
+        after = [ "zfs-import.target" ];
+        # The host's own zfs: the pinned one may not match the loaded kernel module.
+        path = [ config.boot.zfs.package ];
+        unitConfig.OnFailure = auditCfg.onFailure;
+        serviceConfig = {
+          Type = "oneshot";
+          ExecStart = "${lib.getExe cfg.package} audit ${lib.escapeShellArgs auditArgs}";
+          # Needs root and read-write /dev/zfs, so no PrivateDevices and no User=.
+          # The audit only reads pool state, so the rest of the system can be read-only.
+          ProtectSystem = "strict";
+          ProtectHome = true;
+          PrivateTmp = true;
+          NoNewPrivileges = true;
+          ProtectControlGroups = true;
+          RestrictSUIDSGID = true;
+          LockPersonality = true;
+        };
       };
-    };
 
-    systemd.timers.zfs-encrypt-migrate-audit = lib.mkIf auditCfg.enable {
-      description = "Audit ZFS pools for unencrypted datasets";
-      wantedBy = [ "timers.target" ];
-      timerConfig = {
-        OnCalendar = auditCfg.onCalendar;
-        Persistent = true;
+      systemd.timers.zfs-encrypt-migrate-audit = {
+        description = "Audit ZFS pools for unencrypted datasets";
+        wantedBy = [ "timers.target" ];
+        timerConfig = {
+          OnCalendar = auditCfg.onCalendar;
+          Persistent = true;
+        };
       };
-    };
-  };
+    })
+  ];
 }

@@ -242,6 +242,9 @@ pkgs.testers.runNixOSTest {
     with subtest("module audit unit fails on an unencrypted dataset and passes once allowlisted"):
         machine.succeed("systemctl cat zfs-encrypt-migrate-audit.service zfs-encrypt-migrate-audit.timer")
         machine.succeed("systemctl is-enabled zfs-encrypt-migrate-audit.timer")
+        # systemd ignores unknown keys with only a log line, so a typo in a hardening key must fail here.
+        assert machine.succeed("systemctl show -p RestrictSUIDSGID --value zfs-encrypt-migrate-audit.service").strip() == "yes"
+        machine.fail("journalctl -b --no-pager | grep 'zfs-encrypt-migrate-audit.service.*Unknown key'")
         machine.succeed("zfs create tank/rogue")
         machine.fail("systemctl start zfs-encrypt-migrate-audit.service")
         assert "tank/rogue" in machine.succeed("journalctl -u zfs-encrypt-migrate-audit.service --no-pager")

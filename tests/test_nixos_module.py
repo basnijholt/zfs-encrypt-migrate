@@ -128,3 +128,24 @@ def test_disabled_module_defines_nothing() -> None:
 
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) is False
+
+
+def test_audit_works_without_enable() -> None:
+    """The audit unit and timer exist with `enable = false`; `enable` only installs the CLI."""
+    expr = eval_expr(
+        """
+          package = flake.packages.${system}.default;
+          audit = { enable = true; pools = [ "tank" ]; };
+        """,
+        """{
+          service = builtins.hasAttr "zfs-encrypt-migrate-audit" eval.config.systemd.services;
+          timer = builtins.hasAttr "zfs-encrypt-migrate-audit" eval.config.systemd.timers;
+          failed = builtins.filter (a: !a.assertion) eval.config.assertions;
+          installed = builtins.any (p: (p.pname or "") == "zfs-encrypt-migrate") eval.config.environment.systemPackages;
+        }""",
+    )
+    result = run_nix_eval(expr)
+
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data == {"service": True, "timer": True, "failed": [], "installed": False}
