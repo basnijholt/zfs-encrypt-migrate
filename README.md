@@ -175,7 +175,8 @@ zfs-encrypt-migrate --help
 <!-- CODE:BASH:START -->
 <!-- export NO_COLOR=1 -->
 <!-- export TERM=dumb -->
-<!-- export TERMINAL_WIDTH=90 -->
+<!-- export TERMINAL_WIDTH=100 -->
+<!-- export LINES=50 -->
 <!-- echo '```bash' -->
 <!-- uv run zfs-encrypt-migrate --help -->
 <!-- echo '```' -->
@@ -189,29 +190,25 @@ zfs-encrypt-migrate --help
 
  Migrate OpenZFS datasets to native encryption in place, one at a time
 
-╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ --version  -v        Show version and exit                                   │
-│ --help     -h        Show this message and exit.                             │
-╰──────────────────────────────────────────────────────────────────────────────╯
-╭─ Migration Commands ─────────────────────────────────────────────────────────╮
-│ seed         Copy a dataset tree to an encrypted staged tree, then unload    │
-│              its key.                                                        │
-│ catchup      Send what changed since the seed to the staged tree.            │
-│ cutover      Swap the staged tree into place; the original stays read-only   │
-│              under STAGE/old.                                                │
-╰──────────────────────────────────────────────────────────────────────────────╯
-╭─ Tree Commands ──────────────────────────────────────────────────────────────╮
-│ tree-seed    Copy only the parent to an encrypted staged dataset; its        │
-│              children move one by one.                                       │
-│ tree-move    Copy one child subtree under the staged parent; the source      │
-│              stays until you destroy it.                                     │
-│ tree-finish  Send the parent's last changes and swap the staged tree into    │
-│              place once no children remain.                                  │
-╰──────────────────────────────────────────────────────────────────────────────╯
-╭─ Audit Commands ─────────────────────────────────────────────────────────────╮
-│ audit        List unencrypted datasets outside the allowlists; exit 1 if     │
-│              there are any.                                                  │
-╰──────────────────────────────────────────────────────────────────────────────╯
+╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
+│ --version  -v        Show version and exit                                                       │
+│ --help     -h        Show this message and exit.                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Migration Commands ─────────────────────────────────────────────────────────────────────────────╮
+│ seed         Copy a dataset tree to an encrypted staged tree, then unload its key.               │
+│ catchup      Send what changed since the seed to the staged tree.                                │
+│ cutover      Swap the staged tree into place; the original stays read-only under STAGE/old.      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Tree Commands ──────────────────────────────────────────────────────────────────────────────────╮
+│ tree-seed    Copy only the parent to an encrypted staged dataset; its children move one by one.  │
+│ tree-move    Copy one child subtree under the staged parent; the source stays until you destroy  │
+│              it.                                                                                 │
+│ tree-finish  Send the parent's last changes and swap the staged tree into place once no children │
+│              remain.                                                                             │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Audit Commands ─────────────────────────────────────────────────────────────────────────────────╮
+│ audit        List unencrypted datasets outside the allowlists; exit 1 if there are any.          │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 
 ```
 
@@ -227,6 +224,7 @@ zfs-encrypt-migrate seed --help
 <!-- export NO_COLOR=1 -->
 <!-- export TERM=dumb -->
 <!-- export TERMINAL_WIDTH=100 -->
+<!-- export LINES=50 -->
 <!-- echo '```bash' -->
 <!-- uv run zfs-encrypt-migrate seed --help -->
 <!-- echo '```' -->
@@ -240,46 +238,32 @@ zfs-encrypt-migrate seed --help
 
  Copy a dataset tree to an encrypted staged tree, then unload its key.
 
-╭─ Arguments ──────────────────────────────────────────────────────────────────╮
-│ *    dataset      <str>  Dataset to migrate [required]                       │
-╰──────────────────────────────────────────────────────────────────────────────╯
-╭─ Options ────────────────────────────────────────────────────────────────────╮
-│ *  --stage                      <str>                 Staging dataset, e.g.  │
-│                                                       tank/stage             │
-│                                                       [env var:              │
-│                                                       ZFS_ENCRYPT_MIGRATE_S… │
-│                                                       [required]             │
-│    --key-file                   <path>                Key file for the       │
-│                                                       staged tree, as an     │
-│                                                       absolute path; must    │
-│                                                       have mode 600          │
-│                                                       [env var:              │
-│                                                       ZFS_ENCRYPT_MIGRATE_K… │
-│                                                       [default:              │
-│                                                       /run/zfs-encrypt-migr… │
-│    --min-free                   SIZE                  Free space to keep on  │
-│                                                       the staging pool after │
-│                                                       the copy, e.g. 500G or │
-│                                                       1T                     │
-│                                                       [env var:              │
-│                                                       ZFS_ENCRYPT_MIGRATE_M… │
-│                                                       [default: 1T]          │
-│    --keyformat                  <passphrase|hex|raw>  Key format of the key  │
-│                                                       file: passphrase, hex  │
-│                                                       or raw                 │
-│                                                       [env var:              │
-│                                                       ZFS_ENCRYPT_MIGRATE_K… │
-│                                                       [default: passphrase]  │
-│    --final-keylocation          <str>                 Keylocation set on the │
-│                                                       dataset after the      │
-│                                                       swap, e.g. prompt or   │
-│                                                       file:///path           │
-│                                                       [env var:              │
-│                                                       ZFS_ENCRYPT_MIGRATE_F… │
-│                                                       [default: prompt]      │
-│    --help               -h                            Show this message and  │
-│                                                       exit.                  │
-╰──────────────────────────────────────────────────────────────────────────────╯
+╭─ Arguments ──────────────────────────────────────────────────────────────────────────────────────╮
+│ *    dataset      <str>  Dataset to migrate [required]                                           │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
+│ *  --stage                      <str>                 Staging dataset, e.g. tank/stage           │
+│                                                       [env var: ZFS_ENCRYPT_MIGRATE_STAGE]       │
+│                                                       [required]                                 │
+│    --key-file                   <path>                Key file for the staged tree, as an        │
+│                                                       absolute path; must have mode 600          │
+│                                                       [env var: ZFS_ENCRYPT_MIGRATE_KEY_FILE]    │
+│                                                       [default: /run/zfs-encrypt-migrate.key]    │
+│    --min-free                   SIZE                  Free space to keep on the staging pool     │
+│                                                       after the copy, e.g. 500G or 1T            │
+│                                                       [env var: ZFS_ENCRYPT_MIGRATE_MIN_FREE]    │
+│                                                       [default: 1T]                              │
+│    --keyformat                  <passphrase|hex|raw>  Key format of the key file: passphrase,    │
+│                                                       hex or raw                                 │
+│                                                       [env var: ZFS_ENCRYPT_MIGRATE_KEYFORMAT]   │
+│                                                       [default: passphrase]                      │
+│    --final-keylocation          <str>                 Keylocation set on the dataset after the   │
+│                                                       swap, e.g. prompt or file:///path          │
+│                                                       [env var:                                  │
+│                                                       ZFS_ENCRYPT_MIGRATE_FINAL_KEYLOCATION]     │
+│                                                       [default: prompt]                          │
+│    --help               -h                            Show this message and exit.                │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 
 ```
 
