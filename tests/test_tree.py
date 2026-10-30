@@ -7,17 +7,17 @@ from typing import TYPE_CHECKING
 import pytest
 
 from zfs_encrypt_migrate.errors import Interrupted, MigrationError
-from zfs_encrypt_migrate.migrate import Settings
+from zfs_encrypt_migrate.migrate import Settings, cutover
 from zfs_encrypt_migrate.tree import tree_finish, tree_move, tree_seed
 from zfs_encrypt_migrate.zfs import Zfs
 
-from .conftest import STAGE, FakeRunner
+from .conftest import STAGE, FakeRunner, fail
 from .helpers import fail_on, make
 from .test_migrate import recv_args
-from .zfs_sim import ZfsSim
+from .zfs_sim import ZfsSim, staged_ready
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
     from pathlib import Path
 
     from zfs_encrypt_migrate.process import CommandResult
@@ -602,3 +602,108 @@ def test_tree_finish_interrupt_unloads_key(sim: ZfsSim, settings: Settings) -> N
 
     assert ("zfs", "unload-key", "-r", STAGED_ROOT) in runner.calls
     assert info.value.hints[0] == "tree-finish aborted."
+
+
+# --- the guard is armed before the key loads ---
+
+
+def load_key_then(sim: ZfsSim, fault: BaseException | None) -> Callable[[Sequence[str]], CommandResult | None]:
+    """Answer load-key like zfs (the key loads), then fail or raise as the step right after it."""
+
+    def responder(args: Sequence[str]) -> CommandResult | None:
+        if args[1] != "load-key":
+            return None
+        sim.answer(args)
+        if fault is not None:
+            raise fault
+        return fail("injected\n")
+
+    return responder
+
+
+def _cutover_ready(sim: ZfsSim) -> None:
+    staged_ready(sim, final=True)
+
+
+def _tree_move_ready(sim: ZfsSim) -> None:
+    tree_seeded(sim)
+
+
+def _tree_finish_ready(sim: ZfsSim) -> None:
+    finish_ready(sim)
+
+
+def _cutover(zfs: Zfs, settings: Settings) -> list[str]:
+    return cutover(zfs, settings, "tank/data")
+
+
+def _tree_move(zfs: Zfs, settings: Settings) -> list[str]:
+    return tree_move(zfs, settings, "tank/data", "child")
+
+
+def _tree_finish(zfs: Zfs, settings: Settings) -> list[str]:
+    return tree_finish(zfs, settings, "tank/data")
+
+
+GUARDED = pytest.mark.parametrize(
+    ("ready", "command"),
+    [(_cutover_ready, _cutover), (_tree_move_ready, _tree_move), (_tree_finish_ready, _tree_finish)],
+    ids=["cutover", "tree-move", "tree-finish"],
+)
+
+
+@GUARDED
+def test_failure_right_after_load_key_unloads_it(
+    sim: ZfsSim,
+    settings: Settings,
+    ready: Callable[[ZfsSim], None],
+    command: Callable[[Zfs, Settings], list[str]],
+) -> None:
+    """A load-key that loaded the key but failed leaves it unloaded and prints no recovery hint."""
+    ready(sim)
+    zfs, _ = make(sim, load_key_then(sim, None))
+
+    with pytest.raises(MigrationError, match="injected") as info:
+        command(zfs, settings)
+
+    assert sim.props[STAGED_ROOT, "keystatus"] == "unavailable"
+    assert not [hint for hint in info.value.hints if "aborted." in hint]
+
+
+@GUARDED
+def test_interrupt_right_after_load_key_unloads_it(
+    sim: ZfsSim,
+    settings: Settings,
+    ready: Callable[[ZfsSim], None],
+    command: Callable[[Zfs, Settings], list[str]],
+) -> None:
+    """Ctrl-C while the key loads still unloads it."""
+    ready(sim)
+    zfs, _ = make(sim, load_key_then(sim, KeyboardInterrupt()))
+
+    with pytest.raises(Interrupted) as info:
+        command(zfs, settings)
+
+    assert sim.props[STAGED_ROOT, "keystatus"] == "unavailable"
+    assert not [hint for hint in info.value.hints if "aborted." in hint]
+
+
+# --- cross-pool ---
+
+
+def test_tree_seed_refuses_dataset_on_other_pool_than_stage(settings: Settings) -> None:
+    """tree-finish could never rename the tree into place, so tree-seed refuses before any command."""
+    zfs, runner = make(ZfsSim(["ssd", "ssd/data"]))
+
+    with pytest.raises(MigrationError, match="ssd/data is on pool ssd but the stage is on tank; tree-seed cannot"):
+        tree_seed(zfs, settings, "ssd/data")
+    assert runner.calls == []
+
+
+def test_tree_move_refuses_dataset_on_other_pool_than_stage(settings: Settings) -> None:
+    """tree-move refuses before any command, so no child is ever moved for a tree that cannot finish."""
+    zfs, runner = make(ZfsSim(["ssd", "ssd/data", "ssd/data/child"]))
+
+    with pytest.raises(MigrationError, match="ssd/data is on pool ssd but the stage is on tank; tree-move cannot"):
+        tree_move(zfs, settings, "ssd/data", "child")
+    assert runner.calls == []

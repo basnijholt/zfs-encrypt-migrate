@@ -191,6 +191,16 @@ def ensure_container(zfs: Zfs, name: str) -> None:
         zfs.create(name, {"canmount": "off"})
 
 
+def refuse_cross_pool(settings: Settings, dataset: str, command: str) -> None:
+    """Refuse a dataset outside the stage pool: the swap renames across the two, which zfs cannot do."""
+    if pool_of(dataset) != pool_of(settings.stage):
+        msg = (
+            f"{dataset} is on pool {pool_of(dataset)} but the stage is on {pool_of(settings.stage)}; "
+            f"{command} cannot rename across pools"
+        )
+        raise MigrationError(msg)
+
+
 def in_flight(zfs: Zfs, settings: Settings) -> list[str]:
     """Datasets under the stage other than the stage, its ``old`` container and the old copies."""
     stage = settings.stage
@@ -364,17 +374,16 @@ def cutover(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
         raise MigrationError(msg)
     leaf = leaf_of(dataset)
     staged = f"{settings.stage}/{leaf}"
-    if pool_of(dataset) != pool_of(settings.stage):
-        msg = (
-            f"{dataset} is on pool {pool_of(dataset)} but the stage is on {pool_of(settings.stage)}; "
-            "cutover cannot rename across pools"
-        )
-        raise MigrationError(msg)
+    refuse_cross_pool(settings, dataset, "cutover")
     if not zfs.exists(staged):
         msg = f"{staged} does not exist; run seed first"
         raise MigrationError(msg)
-    load_stage_key(zfs, staged)
-    with abort_guard(zfs, settings, staged, source=dataset, leaf=leaf, label="cutover") as guard:
+    # The guard is armed before the load so an interrupt while the key loads still unloads it; the
+    # recovery hints only apply once the source is about to be touched.
+    with abort_guard(zfs, settings, staged, label="cutover") as guard:
+        load_stage_key(zfs, staged)
+        guard.source = dataset
+        guard.leaf = leaf
         unmount_subtree(zfs, dataset)
         # A catch-up whose enc-final snapshots still match on both sides is not repeated.
         if not snaps_match(zfs, dataset, staged, FINAL_SNAPSHOT):

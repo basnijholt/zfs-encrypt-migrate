@@ -211,7 +211,8 @@ class ZfsSim:
     def _create_received(self, staged: str, target: str, *, encrypting: bool, inherit: bool) -> None:
         self.datasets.add(staged)
         parent = staged.rsplit("/", 1)[0]
-        if encrypting and staged == target:
+        if encrypting:
+            # Everything created by an encrypting receive joins the new encryption root.
             self.prop(staged, "encryptionroot", target)
             self.prop(staged, "encryption", "aes-256-gcm")
             self.prop(staged, "keystatus", "available")

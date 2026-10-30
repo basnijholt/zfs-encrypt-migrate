@@ -16,6 +16,7 @@ from .migrate import (
     load_stage_key,
     pool_of,
     preflight_seed,
+    refuse_cross_pool,
     snaps_match,
     swap_into_place,
     unmount_subtree,
@@ -44,6 +45,7 @@ def _require_tree_snapshot(zfs: Zfs, name: str) -> None:
 def tree_seed(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
     """Copy the parent alone to an encrypted staged dataset, leaving its key unloaded."""
     _refuse_pool_root(dataset)
+    refuse_cross_pool(settings, dataset, "tree-seed")
     staged = f"{settings.stage}/{leaf_of(dataset)}"
     # The children move on their own, so only the parent's own data and snapshots are sized.
     preflight_seed(zfs, settings, dataset, "usedbydataset,usedbysnapshots")
@@ -58,8 +60,8 @@ def tree_seed(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
 
 def tree_move(zfs: Zfs, settings: Settings, dataset: str, child: str) -> list[str]:
     """Copy one child subtree under the staged parent; the source stays until the operator destroys it."""
-    leaf = leaf_of(dataset)
-    staged_root = f"{settings.stage}/{leaf}"
+    refuse_cross_pool(settings, dataset, "tree-move")
+    staged_root = f"{settings.stage}/{leaf_of(dataset)}"
     source = f"{dataset}/{child}"
     staged = f"{staged_root}/{child}"
     _require_tree_snapshot(zfs, staged_root)
@@ -70,8 +72,11 @@ def tree_move(zfs: Zfs, settings: Settings, dataset: str, child: str) -> list[st
         msg = f"{staged} already exists"
         raise MigrationError(msg)
     check_free_space(zfs, settings, source, "used")
-    load_stage_key(zfs, staged_root)
-    with abort_guard(zfs, settings, staged_root, source=source, leaf=None, label="tree-move"):
+    # Armed before the load so an interrupt while the key loads still unloads it; the remount hint only
+    # applies once the source is about to be unmounted.
+    with abort_guard(zfs, settings, staged_root, label="tree-move") as guard:
+        load_stage_key(zfs, staged_root)
+        guard.source = source
         unmount_subtree(zfs, source)
         zfs.snapshot(f"{source}@{TREE_SNAPSHOT}", recursive=True)
         # A replication stream received under an encrypted parent stays unencrypted unless told to inherit.
@@ -107,12 +112,7 @@ def tree_finish(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
     _refuse_pool_root(dataset)
     leaf = leaf_of(dataset)
     staged = f"{settings.stage}/{leaf}"
-    if pool_of(dataset) != pool_of(settings.stage):
-        msg = (
-            f"{dataset} is on pool {pool_of(dataset)} but the stage is on {pool_of(settings.stage)}; "
-            "tree-finish cannot rename across pools"
-        )
-        raise MigrationError(msg)
+    refuse_cross_pool(settings, dataset, "tree-finish")
     _require_tree_snapshot(zfs, staged)
     _require_tree_snapshot(zfs, dataset)
     if zfs.children(dataset):
@@ -123,8 +123,10 @@ def tree_finish(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
     _stale_final(zfs, staged, stale)
     if stale:
         raise MigrationError("\n".join(stale))
-    load_stage_key(zfs, staged)
-    with abort_guard(zfs, settings, staged, source=dataset, leaf=leaf, label="tree-finish") as guard:
+    with abort_guard(zfs, settings, staged, label="tree-finish") as guard:
+        load_stage_key(zfs, staged)
+        guard.source = dataset
+        guard.leaf = leaf
         unmount_subtree(zfs, dataset)
         zfs.snapshot(f"{dataset}@{TREE_FINAL_SNAPSHOT}", recursive=False)
         zfs.send_recv(["-p", "-I", f"@{TREE_SNAPSHOT}", f"{dataset}@{TREE_FINAL_SNAPSHOT}"], ["-u", staged])

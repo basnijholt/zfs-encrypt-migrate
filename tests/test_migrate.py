@@ -89,6 +89,20 @@ def test_seed_exact_commands(sim: ZfsSim, settings: Settings, key_file: Path) ->
     assert sim.props[f"{STAGE}/data/child", "keystatus"] == "unavailable"
 
 
+def test_seed_children_join_the_staged_encryption_root_and_catchup_succeeds(sim: ZfsSim, settings: Settings) -> None:
+    """An encrypting -R receive puts the children under the new root, so the catch-up check passes."""
+    zfs, _ = make(sim)
+
+    seed(zfs, settings, "tank/data")
+
+    assert sim.props[f"{STAGE}/data/child", "encryptionroot"] == f"{STAGE}/data"
+    assert sim.props[f"{STAGE}/data/child", "encryption"] == "aes-256-gcm"
+
+    catchup(zfs, settings, "tank/data")
+
+    assert sim.props[f"{STAGE}/data/child", "encryptionroot"] == f"{STAGE}/data"
+
+
 def test_seed_uses_keyformat_setting(sim: ZfsSim, settings: Settings, key_file: Path) -> None:
     """The keyformat option reaches the recv arguments."""
     zfs, runner = make(sim)
