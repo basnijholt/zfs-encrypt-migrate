@@ -68,7 +68,8 @@ class AbortGuard:
 
     The staged tree carries the source's mountpoints, so its key must never stay loaded after a
     failure. ``phase`` and ``canmount_on`` are updated by ``swap_into_place`` so the hints match how
-    far the swap got. Hints are only attached once ``source`` is known.
+    far the swap got; ``cleanup`` lists what a rerun needs removed first. Hints are only attached
+    once ``source`` is known.
     """
 
     def __init__(
@@ -90,6 +91,7 @@ class AbortGuard:
         self.label = label
         self.phase = ""
         self.canmount_on: list[str] = []
+        self.cleanup: list[str] = []
 
     def __enter__(self) -> Self:
         """Start guarding."""
@@ -155,7 +157,7 @@ class AbortGuard:
                     f"  zfs set keylocation={self.settings.final_keylocation} {source}",
                     "  zfs mount -a",
                 ]
-        return lines
+        return lines + self.cleanup
 
 
 def abort_guard(
@@ -201,6 +203,14 @@ def refuse_cross_pool(settings: Settings, dataset: str, command: str) -> None:
         raise MigrationError(msg)
 
 
+def refuse_nested(settings: Settings, dataset: str) -> None:
+    """Refuse a dataset that is the stage, inside it or around it: the copy or the swap would land in itself."""
+    stage = settings.stage
+    if dataset == stage or dataset.startswith(f"{stage}/") or stage.startswith(f"{dataset}/"):
+        msg = f"{dataset} overlaps the stage {stage}; neither may be or contain the other"
+        raise MigrationError(msg)
+
+
 def in_flight(zfs: Zfs, settings: Settings) -> list[str]:
     """Datasets under the stage other than the stage, its ``old`` container and the old copies."""
     stage = settings.stage
@@ -222,6 +232,7 @@ def check_free_space(zfs: Zfs, settings: Settings, dataset: str, size_props: str
 
 def preflight_seed(zfs: Zfs, settings: Settings, dataset: str, size_props: str = "used") -> None:
     """Refuse to seed unless the key, the dataset, the stage and the free space are in order."""
+    refuse_nested(settings, dataset)
     key_file = settings.key_file
     # Anything other than a private regular file could leak the passphrase. Symlinks (secret
     # managers use them) are followed: the target must be the regular file with mode 600.
@@ -271,12 +282,17 @@ def dirty_since(zfs: Zfs, dataset: str, snap: str) -> list[str]:
     return [name for name in zfs.subtree(dataset) if zfs.get(f"written@{snap}", name) != "0"]
 
 
+def outside_encryption_root(zfs: Zfs, root: str, encryption_root: str) -> str | None:
+    """Return the first filesystem or volume under ``root`` whose encryption root is not ``encryption_root``."""
+    return next((name for name in zfs.subtree(root) if zfs.get("encryptionroot", name) != encryption_root), None)
+
+
 def check_encrypted_under(zfs: Zfs, root: str, encryption_root: str) -> None:
     """Every filesystem and volume under ``root`` has encryption root ``encryption_root``."""
-    for name in zfs.subtree(root):
-        if zfs.get("encryptionroot", name) != encryption_root:
-            msg = f"{name} is not encrypted under {encryption_root}"
-            raise MigrationError(msg)
+    name = outside_encryption_root(zfs, root, encryption_root)
+    if name is not None:
+        msg = f"{name} is not encrypted under {encryption_root}"
+        raise MigrationError(msg)
 
 
 def unmount_subtree(zfs: Zfs, dataset: str) -> None:
@@ -358,6 +374,7 @@ def catchup_staged(zfs: Zfs, settings: Settings, dataset: str) -> None:
 
 def catchup(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
     """Bring the staged tree up to date, then unload its key."""
+    refuse_nested(settings, dataset)
     staged = f"{settings.stage}/{leaf_of(dataset)}"
     with abort_guard(zfs, settings, staged):
         catchup_staged(zfs, settings, dataset)
@@ -399,6 +416,7 @@ def cutover(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
     leaf = leaf_of(dataset)
     staged = f"{settings.stage}/{leaf}"
     refuse_cross_pool(settings, dataset, "cutover")
+    refuse_nested(settings, dataset)
     if not zfs.exists(staged):
         msg = f"{staged} does not exist; run seed first"
         raise MigrationError(msg)

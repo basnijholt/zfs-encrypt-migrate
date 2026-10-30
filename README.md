@@ -246,8 +246,8 @@ zfs-encrypt-migrate seed --help
 │ *  --stage                      <str>                 Staging dataset, e.g. tank/stage           │
 │                                                       [env var: ZFS_ENCRYPT_MIGRATE_STAGE]       │
 │                                                       [required]                                 │
-│    --key-file                   <path>                Key file for the staged tree; must have    │
-│                                                       mode 600                                   │
+│    --key-file                   <path>                Key file for the staged tree, as an        │
+│                                                       absolute path; must have mode 600          │
 │                                                       [env var: ZFS_ENCRYPT_MIGRATE_KEY_FILE]    │
 │                                                       [default: /run/zfs-encrypt-migrate.key]    │
 │    --min-free                   SIZE                  Free space to keep on the staging pool     │

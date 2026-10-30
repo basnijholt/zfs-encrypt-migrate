@@ -1,4 +1,4 @@
-"""Tests for the audit CLI command."""
+"""Tests for the CLI commands."""
 
 from __future__ import annotations
 
@@ -150,10 +150,12 @@ def test_options_override_env(sim: ZfsSim) -> None:
         ["seed", "tank/data", "--keyformat", "bogus"],
         ["seed", "tank/data", "--min-free", "lots"],
         ["seed", "tank/data", "--stage", "-x"],
-        ["seed", "tank/data", "--final-keylocation", "promt"],
+        ["seed", "tank/data", "--final-keylocation", "promt"],  # codespell:ignore
         ["seed", "tank/data", "--final-keylocation", "file://relative"],
         ["seed", "tank/data", "--final-keylocation", "file:///"],
         ["seed", "tank/data", "--final-keylocation", "https://"],
+        ["seed", "tank/data", "--key-file", "key"],
+        ["catchup", "tank/data", "--key-file", "./run/key"],
         ["seed", "-r"],
         ["seed", "tank/data@s"],
         ["catchup", "tank/a b"],
@@ -165,6 +167,17 @@ def test_migration_commands_reject_bad_input_before_zfs(sim: ZfsSim, argv: list[
     result = runner.invoke(cli.app, argv)
 
     assert result.exit_code == 2  # noqa: PLR2004
+    assert sim.runner.calls == []  # type: ignore[attr-defined]
+
+
+def test_relative_key_file_from_env_is_usage_error(sim: ZfsSim, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A relative key file from the env var is refused too: zfs would only reject it after the seed snapshots."""
+    monkeypatch.setenv("ZFS_ENCRYPT_MIGRATE_KEY_FILE", "zfs-encrypt-migrate.key")
+
+    result = runner.invoke(cli.app, ["seed", "tank/data"])
+
+    assert result.exit_code == 2  # noqa: PLR2004
+    assert "must be an absolute path" in result.output
     assert sim.runner.calls == []  # type: ignore[attr-defined]
 
 
@@ -355,13 +368,16 @@ def test_tree_seed_runs_through_options_and_env(sim: ZfsSim) -> None:
 
 
 def test_tree_move_runs_and_prints_destroy_hint(sim: ZfsSim) -> None:
-    """tree-move takes the parent and the child name and prints the verified-destroy hint."""
+    """tree-move takes the parent and the child name and prints the key check, then the verified-destroy hint."""
     _tree_state(sim)
 
     result = runner.invoke(cli.app, ["tree-move", "tank/data", "child"])
 
     assert result.exit_code == 0, result.output
-    assert "moved tank/data/child; once verified, free it with: zfs destroy -r tank/data/child" in result.output
+    assert result.stdout == (
+        "verify the key with: zfs load-key -n -L prompt tank/stage/data\n"
+        "moved tank/data/child; once verified, free it with: zfs destroy -r tank/data/child\n"
+    )
     assert sim.runner.pipelines[0][0] == ("zfs", "send", "-R", "tank/data/child@enc-tree")  # type: ignore[attr-defined]
 
 
@@ -448,7 +464,29 @@ def test_tree_move_interrupt_prints_tree_move_hints_and_exits_130(
 
     assert result.exit_code == 130  # noqa: PLR2004
     assert "tree-move aborted." in result.output
+    assert "tank/stage/data/child may hold a partial copy" in result.output
+    assert "  zfs destroy -r tank/data/child@enc-tree\n  zfs destroy -r tank/stage/data/child\n" in result.output
     assert ("zfs", "unload-key", "-r", "tank/stage/data") in sim.runner.calls  # type: ignore[attr-defined]
+
+
+def test_tree_move_partial_copy_exits_1_with_cleanup(sim: ZfsSim) -> None:
+    """A copy left by an interrupted run is refused with the commands that remove it."""
+    _tree_state(sim)
+    sim.datasets.add("tank/stage/data/child")
+
+    result = runner.invoke(cli.app, ["tree-move", "tank/data", "child"])
+
+    assert result.exit_code == 1
+    assert "not a complete copy of tank/data/child" in result.output
+    assert "  zfs destroy -r tank/data/child@enc-tree\n  zfs destroy -r tank/stage/data/child\n" in result.output
+    assert "moved" not in result.output
+
+
+def test_tree_move_help_names_the_parent() -> None:
+    """DATASET of tree-move is the parent, not the dataset being moved."""
+    result = runner.invoke(cli.app, ["tree-move", "--help"])
+
+    assert "Parent dataset, as given to tree-seed" in result.output
 
 
 def test_tree_commands_are_in_their_own_help_panel() -> None:

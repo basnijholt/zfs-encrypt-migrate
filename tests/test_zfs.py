@@ -134,16 +134,13 @@ def test_unmount_reports_busy_without_force() -> None:
     assert all(call == ("zfs", "unmount", "tank/a") for call in runner.calls)
 
 
-def test_pool_avail_and_imported() -> None:
-    """pool_avail parses bytes; pool_imported tests zpool list."""
-    runner = FakeRunner(queue=[ok("12345\n"), ok("tank\n"), fail("cannot open 'x': no such pool\n")])
+def test_pool_avail() -> None:
+    """pool_avail parses bytes."""
+    runner = FakeRunner(queue=[ok("12345\n")])
     zfs = Zfs(runner)
 
     assert zfs.pool_avail("tank") == 12345  # noqa: PLR2004
-    assert zfs.pool_imported("tank") is True
-    assert zfs.pool_imported("x") is False
-    assert runner.calls[0] == ("zfs", "list", "-Hp", "-o", "avail", "tank")
-    assert runner.calls[1] == ("zpool", "list", "-H", "-o", "name", "tank")
+    assert runner.calls == [("zfs", "list", "-Hp", "-o", "avail", "tank")]
 
 
 @pytest.mark.parametrize("name", ["tank", "tank/a.b_c-d:e", "a/b/c"])

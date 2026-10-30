@@ -902,6 +902,43 @@ def test_sim_rejects_recv_into_locked_or_baseless_target(sim: ZfsSim) -> None:
         zfs.send_recv(send, recv)
 
 
+# --- stage and dataset overlap ---
+
+
+@pytest.mark.parametrize(
+    ("stage", "dataset"),
+    [
+        ("tank/data", "tank/data"),
+        ("tank/data/stage", "tank/data"),
+        ("tank/stage", "tank/stage/old/x"),
+    ],
+    ids=["same", "stage-inside", "dataset-inside"],
+)
+@pytest.mark.parametrize("command", [seed, catchup, cutover], ids=["seed", "catchup", "cutover"])
+def test_refuses_a_stage_overlapping_the_dataset(
+    sim: ZfsSim,
+    settings: Settings,
+    stage: str,
+    dataset: str,
+    command: Callable[[Zfs, Settings, str], list[str]],
+) -> None:
+    """The copy would land inside its own source, or the swap rename the stage into itself: refuse before zfs runs."""
+    zfs, runner = make(sim)
+
+    with pytest.raises(MigrationError, match=f"{dataset} overlaps the stage {stage}; neither may be or contain"):
+        command(zfs, replace(settings, stage=stage), dataset)
+    assert runner.calls == []
+
+
+def test_seed_refuses_a_pool_root_holding_the_stage(sim: ZfsSim, settings: Settings) -> None:
+    """A pool root seeded to a stage on the same pool would copy the stage into itself."""
+    zfs, runner = make(sim)
+
+    with pytest.raises(MigrationError, match=f"tank overlaps the stage {STAGE}"):
+        seed(zfs, settings, "tank")
+    assert runner.calls == []
+
+
 # --- cutover pool, key file links, signals ---
 
 

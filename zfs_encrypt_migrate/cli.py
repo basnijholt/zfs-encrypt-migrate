@@ -61,6 +61,14 @@ def _validate_keylocation(value: str) -> str:
     raise typer.BadParameter(msg)
 
 
+def _validate_key_file(value: Path) -> Path:
+    # zfs only rejects a relative file:// keylocation in the receive, after seed took its snapshots.
+    if not value.is_absolute():
+        msg = f"key file {str(value)!r} must be an absolute path"
+        raise typer.BadParameter(msg)
+    return value
+
+
 def _validate_name(value: str) -> str:
     return validate_name(value)
 
@@ -83,7 +91,8 @@ KeyFileOption = Annotated[
     typer.Option(
         "--key-file",
         envvar="ZFS_ENCRYPT_MIGRATE_KEY_FILE",
-        help="Key file for the staged tree; must have mode 600",
+        help="Key file for the staged tree, as an absolute path; must have mode 600",
+        callback=_validate_key_file,
     ),
 ]
 MinFreeOption = Annotated[
@@ -124,6 +133,10 @@ FinalKeylocationOption = Annotated[
     ),
 ]
 DatasetArgument = Annotated[str, typer.Argument(help="Dataset to migrate", callback=_validate_name, show_default=False)]
+ParentArgument = Annotated[
+    str,
+    typer.Argument(help="Parent dataset, as given to tree-seed", callback=_validate_name, show_default=False),
+]
 ChildArgument = Annotated[
     str,
     typer.Argument(help="Name of a direct child of DATASET", callback=_validate_child, show_default=False),
@@ -251,7 +264,7 @@ def tree_seed_command(
 
 @app.command("tree-move", rich_help_panel="Tree Commands")
 def tree_move_command(
-    dataset: DatasetArgument,
+    dataset: ParentArgument,
     child: ChildArgument,
     *,
     stage: StageOption,

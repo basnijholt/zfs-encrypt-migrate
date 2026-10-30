@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -25,6 +26,17 @@ if TYPE_CHECKING:
 SOURCE = "tank/data/child"
 STAGED = f"{STAGE}/data/child"
 STAGED_ROOT = f"{STAGE}/data"
+MOVED = [
+    f"verify the key with: zfs load-key -n -L prompt {STAGED_ROOT}",
+    f"moved {SOURCE}; once verified, free it with: zfs destroy -r {SOURCE}",
+]
+START_OVER = (f"  zfs destroy -r {SOURCE}@enc-tree", f"  zfs destroy -r {STAGED}")
+MAY_BE_PARTIAL = (
+    "tree-move aborted.",
+    f"{SOURCE} may be unmounted; remount with: zfs mount -a",
+    f"{STAGED} may hold a partial copy; remove it and the tree snapshots, then rerun tree-move:",
+    *START_OVER,
+)
 
 
 def written(name: str, snap: str = "enc-tree") -> tuple[str, ...]:
@@ -163,7 +175,8 @@ def test_tree_move_exact_commands(sim: ZfsSim, settings: Settings) -> None:
 
     lines = tree_move(zfs, settings, "tank/data", "child")
 
-    assert lines == [f"moved {SOURCE}; once verified, free it with: zfs destroy -r {SOURCE}"]
+    # The passphrase check comes first: once the source is destroyed, the staged copy is the only one.
+    assert lines == MOVED
     assert runner.pipelines == [
         (("zfs", "send", "-R", f"{SOURCE}@enc-tree"), ("zfs", "recv", "-u", "-x", "encryption", STAGED)),
     ]
@@ -210,10 +223,9 @@ def test_tree_move_sizes_the_child_by_used(sim: ZfsSim, settings: Settings) -> N
             f"{STAGED_ROOT}@enc-tree does not exist; run tree-seed first",
         ),
         (lambda sim: sim.datasets.remove(SOURCE), f"dataset {SOURCE} does not exist"),
-        (lambda sim: sim.datasets.add(STAGED), f"{STAGED} already exists"),
         (lambda sim: setattr(sim, "avail", 1050), "below floor 1000"),
     ],
-    ids=["no-tree-snapshot", "no-source", "staged-exists", "free-space"],
+    ids=["no-tree-snapshot", "no-source", "free-space"],
 )
 def test_tree_move_refusals_write_nothing(sim: ZfsSim, settings: Settings, prepare: object, message: str) -> None:
     """Every refusal happens before the key is loaded or anything is unmounted."""
@@ -226,6 +238,66 @@ def test_tree_move_refusals_write_nothing(sim: ZfsSim, settings: Settings, prepa
 
     assert sim.ops() == []
     assert info.value.hints == ()
+
+
+def test_tree_move_rerun_after_a_finished_move_reports_it_again(sim: ZfsSim, settings: Settings) -> None:
+    """A complete, encrypted copy is reported as moved, with the key check and the destroy hint; nothing runs."""
+    tree_seeded(sim)
+    zfs, _ = make(sim)
+    tree_move(zfs, settings, "tank/data", "child")
+    sim.log.clear()
+
+    lines = tree_move(zfs, settings, "tank/data", "child")
+
+    assert lines == [f"{SOURCE} was already moved to {STAGED}", *MOVED]
+    assert sim.ops() == []
+
+
+@pytest.mark.parametrize(
+    "interrupted",
+    [
+        lambda sim: (sim.datasets.remove(f"{STAGED}/grand"), sim.snapshots.pop(f"{STAGED}/grand@enc-tree")),
+        lambda sim: sim.snapshots.pop(f"{STAGED}@enc-tree"),
+        lambda sim: sim.prop(f"{STAGED}/grand", "encryptionroot", "-"),
+    ],
+    ids=["missing-descendant", "older-head", "not-encrypted"],
+)
+def test_tree_move_refuses_a_partial_copy_with_the_cleanup(
+    sim: ZfsSim,
+    settings: Settings,
+    interrupted: Callable[[ZfsSim], object],
+) -> None:
+    """An incomplete copy left by an interrupted run is refused with its cleanup, never reported as moved."""
+    tree_seeded(sim)
+    zfs, _ = make(sim)
+    tree_move(zfs, settings, "tank/data", "child")
+    interrupted(sim)
+    sim.log.clear()
+
+    with pytest.raises(MigrationError) as info:
+        tree_move(zfs, settings, "tank/data", "child")
+
+    assert info.value.message == (
+        f"{STAGED} already exists but is not a complete copy of {SOURCE}; a tree-move was interrupted or failed"
+    )
+    assert info.value.hints == (
+        "remove the partial copy and the tree snapshots, then rerun tree-move:",
+        *START_OVER,
+    )
+    assert sim.ops() == []
+
+
+def test_tree_move_reruns_once_the_partial_copy_is_removed(sim: ZfsSim, settings: Settings) -> None:
+    """The printed cleanup is all a rerun needs."""
+    tree_seeded(sim)
+    zfs, _ = make(sim)
+    tree_move(zfs, settings, "tank/data", "child")
+    # What the two printed zfs destroy -r commands remove.
+    for name in (SOURCE, f"{SOURCE}/grand", STAGED, f"{STAGED}/grand"):
+        sim.snapshots.pop(f"{name}@enc-tree")
+    sim.datasets -= {STAGED, f"{STAGED}/grand"}
+
+    assert tree_move(zfs, settings, "tank/data", "child") == MOVED
 
 
 def test_tree_move_busy_unmount_hints_remount_of_the_child(sim: ZfsSim, settings: Settings) -> None:
@@ -269,7 +341,8 @@ def test_tree_move_refuses_unencrypted_descendant_before_the_destroy_hint(sim: Z
     with pytest.raises(MigrationError, match=f"{STAGED}/grand is not encrypted under {STAGED_ROOT}") as info:
         tree_move(zfs, settings, "tank/data", "child")
 
-    assert not [hint for hint in info.value.hints if "destroy" in hint]
+    # Only the staged copy and the tree snapshots are to be destroyed, never the source itself.
+    assert info.value.hints == MAY_BE_PARTIAL
     assert ("zpool", "sync", "tank") not in runner.calls
 
 
@@ -307,13 +380,7 @@ def test_tree_move_refuses_writes_since_the_tree_snapshot(sim: ZfsSim, settings:
         tree_move(zfs, settings, "tank/data", "child")
 
     assert info.value.message == f"written since the tree snapshot:\n{SOURCE}/grand"
-    assert info.value.hints == (
-        "drop the stale snapshots and the partial copy, then retry tree-move:",
-        f"  zfs destroy -r {SOURCE}@enc-tree",
-        f"  zfs destroy -r {STAGED}",
-        "tree-move aborted.",
-        f"{SOURCE} may be unmounted; remount with: zfs mount -a",
-    )
+    assert info.value.hints == MAY_BE_PARTIAL
     assert ("zfs", "unload-key", "-r", STAGED_ROOT) in runner.calls
     assert not [c for c in runner.calls if c[1] == "destroy"]
 
@@ -327,7 +394,18 @@ def test_tree_move_failed_receive_unloads_key(sim: ZfsSim, settings: Settings) -
         tree_move(zfs, settings, "tank/data", "child")
 
     assert ("zfs", "unload-key", "-r", STAGED_ROOT) in runner.calls
-    assert info.value.hints[0] == "tree-move aborted."
+    assert info.value.hints == MAY_BE_PARTIAL
+
+
+def test_tree_move_failed_snapshot_hints_no_cleanup(sim: ZfsSim, settings: Settings) -> None:
+    """Before the tree snapshot exists there is nothing to remove, so only the remount is hinted."""
+    tree_seeded(sim)
+    zfs, _ = make(sim, fail_on("zfs", "snapshot"))
+
+    with pytest.raises(MigrationError, match="injected") as info:
+        tree_move(zfs, settings, "tank/data", "child")
+
+    assert info.value.hints == ("tree-move aborted.", f"{SOURCE} may be unmounted; remount with: zfs mount -a")
 
 
 def test_tree_move_interrupt_unloads_key(sim: ZfsSim, settings: Settings) -> None:
@@ -345,7 +423,7 @@ def test_tree_move_interrupt_unloads_key(sim: ZfsSim, settings: Settings) -> Non
         tree_move(Zfs(runner), settings, "tank/data", "child")
 
     assert ("zfs", "unload-key", "-r", STAGED_ROOT) in runner.calls
-    assert info.value.hints[0] == "tree-move aborted."
+    assert info.value.hints == MAY_BE_PARTIAL
 
 
 def test_tree_move_skips_load_when_key_loaded(sim: ZfsSim, settings: Settings) -> None:
@@ -713,4 +791,36 @@ def test_tree_move_refuses_dataset_on_other_pool_than_stage(settings: Settings) 
 
     with pytest.raises(MigrationError, match="ssd/data is on pool ssd but the stage is on tank; tree-move cannot"):
         tree_move(zfs, settings, "ssd/data", "child")
+    assert runner.calls == []
+
+
+# --- stage and dataset overlap ---
+
+
+@pytest.mark.parametrize(
+    ("stage", "dataset"),
+    [("tank/data", "tank/data"), ("tank/data/stage", "tank/data"), ("tank/stage", "tank/stage/old")],
+    ids=["same", "stage-inside", "dataset-inside"],
+)
+@pytest.mark.parametrize(
+    "command",
+    [
+        tree_seed,
+        lambda zfs, settings, dataset: tree_move(zfs, settings, dataset, "child"),
+        tree_finish,
+    ],
+    ids=["tree-seed", "tree-move", "tree-finish"],
+)
+def test_tree_commands_refuse_a_stage_overlapping_the_dataset(
+    sim: ZfsSim,
+    settings: Settings,
+    stage: str,
+    dataset: str,
+    command: Callable[[Zfs, Settings, str], list[str]],
+) -> None:
+    """The copy would land inside its own source, or the swap rename the stage into itself: refuse before zfs runs."""
+    zfs, runner = make(sim)
+
+    with pytest.raises(MigrationError, match=f"{dataset} overlaps the stage {stage}; neither may be or contain"):
+        command(zfs, replace(settings, stage=stage), dataset)
     assert runner.calls == []

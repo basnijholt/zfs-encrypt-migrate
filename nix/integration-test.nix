@@ -23,7 +23,7 @@ pkgs.testers.runNixOSTest {
       # Real ZFS in the guest; its zfs/zpool land on the system PATH.
       boot.supportedFilesystems = [ "zfs" ];
       # ZFS refuses to import without a hostId; the value is arbitrary.
-      networking.hostId = "8425e349";
+      networking.hostId = "3e1647d3";
 
       environment.systemPackages = [
         pkgs.gawk
@@ -206,20 +206,43 @@ pkgs.testers.runNixOSTest {
         machine.succeed("zfs create -V 16M tank/backups/v")
         machine.succeed(f"{M} zfs-encrypt-migrate tree-seed {S} tank/backups")
         assert get("keystatus", "tank/stage/backups") == "unavailable"
-        machine.succeed(f"{M} zfs-encrypt-migrate tree-move {S} tank/backups b1 && zfs destroy -r tank/backups/b1")
+        out = machine.succeed(f"{M} zfs-encrypt-migrate tree-move {S} tank/backups b1")
+        check = "verify the key with: zfs load-key -n -L prompt tank/stage/backups"
+        assert check in out and out.index(check) < out.index("moved tank/backups/b1"), out
+        # The printed check asks for the passphrase instead of reading the key file: the right one verifies, a wrong one fails.
+        machine.succeed("zfs load-key -n -L prompt tank/stage/backups < /run/zfs-encrypt-migrate.key")
+        machine.fail("printf wrong-passphrase | zfs load-key -n -L prompt tank/stage/backups")
+        assert get("keystatus", "tank/stage/backups") == "unavailable"
+        machine.succeed("zfs destroy -r tank/backups/b1")
         machine.succeed(f"{M} zfs-encrypt-migrate tree-move {S} tank/backups b2")
+        out = machine.succeed(f"{M} zfs-encrypt-migrate tree-move {S} tank/backups b2")
+        assert "tank/backups/b2 was already moved to tank/stage/backups/b2" in out and check in out, out
+        # A partial copy, as an interrupted tree-move leaves it: the child arrived, its descendant didn't.
+        machine.succeed("zfs create tank/backups/b3 && zfs create tank/backups/b3/k && echo k > /tank/backups/b3/k/k")
+        machine.succeed(
+            "zfs snapshot -r tank/backups/b3@enc-tree && zfs load-key tank/stage/backups"
+            " && zfs send tank/backups/b3@enc-tree | zfs recv -u -x encryption tank/stage/backups/b3"
+            " && zfs unload-key -r tank/stage/backups"
+        )
+        out = machine.fail(f"{M} zfs-encrypt-migrate tree-move {S} tank/backups b3 2>&1")
+        assert "tank/stage/backups/b3 already exists but is not a complete copy of tank/backups/b3" in out, out
+        cleanup = [line.strip() for line in out.splitlines() if line.strip().startswith("zfs destroy ")]
+        assert cleanup == ["zfs destroy -r tank/backups/b3@enc-tree", "zfs destroy -r tank/stage/backups/b3"], out
+        for command in cleanup:
+            machine.succeed(command)
+        machine.succeed(f"{M} zfs-encrypt-migrate tree-move {S} tank/backups b3")
         machine.succeed(f"{M} zfs-encrypt-migrate tree-move {S} tank/backups v")
         assert get("keystatus", "tank/stage/backups") == "unavailable"
         assert "children remain" in machine.fail(f"{M} zfs-encrypt-migrate tree-finish {S} tank/backups 2>&1")
-        machine.succeed("zfs destroy -r tank/backups/b2 && zfs destroy -r tank/backups/v")
+        machine.succeed("zfs destroy -r tank/backups/b2 && zfs destroy -r tank/backups/b3 && zfs destroy -r tank/backups/v")
         out = machine.succeed(f"{M} zfs-encrypt-migrate tree-finish {S} tank/backups")
         assert "verify the key with: zfs load-key -n tank/backups" in out, out
         machine.succeed("zfs load-key -n tank/backups < /run/zfs-encrypt-migrate.key")
         assert get("encryptionroot", "tank/backups") == "tank/backups"
         assert get("keylocation", "tank/backups") == "prompt"
-        for d in ("b1", "b2", "b2/c", "v"):
+        for d in ("b1", "b2", "b2/c", "b3", "b3/k", "v"):
             assert get("encryptionroot", f"tank/backups/{d}") == "tank/backups"
-        machine.succeed("test -f /tank/b2c/g")
+        machine.succeed("test -f /tank/b2c/g && test -f /tank/backups/b3/k/k")
         assert "tank/backups/b2/c@autosnap_c" in machine.succeed("zfs list -H -t snapshot -o name tank/backups/b2/c")
         assert get("mountpoint", "tank/backups/b2") == "none"
         assert get("readonly", "tank/backups/b2") == "on"
@@ -289,6 +312,8 @@ pkgs.testers.runNixOSTest {
             "-O " + line.replace("\t", "=", 1) for line in props.splitlines() if line.split("\t")[0] != "keylocation"
         )
         assert "-O compression=zstd" in root_options and "-O mountpoint=/ssd" in root_options, root_options
+        # The stored passphrase must open the staged copy before the pool, the other copy, is destroyed.
+        machine.succeed("zfs load-key -n -L prompt tank/stage/ssd < /run/zfs-encrypt-migrate.key")
         machine.succeed("udevadm settle && zpool destroy ssd")
         machine.succeed(
             "zpool create -O encryption=aes-256-gcm -O keyformat=passphrase"

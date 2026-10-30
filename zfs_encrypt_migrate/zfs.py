@@ -166,11 +166,3 @@ class Zfs:
     def pool_sync(self, pool: str) -> None:
         """Flush pending writes of a pool."""
         self._run(["zpool", "sync", pool])
-
-    def pool_imported(self, pool: str) -> bool:
-        """Return whether a pool is imported."""
-        args = ["zpool", "list", "-H", "-o", "name", pool]
-        result = self.runner.run(args)
-        if result.returncode == COMMAND_STARTUP_ERROR_RETURNCODE:
-            raise ZfsError(result, args)
-        return result.returncode == 0
