@@ -281,12 +281,22 @@ def test_real_signal_mid_pipeline_cleans_up_and_exits_130(
     blocking = Blocking(sim.answer)
     monkeypatch.setattr(cli, "_runner", lambda: blocking)
     before = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
-    timer = threading.Timer(1.0, os.kill, (os.getpid(), signum))
-    timer.start()
+    stop = threading.Event()
+
+    def signal_once_children_run() -> None:
+        # Fire only when both children wrote their pid, so slow machines cannot signal too early.
+        while not stop.wait(0.05):
+            if all(f.exists() and f.read_text().strip() for f in pid_files):
+                os.kill(os.getpid(), signum)
+                return
+
+    thread = threading.Thread(target=signal_once_children_run)
+    thread.start()
     try:
         result = runner.invoke(cli.app, ["cutover", "tank/data"])
     finally:
-        timer.cancel()
+        stop.set()
+        thread.join()
 
     assert result.exit_code == 130  # noqa: PLR2004
     assert "interrupted" in result.output
@@ -296,3 +306,28 @@ def test_real_signal_mid_pipeline_cleans_up_and_exits_130(
         with pytest.raises(ProcessLookupError):
             os.kill(int(pid_file.read_text()), 0)
     assert {number: signal.getsignal(number) for number in before} == before
+
+
+def test_signal_ignored_on_entry_stays_ignored(sim: ZfsSim, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Under nohup SIGHUP starts ignored; a hangup mid-run must not abort the migration."""
+    seen: list[object] = []
+
+    def hang_up(args: Sequence[str]) -> CommandResult:
+        if args[1] == "snapshot":
+            seen.append(signal.getsignal(signal.SIGHUP))
+            signal.raise_signal(signal.SIGHUP)
+        return sim.answer(args)
+
+    monkeypatch.setattr(cli, "_runner", lambda: FakeRunner(hang_up))
+    sigterm = signal.getsignal(signal.SIGTERM)
+    previous = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    try:
+        result = runner.invoke(cli.app, ["seed", "tank/data"])
+        after = signal.getsignal(signal.SIGHUP)
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+
+    assert result.exit_code == 0, result.output
+    assert seen == [signal.SIG_IGN]
+    assert after is signal.SIG_IGN
+    assert signal.getsignal(signal.SIGTERM) is sigterm

@@ -130,7 +130,12 @@ def _run_migration(
         raise KeyboardInterrupt
 
     # A dropped ssh session (SIGHUP) or a kill (SIGTERM) must unload the staged key like Ctrl-C does.
-    previous = {number: signal.signal(number, interrupt) for number in INTERRUPT_SIGNALS}
+    # A signal that was ignored on entry (nohup) stays ignored, so a protected run survives a hangup.
+    previous = {
+        number: signal.signal(number, interrupt)
+        for number in INTERRUPT_SIGNALS
+        if signal.getsignal(number) is not signal.SIG_IGN
+    }
     try:
         lines = command(Zfs(_runner()), settings, dataset)
     except Interrupted as error:

@@ -27,7 +27,10 @@ INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 @contextlib.contextmanager
 def signals_ignored() -> Iterator[None]:
-    """Ignore the interrupt signals so a second one cannot skip the cleanup inside."""
+    """Ignore the interrupt signals so a second one cannot skip the cleanup inside.
+
+    Children inherit the ignore on purpose: the same keypress or hangup that reaches us reaches them.
+    """
     if threading.current_thread() is not threading.main_thread():
         yield
         return

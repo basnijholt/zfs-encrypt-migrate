@@ -909,8 +909,11 @@ def test_seed_and_catchup_work_across_pools(settings: Settings, key_file: Path) 
     zfs, runner = make(simulator)
 
     seed(zfs, settings, "ssd/data")
+    catchup(zfs, settings, "ssd/data")
 
     assert runner.pipelines[0][1] == recv_args(key_file, f"{STAGE}/data")
+    assert runner.pipelines[1][0] == ("zfs", "send", "-R", "-I", "@enc-seed", "ssd/data@enc-final")
+    assert simulator.props[f"{STAGE}/data", "keystatus"] == "unavailable"
 
 
 def test_key_file_symlink_to_private_file_is_accepted(sim: ZfsSim, settings: Settings, tmp_path: Path) -> None:
@@ -951,8 +954,11 @@ def test_cleanup_ignores_signals_and_restores_handlers(sim: ZfsSim, settings: Se
 
     zfs, runner = make(sim, second_signal)
     try:
-        with pytest.raises(MigrationError, match=MSG), abort_guard(zfs, settings, f"{STAGE}/data"):
-            raise MigrationError(MSG)
+        try:
+            with pytest.raises(MigrationError, match=MSG), abort_guard(zfs, settings, f"{STAGE}/data"):
+                raise MigrationError(MSG)
+        except KeyboardInterrupt:
+            pytest.fail("a signal during the key unload interrupted the cleanup")
         assert sim.props[f"{STAGE}/data", "keystatus"] == "unavailable"
         assert signal.getsignal(signal.SIGTERM) is signal.default_int_handler
         assert signal.getsignal(signal.SIGHUP) is signal.default_int_handler
