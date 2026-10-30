@@ -189,3 +189,22 @@ def test_validate_child_rejects(name: str) -> None:
     """Empty names, paths, snapshots and option-like names are refused."""
     with pytest.raises(typer.BadParameter):
         validate_child(name)
+
+
+def test_unload_key_retries_while_busy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A volume still held open by udev is retried; other failures raise at once."""
+    monkeypatch.setattr("zfs_encrypt_migrate.zfs.time.sleep", lambda _: None)
+    busy = fail("Key unload error: 'tank/a' is busy.\n")
+    runner = FakeRunner(queue=[busy, busy, ok()])
+
+    Zfs(runner).unload_key("tank/a")
+
+    assert len(runner.calls) == 3  # noqa: PLR2004
+
+    with pytest.raises(ZfsError, match="permission denied"):
+        Zfs(FakeRunner(queue=[fail("permission denied\n")])).unload_key("tank/a")
+
+    stuck = FakeRunner(queue=[busy] * 20)
+    with pytest.raises(ZfsError, match="busy"):
+        Zfs(stuck).unload_key("tank/a")
+    assert len(stuck.calls) == 20  # noqa: PLR2004

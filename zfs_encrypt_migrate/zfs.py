@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -14,6 +15,10 @@ if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
     from .process import CommandResult, CommandRunner
+
+# A freshly received volume is held open by udev for a moment, which makes unload-key report "busy".
+_UNLOAD_ATTEMPTS = 20
+_UNLOAD_RETRY_SECONDS = 0.5
 
 # -13 from subprocess, 128 + 13 when the kill is reported through a shell.
 _SIGPIPE_RETURNCODES = frozenset({-13, 141})
@@ -137,7 +142,15 @@ class Zfs:
 
     def unload_key(self, name: str) -> None:
         """Unload the key of a dataset and its descendants."""
-        self._run(["zfs", "unload-key", "-r", name])
+        args = ["zfs", "unload-key", "-r", name]
+        for _ in range(_UNLOAD_ATTEMPTS - 1):
+            result = self.runner.run(args)
+            if result.returncode == 0:
+                return
+            if result.returncode == COMMAND_STARTUP_ERROR_RETURNCODE or "busy" not in result.stderr:
+                raise ZfsError(result, args)
+            time.sleep(_UNLOAD_RETRY_SECONDS)
+        self._run(args)
 
     def pool_avail(self, pool: str) -> int:
         """Return free bytes in a pool."""
