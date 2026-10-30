@@ -5,11 +5,16 @@ from __future__ import annotations
 from collections import deque
 from typing import TYPE_CHECKING
 
+import pytest
+
+from zfs_encrypt_migrate.migrate import Settings
 from zfs_encrypt_migrate.process import CommandResult
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
+    from pathlib import Path
 
+STAGE = "tank/stage"
 OK = CommandResult(returncode=0, stdout="", stderr="")
 
 
@@ -49,3 +54,18 @@ class FakeRunner:
         """Record both commands and answer each in order."""
         self.pipelines.append((tuple(first), tuple(second)))
         return self._answer(first), self._answer(second)
+
+
+@pytest.fixture
+def key_file(tmp_path: Path) -> Path:
+    """Create a private key file."""
+    path = tmp_path / "key"
+    path.write_text("secret")
+    path.chmod(0o600)
+    return path
+
+
+@pytest.fixture
+def settings(key_file: Path) -> Settings:
+    """Build settings with a tiny free-space floor."""
+    return Settings(stage=STAGE, key_file=key_file, min_free=1000, keyformat="passphrase", final_keylocation="prompt")

@@ -331,3 +331,130 @@ def test_signal_ignored_on_entry_stays_ignored(sim: ZfsSim, monkeypatch: pytest.
     assert seen == [signal.SIG_IGN]
     assert after is signal.SIG_IGN
     assert signal.getsignal(signal.SIGTERM) is sigterm
+
+
+# --- tree commands ---
+
+
+def _tree_state(sim: ZfsSim) -> None:
+    """Stage the parent of tank/data as tree-seed leaves it, with one child to move."""
+    sim.datasets |= {"tank/stage", "tank/stage/old", "tank/stage/data", "tank/data/child"}
+    sim.snapshot("tank/data@enc-tree")
+    sim.snapshot("tank/stage/data@enc-tree")
+    sim.prop("tank/stage/data", "encryption", "aes-256-gcm")
+    sim.prop("tank/stage/data", "encryptionroot", "tank/stage/data")
+    sim.prop("tank/stage/data", "keystatus", "unavailable")
+
+
+def test_tree_seed_runs_through_options_and_env(sim: ZfsSim) -> None:
+    """tree-seed uses the shared options and exits 0."""
+    result = runner.invoke(cli.app, ["tree-seed", "tank/data"])
+
+    assert result.exit_code == 0, result.output
+    assert sim.runner.pipelines[0][0] == ("zfs", "send", "-p", "tank/data@enc-tree")  # type: ignore[attr-defined]
+
+
+def test_tree_move_runs_and_prints_destroy_hint(sim: ZfsSim) -> None:
+    """tree-move takes the parent and the child name and prints the verified-destroy hint."""
+    _tree_state(sim)
+
+    result = runner.invoke(cli.app, ["tree-move", "tank/data", "child"])
+
+    assert result.exit_code == 0, result.output
+    assert "moved tank/data/child; once verified, free it with: zfs destroy -r tank/data/child" in result.output
+    assert sim.runner.pipelines[0][0] == ("zfs", "send", "-R", "tank/data/child@enc-tree")  # type: ignore[attr-defined]
+
+
+def test_tree_finish_runs(sim: ZfsSim) -> None:
+    """tree-finish refuses while the child remains, with exit 1 and the refusal text."""
+    _tree_state(sim)
+
+    result = runner.invoke(cli.app, ["tree-finish", "tank/data"])
+
+    assert result.exit_code == 1
+    assert "children remain under tank/data; move each with tree-move and destroy it first" in result.output
+
+
+@pytest.mark.parametrize("command", ["tree-seed", "tree-finish"])
+@pytest.mark.usefixtures("sim")
+def test_tree_commands_refuse_pool_root(command: str) -> None:
+    """Pool roots exit 1 with the tree-move wording."""
+    result = runner.invoke(cli.app, [command, "tank"])
+
+    assert result.exit_code == 1
+    assert "tank is a pool root; the tree move is not supported" in result.output
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["tree-move", "tank/data", "a/b"],
+        ["tree-move", "tank/data", "a@b"],
+        ["tree-move", "tank/data", ""],
+        ["tree-move", "tank/data", "--", "-x"],
+        ["tree-move", "tank/data", "a b"],
+        ["tree-move", "tank/data"],
+        ["tree-move", "--", "-r", "child"],
+        ["tree-seed", "tank/data@s"],
+        ["tree-finish", "--", "-r"],
+        ["tree-finish", "tank/data", "--min-free", "lots"],
+    ],
+)
+def test_tree_commands_reject_bad_input_before_zfs(sim: ZfsSim, argv: list[str]) -> None:
+    """Bad names, child paths and options exit 2 and never reach zfs."""
+    result = runner.invoke(cli.app, argv)
+
+    assert result.exit_code == 2  # noqa: PLR2004
+    assert sim.runner.calls == []  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [["tree-seed", "tank/data"], ["tree-move", "tank/data", "child"], ["tree-finish", "tank/data"]],
+)
+def test_tree_commands_missing_zfs_binary_is_one_error_line(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    argv: list[str],
+) -> None:
+    """A zfs binary that cannot start is one clean error, never a traceback."""
+    key = tmp_path / "key"
+    key.write_text("secret")
+    key.chmod(0o600)
+    fake_runner = FakeRunner(lambda _args: fail("No such file or directory: 'zfs'\n", COMMAND_STARTUP_ERROR_RETURNCODE))
+    monkeypatch.setattr(cli, "_runner", lambda: fake_runner)
+
+    result = runner.invoke(cli.app, [*argv, "--stage", "tank/stage", "--key-file", str(key)])
+
+    assert result.exit_code == 1
+    assert "error:" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_tree_move_interrupt_prints_tree_move_hints_and_exits_130(
+    sim: ZfsSim,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ctrl-C mid-pipeline unloads the key, prints the tree-move hints and exits 130."""
+    _tree_state(sim)
+    sim.props["tank/stage/data", "keystatus"] = "available"
+
+    def interrupt(_first: object, _second: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(sim.runner, "pipeline", interrupt)  # type: ignore[attr-defined]
+
+    result = runner.invoke(cli.app, ["tree-move", "tank/data", "child"])
+
+    assert result.exit_code == 130  # noqa: PLR2004
+    assert "tree-move aborted." in result.output
+    assert ("zfs", "unload-key", "-r", "tank/stage/data") in sim.runner.calls  # type: ignore[attr-defined]
+
+
+def test_tree_commands_are_in_their_own_help_panel() -> None:
+    """The three commands are listed under Tree Commands."""
+    result = runner.invoke(cli.app, ["--help"])
+
+    assert "Tree Commands" in result.output
+    for name in ("tree-seed", "tree-move", "tree-finish"):
+        assert name in result.output

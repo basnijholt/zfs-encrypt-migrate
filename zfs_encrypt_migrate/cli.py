@@ -15,8 +15,9 @@ from .migrate import INTERRUPT_SIGNALS, Settings, catchup, cutover, seed
 from .output import console, print_error
 from .process import CommandRunner, SubprocessRunner
 from .sizes import parse_size
+from .tree import tree_finish, tree_move, tree_seed
 from .version import __version__
-from .zfs import Zfs, validate_name
+from .zfs import Zfs, validate_child, validate_name
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -62,6 +63,10 @@ def _validate_keylocation(value: str) -> str:
 
 def _validate_name(value: str) -> str:
     return validate_name(value)
+
+
+def _validate_child(value: str) -> str:
+    return validate_child(value)
 
 
 StageOption = Annotated[
@@ -119,6 +124,10 @@ FinalKeylocationOption = Annotated[
     ),
 ]
 DatasetArgument = Annotated[str, typer.Argument(help="Dataset to migrate", callback=_validate_name, show_default=False)]
+ChildArgument = Annotated[
+    str,
+    typer.Argument(help="Name of a direct child of DATASET", callback=_validate_child, show_default=False),
+]
 
 
 def _run_migration(
@@ -217,6 +226,61 @@ def cutover_command(
     """Swap the staged tree into place; the original stays read-only under STAGE/old."""
     _run_migration(
         cutover,
+        Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation),
+        dataset,
+    )
+
+
+@app.command("tree-seed", rich_help_panel="Tree Commands")
+def tree_seed_command(
+    dataset: DatasetArgument,
+    *,
+    stage: StageOption,
+    key_file: KeyFileOption = Path("/run/zfs-encrypt-migrate.key"),
+    min_free: MinFreeOption = "1T",
+    keyformat: KeyformatOption = Keyformat.passphrase,
+    final_keylocation: FinalKeylocationOption = "prompt",
+) -> None:
+    """Copy only the parent to an encrypted staged dataset; its children move one by one."""
+    _run_migration(
+        tree_seed,
+        Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation),
+        dataset,
+    )
+
+
+@app.command("tree-move", rich_help_panel="Tree Commands")
+def tree_move_command(
+    dataset: DatasetArgument,
+    child: ChildArgument,
+    *,
+    stage: StageOption,
+    key_file: KeyFileOption = Path("/run/zfs-encrypt-migrate.key"),
+    min_free: MinFreeOption = "1T",
+    keyformat: KeyformatOption = Keyformat.passphrase,
+    final_keylocation: FinalKeylocationOption = "prompt",
+) -> None:
+    """Copy one child subtree under the staged parent; the source stays until you destroy it."""
+    _run_migration(
+        lambda zfs, settings, parent: tree_move(zfs, settings, parent, child),
+        Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation),
+        dataset,
+    )
+
+
+@app.command("tree-finish", rich_help_panel="Tree Commands")
+def tree_finish_command(
+    dataset: DatasetArgument,
+    *,
+    stage: StageOption,
+    key_file: KeyFileOption = Path("/run/zfs-encrypt-migrate.key"),
+    min_free: MinFreeOption = "1T",
+    keyformat: KeyformatOption = Keyformat.passphrase,
+    final_keylocation: FinalKeylocationOption = "prompt",
+) -> None:
+    """Send the parent's last changes and swap the staged tree into place once no children remain."""
+    _run_migration(
+        tree_finish,
         Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation),
         dataset,
     )

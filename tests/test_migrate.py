@@ -22,7 +22,8 @@ from zfs_encrypt_migrate.migrate import (
 )
 from zfs_encrypt_migrate.zfs import Zfs
 
-from .conftest import FakeRunner, fail
+from .conftest import STAGE, FakeRunner, fail
+from .helpers import fail_on, make
 from .zfs_sim import ZfsSim, staged_ready
 
 if TYPE_CHECKING:
@@ -31,7 +32,6 @@ if TYPE_CHECKING:
 
     from zfs_encrypt_migrate.process import CommandResult
 
-STAGE = "tank/stage"
 MSG = "x"
 
 
@@ -52,21 +52,6 @@ def recv_args(key_file: Path, target: str, keyformat: str = "passphrase") -> tup
 
 
 @pytest.fixture
-def key_file(tmp_path: Path) -> Path:
-    """Create a private key file."""
-    path = tmp_path / "key"
-    path.write_text("secret")
-    path.chmod(0o600)
-    return path
-
-
-@pytest.fixture
-def settings(key_file: Path) -> Settings:
-    """Build settings with a tiny free-space floor."""
-    return Settings(stage=STAGE, key_file=key_file, min_free=1000, keyformat="passphrase", final_keylocation="prompt")
-
-
-@pytest.fixture
 def sim() -> ZfsSim:
     """Build a pool with a dataset that has one child."""
     simulator = ZfsSim(["tank", "tank/data", "tank/data/child"])
@@ -74,42 +59,6 @@ def sim() -> ZfsSim:
     for name in ("tank/data", "tank/data/child"):
         simulator.prop(name, "mounted", "yes")
     return simulator
-
-
-def make(
-    sim: ZfsSim,
-    responder: Callable[[Sequence[str]], CommandResult | None] | None = None,
-    after: Callable[[Sequence[str]], None] | None = None,
-) -> tuple[Zfs, FakeRunner]:
-    """Build a Zfs over a runner answered by the simulator.
-
-    ``responder`` may answer a command itself (returning None defers to the simulator);
-    ``after`` runs once the simulator answered, to tamper with its state.
-    """
-
-    def answer(args: Sequence[str]) -> CommandResult:
-        if responder is not None:
-            result = responder(args)
-            if result is not None:
-                return result
-        result = sim.answer(args)
-        if after is not None:
-            after(args)
-        return result
-
-    runner = FakeRunner(answer)
-    return Zfs(runner), runner
-
-
-def fail_on(*prefix: str) -> Callable[[Sequence[str]], CommandResult | None]:
-    """Fail every command that starts with the given words."""
-
-    def responder(args: Sequence[str]) -> CommandResult | None:
-        if tuple(args[: len(prefix)]) == prefix:
-            return fail("injected\n")
-        return None
-
-    return responder
 
 
 def written(name: str) -> tuple[str, ...]:

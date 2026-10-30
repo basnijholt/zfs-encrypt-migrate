@@ -29,6 +29,15 @@ def validate_name(name: str) -> str:
     return name
 
 
+def validate_child(name: str) -> str:
+    """Return the name of a direct child dataset, refusing paths and anything validate_name refuses."""
+    validate_name(name)
+    if "/" in name:
+        msg = f"invalid child name {name!r}: give the name of a direct child, without /"
+        raise typer.BadParameter(msg)
+    return name
+
+
 class Zfs:
     """Run zfs and zpool commands, raising ZfsError on any unexpected failure."""
 
@@ -66,6 +75,11 @@ class Zfs:
         """List a dataset and its descendants, parents first."""
         result = self._run(["zfs", "list", "-rH", "-t", "filesystem,volume", "-o", "name", "-s", "name", name])
         return result.stdout.split()
+
+    def children(self, name: str) -> list[str]:
+        """List the filesystems and volumes directly under a dataset."""
+        result = self._run(["zfs", "list", "-rH", "-t", "filesystem,volume", "-o", "name", "-d", "1", name])
+        return [child for child in result.stdout.split() if child != name]
 
     def snapshot(self, name: str, *, recursive: bool) -> None:
         """Create a snapshot, recursively when asked."""

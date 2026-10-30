@@ -8,7 +8,7 @@ import pytest
 import typer
 
 from zfs_encrypt_migrate.errors import ZfsError
-from zfs_encrypt_migrate.zfs import Zfs, validate_name
+from zfs_encrypt_migrate.zfs import Zfs, validate_child, validate_name
 
 from .conftest import FakeRunner, fail, ok
 
@@ -168,3 +168,24 @@ def test_send_recv_includes_both_stderrs_when_both_fail() -> None:
 
     assert "recv broke" in str(info.value)
     assert "send broke" in str(info.value)
+
+
+def test_children_lists_direct_children_only() -> None:
+    """Children asks for depth 1 and drops the dataset itself."""
+    runner = FakeRunner(queue=[ok("tank/data\ntank/data/a\ntank/data/vol\n")])
+
+    assert Zfs(runner).children("tank/data") == ["tank/data/a", "tank/data/vol"]
+    assert runner.calls == [("zfs", "list", "-rH", "-t", "filesystem,volume", "-o", "name", "-d", "1", "tank/data")]
+
+
+@pytest.mark.parametrize("name", ["child", "a.b-c_d:e", "x1"])
+def test_validate_child_accepts(name: str) -> None:
+    """Plain direct child names pass."""
+    assert validate_child(name) == name
+
+
+@pytest.mark.parametrize("name", ["", "a/b", "a@b", "-x", "a b", "/a", "a/"])
+def test_validate_child_rejects(name: str) -> None:
+    """Empty names, paths, snapshots and option-like names are refused."""
+    with pytest.raises(typer.BadParameter):
+        validate_child(name)
