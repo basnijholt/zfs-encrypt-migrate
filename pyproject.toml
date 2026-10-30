@@ -51,6 +51,8 @@ dev = [
     "pytest-cov>=4.0",
     "mypy>=1.0",
     "ruff>=0.8",
+    "pyyaml>=6.0",
+    "types-pyyaml>=6.0",
 ]
 docs = [
     "markdown-code-runner>=2.7.0",
