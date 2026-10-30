@@ -220,7 +220,7 @@ When the child is already staged, a rerun of `tree-move` checks the staged copy 
 | `DATASET is on pool POOL but the stage is on OTHER; tree-move cannot rename across pools` | Use a stage on the dataset's pool. |
 | `STAGE/LEAF@enc-tree does not exist; run tree-seed first` | Run `tree-seed`. |
 | `dataset DATASET/CHILD does not exist` | Check the name. |
-| `STAGE/LEAF/CHILD already exists but DATASET/CHILD has no @enc-tree; DATASET/CHILD looks recreated` | Keep `STAGE/LEAF/CHILD`: it may be the only copy of the original data. Resolve it by hand, for example by renaming the new `DATASET/CHILD` aside with `zfs rename`, then rerun. |
+| `STAGE/LEAF/CHILD already exists but DATASET/CHILD has no @enc-tree; DATASET/CHILD looks recreated` | Keep `STAGE/LEAF/CHILD`: it may be the only copy of the original data. Resolve it by hand, for example by renaming the new `DATASET/CHILD` out of `DATASET` with `zfs rename`. |
 | `STAGE/LEAF/CHILD already exists but is not a complete copy of DATASET/CHILD; a tree-move was interrupted or failed` | Only a run that printed `moved ...` finished the child; don't destroy the source. Run the two commands it prints, `zfs destroy -r DATASET/CHILD@enc-tree` and `zfs destroy -r STAGE/LEAF/CHILD`, then rerun. |
 | `free space on POOL (AVAIL) minus size of DATASET/CHILD (USED) is below floor MIN_FREE` | Free space, or lower `--min-free`. |
 | `cannot unmount NAME; a writer is probably still running` | Stop the writer and rerun. |
