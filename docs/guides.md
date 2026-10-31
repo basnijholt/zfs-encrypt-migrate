@@ -169,14 +169,16 @@ Requirements, on top of the usual ones:
 
 - `rsync` 3.1.3 or newer, with ACL and xattr support, on `PATH`. The Nix package appends one to `PATH` for you; with pip or uv, install it from your distribution.
 - A dataset that is a leaf filesystem: no child datasets, no volumes. For a parent with children, use the [tree commands](#moving-a-big-tree), and `file-move` for a big child on its own.
+- Room for block-cloned data, if the pool has any (OpenZFS 2.2 and later): check `zpool get bcloneused,bclonesaved POOL`. A copy of a cloned file takes its full size, while deleting one reference frees nothing, so `file-move` needs free space above `--min-free` for `bclonesaved` plus one batch, and refuses otherwise.
 
 > [!CAUTION]
 > This is the one command that deletes your data. It deletes source files as it goes, so the files end up split between the original dataset and the encrypted copy, and the passphrase becomes the only way into the part that already moved. `file-move` checks that your final key opens the encrypted dataset before it deletes the first file, but store the passphrase safely first, and keep a backup.
 
-**1. Stop everything that uses the dataset, for the whole run.**
+**1. Stop and disable everything that uses the dataset, for the whole run.**
 A 30 TB dataset takes a day or two, and the dataset is not usable meanwhile: files vanish from it as they move.
+Stopping is not enough: a reboot mid-move would start the services again on a half-empty dataset, and some act on what they find missing (Plex's "empty trash", Sonarr and Radarr unmonitoring deleted episodes and movies).
 
-- Stop the services that read or write it, including containers that bind-mount it. The tool refuses a dataset it can't unmount, but a container's bind mount is not detected.
+- Stop and disable the services that read or write it (`systemctl disable --now UNIT`), including containers that bind-mount it (turn off their restart policy, for example `docker update --restart=no CONTAINER`, then stop them). The tool refuses a dataset it can't unmount, but a container's bind mount is not detected.
 - Stop the NFS server and Samba exports of it.
 - Disable snapshot tools (sanoid, zfs-auto-snapshot) for the dataset, then destroy its snapshots. A snapshot keeps deleted files allocated, so no space would be freed; `file-move` refuses while one exists before it changes anything, and checks again before each batch is copied and before it is deleted.
 

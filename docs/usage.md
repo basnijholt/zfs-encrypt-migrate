@@ -329,7 +329,7 @@ From the final unmount of step 8 on, the hints remount with `zfs mount -a` inste
 | `DATASET is a pool root; file-move is not supported` | Not possible; see [rebuilding a pool encrypted](guides.md#rebuilding-a-whole-pool-encrypted). |
 | `DATASET has child datasets; use the tree commands, or file-move each child` | Use the [tree commands](#tree-commands), or `file-move` a big child on its own. |
 | `DATASET is a volume; file-move moves the files of a filesystem` | Use `seed` and `cutover`. |
-| `DATASET is already encrypted` | Nothing to do. |
+| `DATASET is already encrypted` | Nothing to do, unless DATASET still carries `zfs-encrypt-migrate:*` properties (`zfs get all DATASET`): then a stop between the swap and its final steps left them. Run the recovery commands printed then: they inherit the markers, set `mountpoint` and `canmount`, and mount it. |
 | `DATASET is read-only; file-move must delete its files` | `zfs set readonly=off DATASET`, then rerun. |
 | `DATASET has mountpoint none; file-move needs a mounted path` (or `legacy`) | Give it a real mountpoint. |
 | `DATASET is not mounted` | `zfs mount DATASET`, then rerun. |
