@@ -468,17 +468,15 @@ def admit(
     dataset: str,
     groups: Sequence[Group],
     batch_size: int,
-    *,
-    dst: Path,
 ) -> None:
-    """Refuse, before the move deletes anything, unless free space covers its worst case; mark it admitted.
+    """Refuse, before the move copies or deletes any file, unless free space covers its worst case; mark it admitted.
 
     Checked once per move: copies a stopped run left behind use the space counted here, so a rerun after the
     marker is set does not check again. The worst case adds up:
 
-    - the largest batch, which never holds more than the files without a copy in ``dst`` yet, or the largest
-      file when that is bigger: moving the other files first frees only what their copies take, so it never
-      gets more room than it has now;
+    - the largest batch, which never holds more than all the files, or the largest file when that is bigger:
+      moving the other files first frees only what their copies take, so it never gets more room than it has
+      now;
     - the pool's block-cloned savings (``bclonesaved``, before OpenZFS 2.2 none): deleting one reference to a
       cloned block frees nothing while another remains, and the copy takes the full size;
     - with compression now off, what compressed data grows by when copied: logicalreferenced - referenced.
@@ -487,8 +485,8 @@ def admit(
     if zfs.get(MARK_ADMITTED, staged) == "yes":
         return
     pool = pool_of(dataset)
-    pending = sum(group.allocated for group in groups if not os.path.lexists(dst / group.first))
-    largest = max(min(batch_size, pending), *(group.allocated for group in groups))
+    total = sum(group.allocated for group in groups)
+    largest = max(min(batch_size, total), *(group.allocated for group in groups))
     saved = _pool_number(zfs, pool, "bclonesaved") or 0
     loss = 0
     if zfs.get("compression", dataset) == "off":
@@ -551,7 +549,7 @@ def move_files(  # noqa: PLR0917
     while entries := scan(src):
         groups = group_by_inode(entries, src)
         # Before the first batch of the move; skipped once the staged dataset is marked admitted.
-        admit(zfs, settings, dataset, groups, batch_size, dst=dst)
+        admit(zfs, settings, dataset, groups, batch_size)
         left = sum(group.allocated for group in groups)
         deleted = 0
         for batch in plan_batches(groups, batch_size):

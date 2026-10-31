@@ -1204,7 +1204,7 @@ def test_admission_reads_no_block_cloning_as_none(filemove_env: FileMoveEnv, set
 
     zfs, _ = make(env.sim, no_such_property)
     env.sim.avail = settings.min_free + 9000
-    admit(zfs, settings, DATASET, filetree.group_by_inode(fixed_sizes(env.src), env.src), 1, dst=env.mount_root)
+    admit(zfs, settings, DATASET, filetree.group_by_inode(fixed_sizes(env.src), env.src), 1)
     assert env.sim.props[STAGED, MARK_ADMITTED] == "yes"
 
 
@@ -1219,34 +1219,11 @@ def test_admission_counts_each_tiny_file_as_a_sector(
     groups = filetree.group_by_inode(filetree.scan(env.src), env.src)
     env.sim.avail = settings.min_free + 3 * 4096 + spare
     if spare >= 0:
-        admit(env.zfs, settings, DATASET, groups, 10**9, dst=env.mount_root)
+        admit(env.zfs, settings, DATASET, groups, 10**9)
         assert env.sim.props[STAGED, MARK_ADMITTED] == "yes"
         return
     with pytest.raises(MigrationError, match=r"largest batch or file 12\.0K,"):
-        admit(env.zfs, settings, DATASET, groups, 10**9, dst=env.mount_root)
-
-
-@pytest.mark.parametrize("spare", [0, -1])
-def test_admission_counts_only_files_without_a_copy(
-    filemove_env: FileMoveEnv,
-    settings: Settings,
-    tmp_path: Path,
-    spare: int,
-) -> None:
-    """A batch never copies more than the files without a copy yet, so a bigger batch size needs no more room."""
-    env = filemove_env
-    dst = tmp_path / "dst"
-    dst.mkdir()
-    (dst / "a.txt").write_text("a")
-    groups = filetree.group_by_inode(fixed_sizes(env.src), env.src)
-    # b.txt (9000) and c.txt (1000) are left to copy.
-    env.sim.avail = settings.min_free + 10_000 + spare
-    if spare >= 0:
-        admit(env.zfs, settings, DATASET, groups, 10**9, dst=dst)
-        assert env.sim.props[STAGED, MARK_ADMITTED] == "yes"
-        return
-    with pytest.raises(MigrationError, match=r"largest batch or file 9\.8K,"):
-        admit(env.zfs, settings, DATASET, groups, 10**9, dst=dst)
+        admit(env.zfs, settings, DATASET, groups, 10**9)
 
 
 @needs_rsync
