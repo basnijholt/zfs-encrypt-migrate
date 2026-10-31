@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from .constants import (
     LOCK_FILE,
+    MARK_ADMITTED,
     MARK_DIRS,
     MARK_KEY,
     MARK_SOURCE,
@@ -149,36 +150,15 @@ def _refuse_pinned_space(zfs: Zfs, settings: Settings, dataset: str) -> None:
         raise MigrationError(msg)
 
 
-def _block_cloned(zfs: Zfs, pool: str) -> int:
-    """Return the bytes block cloning saves on ``pool``: 0 when nothing is cloned or OpenZFS has no block cloning."""
+def _pool_number(zfs: Zfs, pool: str, prop: str) -> int | None:
+    """Read a numeric pool property; None when this OpenZFS does not have it, 0 when it reads ``-``."""
     try:
-        value = zfs.pool_get("bclonesaved", pool)
+        value = zfs.pool_get(prop, pool)
     except ZfsError as exc:
-        # OpenZFS before 2.2 has no such property.
         if "invalid property" in exc.result.stderr:
-            return 0
+            return None
         raise
     return int(value) if value.isdigit() else 0
-
-
-def _refuse_block_cloned(zfs: Zfs, settings: Settings, dataset: str, batch_size: int) -> None:
-    """Refuse unless free space covers what block-cloned files may cost on top of one batch.
-
-    A cloned file counts its full size, but deleting one reference frees nothing while another remains, and
-    its copy needs the full size. The pool's savings from cloning bound that extra space.
-    """
-    pool = pool_of(dataset)
-    saved = _block_cloned(zfs, pool)
-    if not saved:
-        return
-    budget = zfs.pool_avail(pool) - settings.min_free
-    if budget < saved + batch_size:
-        msg = (
-            f"pool {pool} has {format_size(saved)} of block-cloned data; copies are not clones, so file-move may "
-            f"need that much more space: free space above the floor ({format_size(max(budget, 0))}) must cover "
-            f"it plus one batch ({format_size(batch_size)})"
-        )
-        raise MigrationError(msg)
 
 
 def _refuse_dedup(zfs: Zfs, dataset: str) -> None:
@@ -201,7 +181,7 @@ def _refuse_dedup(zfs: Zfs, dataset: str) -> None:
         raise MigrationError(msg)
 
 
-def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str, *, batch_size: int) -> Path:
+def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
     """Refuse unless the run can start or resume; return the source mountpoint. Writes nothing."""
     check_key_file(settings)
     if "/" not in dataset:
@@ -217,7 +197,6 @@ def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str, *, batch_siz
     # Checked once, before anything is created or deleted: a later run sees the space the earlier ones used.
     if not staged_exists:
         _refuse_dedup(zfs, dataset)
-        _refuse_block_cloned(zfs, settings, dataset, batch_size)
     # Here as well as before each batch, so a snapshot stops the run before anything is written. Only while
     # files are left: then a snapshot pins nothing, and a rerun after a refused swap keeps its renamed enc-final.
     if zfs.snapshots(dataset) and scan(source):
@@ -419,23 +398,37 @@ def _refuse_snapshots(zfs: Zfs, dataset: str) -> None:
         raise MigrationError(msg, hints)
 
 
-def _refuse_too_big(zfs: Zfs, settings: Settings, src: Path, dst: Path, groups: Sequence[Group]) -> None:
-    """Refuse, before the run deletes anything, a file without a copy that is bigger than the free space.
+def admit(zfs: Zfs, settings: Settings, dataset: str, groups: Sequence[Group], batch_size: int) -> None:
+    """Refuse, before the move deletes anything, unless free space covers its worst case; mark it admitted.
 
-    Moving the other files first frees only what their copies take, so it would never fit, and the run would
-    stop half-moved.
+    Checked once per move: copies a stopped run left behind use the space counted here, so a rerun after the
+    marker is set does not check again. The worst case adds up:
+
+    - the largest batch, or the largest file when that is bigger: moving the other files first frees only what
+      their copies take, so it never gets more room than it has now;
+    - the pool's block-cloned savings (``bclonesaved``, before OpenZFS 2.2 none): deleting one reference to a
+      cloned block frees nothing while another remains, and the copy takes the full size;
+    - with compression now off, what compressed data grows by when copied: logicalreferenced - referenced.
     """
-    missing = [group for group in groups if not os.path.lexists(dst / group.first)]
-    if not missing:
+    staged = f"{settings.stage}/{leaf_of(dataset)}"
+    if zfs.get(MARK_ADMITTED, staged) == "yes":
         return
-    largest = max(missing, key=lambda group: group.allocated)
-    budget = zfs.pool_avail(pool_of(settings.stage)) - settings.min_free
-    if largest.allocated > budget:
+    pool = pool_of(dataset)
+    largest = max(batch_size, *(group.allocated for group in groups))
+    saved = _pool_number(zfs, pool, "bclonesaved") or 0
+    loss = 0
+    if zfs.get("compression", dataset) == "off":
+        loss = max(int(zfs.get("logicalreferenced", dataset)) - int(zfs.get("referenced", dataset)), 0)
+    need = largest + saved + loss
+    budget = zfs.pool_avail(pool) - settings.min_free
+    if budget < need:
         msg = (
-            f"{src / largest.first} ({format_size(largest.allocated)}) is larger than the free space above the "
-            f"floor ({format_size(max(budget, 0))}); free space first"
+            f"free space on {pool} above the floor ({format_size(max(budget, 0))}) does not cover the worst case of "
+            f"this move ({format_size(need)}: largest batch or file {format_size(largest)}, block-cloned data "
+            f"{format_size(saved)}, lost compression {format_size(loss)})"
         )
         raise MigrationError(msg)
+    zfs.set_prop(staged, MARK_ADMITTED, "yes")
 
 
 def _refuse_unmounted(zfs: Zfs, staged: str, dst: Path, device: int) -> None:
@@ -470,12 +463,10 @@ def move_files(  # noqa: PLR0917
     # Before any space check, since they hold space; the run lock keeps every other run out of scratch.
     remove_partials(dst)
     batch_number = 0
-    first_pass = True
     while entries := scan(src):
         groups = group_by_inode(entries, src)
-        if first_pass:
-            _refuse_too_big(zfs, settings, src, dst, groups)
-            first_pass = False
+        # Before the first batch of the move; skipped once the staged dataset is marked admitted.
+        admit(zfs, settings, dataset, groups, batch_size)
         left = sum(group.allocated for group in groups)
         deleted = 0
         for batch in plan_batches(groups, batch_size):
@@ -557,7 +548,7 @@ def finish(  # noqa: PLR0917
     # source's mountpoint, so the source's effective one says whether it will mount.
     fix = fixups(zfs.props(dataset))
     mount = fix.canmount == "on" and zfs.get("mountpoint", dataset) not in NO_MOUNTPOINT
-    markers = (MARK_SOURCE, MARK_DIRS, MARK_KEY)
+    markers = (MARK_SOURCE, MARK_DIRS, MARK_KEY, MARK_ADMITTED)
     # Hinted before the swap: each acts on <dataset> and is idempotent, so it is right whatever step failed.
     guard.cleanup += [
         # mountpoint, sharenfs and sharesmb values can hold spaces.
@@ -602,7 +593,7 @@ def file_move(
         raise MigrationError(msg)
     staged = f"{settings.stage}/{leaf_of(dataset)}"
     with run_lock(lock_path):
-        src = preflight_file_move(zfs, settings, dataset, batch_size=batch_size)
+        src = preflight_file_move(zfs, settings, dataset)
         source_props = probe_writers(zfs, dataset)
         with abort_guard(zfs, settings, staged, label="file-move") as guard:
             guard.notes = [

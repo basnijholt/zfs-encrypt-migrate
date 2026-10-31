@@ -17,5 +17,6 @@ SCRATCH = ".zfs-encrypt-migrate"
 MARK_SOURCE = "zfs-encrypt-migrate:file-move"
 MARK_DIRS = "zfs-encrypt-migrate:dirs"
 MARK_KEY = "zfs-encrypt-migrate:key-checked"
+MARK_ADMITTED = "zfs-encrypt-migrate:admitted"
 SPACE_ATTEMPTS = 30
 SPACE_DELAY_SECONDS = 10.0

@@ -11,9 +11,18 @@ from typing import TYPE_CHECKING
 import pytest
 
 from zfs_encrypt_migrate import filemove, filetree
-from zfs_encrypt_migrate.constants import MARK_DIRS, MARK_KEY, MARK_SOURCE, SCRATCH, SPACE_ATTEMPTS, SPACE_DELAY_SECONDS
+from zfs_encrypt_migrate.constants import (
+    MARK_ADMITTED,
+    MARK_DIRS,
+    MARK_KEY,
+    MARK_SOURCE,
+    SCRATCH,
+    SPACE_ATTEMPTS,
+    SPACE_DELAY_SECONDS,
+)
 from zfs_encrypt_migrate.errors import Interrupted, MigrationError, ZfsError
 from zfs_encrypt_migrate.filemove import (
+    admit,
     check_passphrase,
     copy_tree,
     file_move,
@@ -29,6 +38,7 @@ from zfs_encrypt_migrate.filemove import (
 )
 from zfs_encrypt_migrate.migrate import AbortGuard
 from zfs_encrypt_migrate.process import SubprocessRunner
+from zfs_encrypt_migrate.sizes import format_size
 
 from .conftest import STAGE, FileMoveEnv, fail, needs_rsync
 from .helpers import fail_on, make
@@ -44,20 +54,19 @@ if TYPE_CHECKING:
 
 DATASET = "tank/media"
 STAGED = f"{STAGE}/media"
-BATCH = 4096
 
 
 def refused(env: FileMoveEnv, settings: Settings, message: str, dataset: str = DATASET) -> None:
     """Refused."""
     with pytest.raises(MigrationError) as info:
-        preflight_file_move(env.zfs, settings, dataset, batch_size=BATCH)
+        preflight_file_move(env.zfs, settings, dataset)
     assert info.value.message == message
     assert env.sim.ops() == []
 
 
 def test_preflight_returns_source_mountpoint(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Preflight returns source mountpoint."""
-    assert preflight_file_move(filemove_env.zfs, settings, DATASET, batch_size=BATCH) == filemove_env.src
+    assert preflight_file_move(filemove_env.zfs, settings, DATASET) == filemove_env.src
     assert filemove_env.sim.ops() == []
 
 
@@ -75,14 +84,14 @@ def test_preflight_refuses_pool_root(filemove_env: FileMoveEnv, settings: Settin
 def test_preflight_refuses_other_pool(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Preflight refuses other pool."""
     with pytest.raises(MigrationError, match="cannot rename across pools"):
-        preflight_file_move(filemove_env.zfs, settings, "other/media", batch_size=BATCH)
+        preflight_file_move(filemove_env.zfs, settings, "other/media")
     assert filemove_env.sim.ops() == []
 
 
 def test_preflight_refuses_nested(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Preflight refuses nested."""
     with pytest.raises(MigrationError, match="overlaps the stage"):
-        preflight_file_move(filemove_env.zfs, settings, f"{STAGE}/x", batch_size=BATCH)
+        preflight_file_move(filemove_env.zfs, settings, f"{STAGE}/x")
     assert filemove_env.sim.ops() == []
 
 
@@ -181,10 +190,10 @@ def test_preflight_allows_ancestor_reservation_around_the_stage(filemove_env: Fi
     dataset = nested_source(filemove_env)
     filemove_env.sim.prop("tank/srv", "reservation", "1073741824")
     inside = replace(settings, stage="tank/srv/stage")
-    assert preflight_file_move(filemove_env.zfs, inside, dataset, batch_size=BATCH) == filemove_env.src
+    assert preflight_file_move(filemove_env.zfs, inside, dataset) == filemove_env.src
     filemove_env.sim.prop("tank/srv", "reservation", "0")
     filemove_env.sim.prop("tank/srv", "refreservation", "1073741824")
-    assert preflight_file_move(filemove_env.zfs, settings, dataset, batch_size=BATCH) == filemove_env.src
+    assert preflight_file_move(filemove_env.zfs, settings, dataset) == filemove_env.src
 
 
 def test_preflight_refuses_clone(filemove_env: FileMoveEnv, settings: Settings) -> None:
@@ -212,7 +221,7 @@ def test_preflight_refuses_snapshots_before_any_write(filemove_env: FileMoveEnv,
     """A snapshot is refused before the writer probe or the staged dataset changes anything."""
     filemove_env.sim.snapshot(f"{DATASET}@auto")
     with pytest.raises(MigrationError) as info:
-        preflight_file_move(filemove_env.zfs, settings, DATASET, batch_size=BATCH)
+        preflight_file_move(filemove_env.zfs, settings, DATASET)
     assert info.value.message == SNAPSHOT_REFUSAL
     assert info.value.hints == SNAPSHOT_HINTS
     assert filemove_env.sim.ops() == []
@@ -226,49 +235,7 @@ def test_preflight_allows_snapshots_once_only_directories_are_left(
     for name in ("a.txt", "docs/b.txt", "docs/deep/c.txt"):
         (filemove_env.src / name).unlink()
     filemove_env.sim.snapshot(f"{DATASET}@enc-final-1")
-    assert preflight_file_move(filemove_env.zfs, settings, DATASET, batch_size=BATCH) == filemove_env.src
-
-
-CLONED = 5000
-
-
-@pytest.mark.parametrize(("spare", "refuses"), [(-1, True), (0, False)])
-def test_preflight_refuses_too_little_space_for_block_cloned_data(
-    filemove_env: FileMoveEnv,
-    settings: Settings,
-    spare: int,
-    refuses: bool,  # noqa: FBT001
-) -> None:
-    """A copy of a block-cloned file takes its full size, while deleting one reference frees nothing.
-
-    Free space above the floor must cover the pool's block-cloned savings plus one batch.
-    """
-    env = filemove_env
-    env.sim.pool_props["tank", "bclonesaved"] = str(CLONED)
-    env.sim.avail = settings.min_free + CLONED + BATCH + spare
-    if not refuses:
-        assert preflight_file_move(env.zfs, settings, DATASET, batch_size=BATCH) == env.src
-        return
-    refused(
-        env,
-        settings,
-        "pool tank has 4.9K of block-cloned data; copies are not clones, so file-move may need that much more "
-        "space: free space above the floor (8.9K) must cover it plus one batch (4.0K)",
-    )
-
-
-def test_preflight_rerun_with_copies_near_the_block_clone_threshold(
-    filemove_env: FileMoveEnv,
-    settings: Settings,
-) -> None:
-    """The block-clone headroom is checked once, on the first run: later runs see the space earlier ones used."""
-    env = filemove_env
-    env.sim.datasets.add(STAGED)
-    env.sim.prop(STAGED, MARK_SOURCE, DATASET)
-    env.sim.pool_props["tank", "bclonesaved"] = str(CLONED)
-    # Copies a stopped run left behind took the space that the first run's check counted on.
-    env.sim.avail = settings.min_free + BATCH
-    assert preflight_file_move(env.zfs, settings, DATASET, batch_size=BATCH) == env.src
+    assert preflight_file_move(filemove_env.zfs, settings, DATASET) == filemove_env.src
 
 
 @pytest.mark.parametrize("value", ["on", "sha256,verify"])
@@ -294,22 +261,6 @@ def test_preflight_refuses_pool_with_deduplicated_blocks(filemove_env: FileMoveE
     )
 
 
-def test_preflight_reads_no_block_cloning_as_none(filemove_env: FileMoveEnv, settings: Settings) -> None:
-    """A pool without block cloning, or an OpenZFS without the property, has nothing cloned."""
-    env = filemove_env
-    env.sim.avail = settings.min_free
-
-    def no_such_property(args: Sequence[str]) -> CommandResult | None:
-        if tuple(args[:2]) == ("zpool", "get") and "bclonesaved" in args:
-            return fail("bad property list: invalid property 'bclonesaved'\n", 2)
-        return None
-
-    zfs, _ = make(env.sim, no_such_property)
-    assert preflight_file_move(zfs, settings, DATASET, batch_size=BATCH) == env.src
-    env.sim.pool_props["tank", "bclonesaved"] = "0"
-    assert preflight_file_move(env.zfs, settings, DATASET, batch_size=BATCH) == env.src
-
-
 def test_preflight_refuses_foreign_staged(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Preflight refuses foreign staged."""
     filemove_env.sim.datasets.add(STAGED)
@@ -320,7 +271,7 @@ def test_preflight_accepts_own_staged(filemove_env: FileMoveEnv, settings: Setti
     """Preflight accepts own staged."""
     filemove_env.sim.datasets.add(STAGED)
     filemove_env.sim.prop(STAGED, MARK_SOURCE, DATASET)
-    assert preflight_file_move(filemove_env.zfs, settings, DATASET, batch_size=BATCH) == filemove_env.src
+    assert preflight_file_move(filemove_env.zfs, settings, DATASET) == filemove_env.src
 
 
 def test_preflight_refuses_other_in_flight(filemove_env: FileMoveEnv, settings: Settings) -> None:
@@ -959,8 +910,8 @@ def test_move_removes_partial_files_before_the_space_check(
     (temp / ".a.txt.Xy12Zq").write_bytes(b"partial")
     (dst / SCRATCH / "dirs" / "docs").mkdir(parents=True)
     env.sim.avail = 0
-    # The first space check: no file without a copy fits.
-    with pytest.raises(MigrationError, match="is larger than the free space above the floor"):
+    # The first space check, the admission: nothing fits.
+    with pytest.raises(MigrationError, match="does not cover the worst case of this move"):
         move(env, settings, dst, 10**9, recorder()[1])
     assert not temp.exists() or list(temp.iterdir()) == []
     assert (dst / SCRATCH / "dirs" / "docs").is_dir()
@@ -974,44 +925,102 @@ def fixed_sizes(root: Path) -> list[filetree.Entry]:
     return [replace(item, allocated=SIZES[item.name]) for item in filetree.scan(root)]
 
 
-def test_file_bigger_than_the_free_space_stops_the_run_before_any_delete(
-    filemove_env: FileMoveEnv,
-    settings: Settings,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Moving the other files first frees only what their copies take, so such a file would stall a half-moved run."""
-    env = filemove_env
-    monkeypatch.setattr(filemove, "scan", fixed_sizes)
-    dst = tmp_path / "dst"
-    dst.mkdir()
-    env.sim.avail = settings.min_free + 5000
-    before = source_files(env)
-    with pytest.raises(MigrationError) as info:
-        move(env, settings, dst, 1, recorder()[1])
-    assert info.value.message == (
-        f"{env.src / 'docs' / 'b.txt'} (8.8K) is larger than the free space above the floor (4.9K); free space first"
-    )
-    assert source_files(env) == before
-    assert not [call for call in env.runner.calls if call[0] == "rsync"]
+ADMISSION = [
+    # (case, batch size, pool properties, source properties, largest batch or file, cloned, lost compression)
+    ("batch", 20_000, {}, {}, 20_000, 0, 0),
+    ("file", 1, {}, {}, 9000, 0, 0),
+    ("cloned", 1, {"bclonesaved": "3000"}, {}, 9000, 3000, 0),
+    ("uncompressed", 1, {}, {"compression": "off", "logicalreferenced": "50000", "referenced": "48000"}, 9000, 0, 2000),
+    ("compressed", 1, {}, {"compression": "lz4", "logicalreferenced": "50000", "referenced": "48000"}, 9000, 0, 0),
+]
 
 
 @needs_rsync
-def test_big_file_with_a_copy_already_does_not_stop_the_run(
+@pytest.mark.parametrize("spare", [0, -1])
+@pytest.mark.parametrize(
+    ("batch_size", "pool_props", "source_props", "largest", "cloned", "loss"),
+    [case[1:] for case in ADMISSION],
+    ids=[case[0] for case in ADMISSION],
+)
+def test_admission_needs_room_for_the_worst_case(  # noqa: PLR0917
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    batch_size: int,
+    pool_props: dict[str, str],
+    source_props: dict[str, str],
+    largest: int,
+    cloned: int,
+    loss: int,
+    spare: int,
+) -> None:
+    """Before the move deletes anything, free space must cover its worst case, or it could stall half-moved.
+
+    The largest batch or file (deleting others frees only what their copies take), block-cloned data (a copy
+    of a clone takes its full size) and, with compression now off, what the old compressed data grows by.
+    """
+    env = filemove_env
+    monkeypatch.setattr(filemove, "scan", fixed_sizes)
+    for prop, value in pool_props.items():
+        env.sim.pool_props["tank", prop] = value
+    for prop, value in source_props.items():
+        env.sim.prop(DATASET, prop, value)
+    need = largest + cloned + loss
+    env.sim.avail = settings.min_free + need + spare
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    before = source_files(env)
+    if spare >= 0:
+        move(env, settings, dst, batch_size, recorder()[1])
+        assert source_files(env) == []
+        assert env.sim.props[STAGED, MARK_ADMITTED] == "yes"
+        return
+    with pytest.raises(MigrationError) as info:
+        move(env, settings, dst, batch_size, recorder()[1])
+    assert info.value.message == (
+        f"free space on tank above the floor ({format_size(need + spare)}) does not cover the worst case of this "
+        f"move ({format_size(need)}: largest batch or file {format_size(largest)}, block-cloned data "
+        f"{format_size(cloned)}, lost compression {format_size(loss)})"
+    )
+    assert source_files(env) == before
+    assert not [call for call in env.runner.calls if call[0] == "rsync"]
+    assert (STAGED, MARK_ADMITTED) not in env.sim.props
+
+
+def test_admission_reads_no_block_cloning_as_none(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """An OpenZFS without block cloning (before 2.2) has no bclonesaved, and nothing cloned."""
+    env = filemove_env
+
+    def no_such_property(args: Sequence[str]) -> CommandResult | None:
+        if tuple(args[:2]) == ("zpool", "get") and "bclonesaved" in args:
+            return fail("bad property list: invalid property 'bclonesaved'\n", 2)
+        return None
+
+    zfs, _ = make(env.sim, no_such_property)
+    env.sim.avail = settings.min_free + 9000
+    admit(zfs, settings, DATASET, filetree.group_by_inode(fixed_sizes(env.src), env.src), 1)
+    assert env.sim.props[STAGED, MARK_ADMITTED] == "yes"
+
+
+@needs_rsync
+def test_rerun_after_admission_does_not_check_again(
     filemove_env: FileMoveEnv,
     settings: Settings,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Only files without a copy count: the big one a stopped run already copied needs no new space."""
+    """Copies a stopped run left behind use the space the admission counted on; the rerun is not refused for it."""
     env = filemove_env
     monkeypatch.setattr(filemove, "scan", fixed_sizes)
     dst = tmp_path / "dst"
     dst.mkdir()
     groups = filetree.group_by_inode(filetree.scan(env.src), env.src)
-    filetree.write_file_list(tmp_path / "list", [g for g in groups if g.first == "docs/b.txt"])
+    filetree.write_file_list(tmp_path / "list", groups)
     rsync_files(env.zfs, env.src, dst, tmp_path / "list")
-    env.sim.avail = settings.min_free + 5000
+    env.sim.prop(STAGED, MARK_ADMITTED, "yes")
+    env.sim.pool_props["tank", "bclonesaved"] = "3000"
+    env.sim.avail = settings.min_free
     move(env, settings, dst, 1, recorder()[1])
     assert source_files(env) == []
 
@@ -1036,8 +1045,10 @@ def test_copies_left_by_a_stop_need_no_space(
     groups = filetree.group_by_inode(filetree.scan(env.src), env.src)
     filetree.write_file_list(tmp_path / "list", [g for g in groups if g.first != "docs/deep/c.txt"])
     rsync_files(env.zfs, env.src, dst, tmp_path / "list")
-    # Room for c.txt, the one file not copied yet, but not for the whole batch of three.
+    # Room for c.txt, the one file not copied yet, but not for the whole batch of three. The stopped run that
+    # left the copies had passed the admission.
     env.sim.avail = settings.min_free + size
+    env.sim.prop(STAGED, MARK_ADMITTED, "yes")
     slept, sleep = recorder()
     move(env, settings, dst, 10**9, sleep)
     assert source_files(env) == []
@@ -1214,6 +1225,7 @@ def test_file_move_end_to_end(filemove_env: FileMoveEnv, settings: Settings, tmp
         sim.ops(),
         [
             ("zfs", "mount", "-o", "noatime", DATASET),
+            ("zfs", "set", f"{MARK_ADMITTED}=yes", STAGED),
             ("zfs", "snapshot", f"{DATASET}@enc-final"),
             ("zfs", "unmount", DATASET),
             ("zpool", "sync", "tank"),
@@ -1228,6 +1240,7 @@ def test_file_move_end_to_end(filemove_env: FileMoveEnv, settings: Settings, tmp
             ("zfs", "inherit", MARK_SOURCE, DATASET),
             ("zfs", "inherit", MARK_DIRS, DATASET),
             ("zfs", "inherit", MARK_KEY, DATASET),
+            ("zfs", "inherit", MARK_ADMITTED, DATASET),
             ("zfs", "set", "canmount=on", DATASET),
             ("zfs", "mount", DATASET),
         ],
@@ -1476,6 +1489,7 @@ def swapped_hints(env: FileMoveEnv) -> tuple[str, ...]:
         f"  zfs inherit {MARK_SOURCE} {DATASET}",
         f"  zfs inherit {MARK_DIRS} {DATASET}",
         f"  zfs inherit {MARK_KEY} {DATASET}",
+        f"  zfs inherit {MARK_ADMITTED} {DATASET}",
         f"  zfs set canmount=on {DATASET}",
         f"  zfs mount {DATASET}",
     )
