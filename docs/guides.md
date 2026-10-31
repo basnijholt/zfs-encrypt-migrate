@@ -265,7 +265,7 @@ If a hard-linked file has fewer names in the dataset than its link count says, t
 - **Old plaintext blocks stay on disk until overwritten.** Deleting files frees their blocks; it doesn't wipe them.
 - **A nearly full pool is slow.** ZFS allocates slowly when little is free; use a smaller `--batch-size`.
 - **Tiny files may each grow to one 4K sector.** An unencrypted dataset can store a file of a few bytes inside its block pointer; an encrypted one can't, so the copy takes a whole sector. The space math counts at least 4K per file.
-- **The space math is an estimate; `--min-free` is the margin.** It counts at least 4K per file, which undercounts tiny files on pools with `ashift` above 12 or on wide raidz (parity padding), and it leaves out the directory tree the staged dataset holds twice during the move. The default floor of 1T covers both on any realistic dataset; if a batch still does not fit, the run stops before copying that batch, and a rerun with more free space continues.
+- **The space math is an estimate; `--min-free` is the margin.** It counts at least 4K per file, which can undercount tiny files on pools with bigger sectors (`ashift` above 12), and it leaves out the directory tree, which the staged dataset holds twice until the swap. With many tiny files or directories, raise `--min-free`. If a batch still does not fit, the run waits for freed space (up to five minutes), then stops before copying that batch; a rerun with more free space continues.
 - **`sharenfs`, `sharesmb`, `reservation` and `refreservation` are set only after the swap,** so a stopped run never leaves them on the encrypted dataset's private mountpoint.
 
 ## Rebuilding a Whole Pool Encrypted
