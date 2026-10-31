@@ -356,11 +356,13 @@ From the final unmount of step 8 on, the hints remount with `zfs mount -a` inste
 | `N files kept changing during the move; stop the writers and rerun` | Stop whatever writes to the dataset. |
 | `N files appeared in DATASET during the swap; stop the writers and rerun` | Stop the writers and rerun. |
 | `DATASET was written after the final scan` | Rename `@enc-final` aside with the commands it prints, then rerun. |
+| `rsync ... failed: ... Disk quota exceeded ...` | A quota on the stage or one of its parents is full; raise or remove it, then rerun. |
+| `PermissionError: [Errno 1] Operation not permitted: 'PATH'` | An immutable or append-only file; clear the flag (`chattr -i -a PATH`), then rerun. |
 | `STAGE/LEAF is mounted at PATH, which overlaps DATASET at PATH` | Change the staged mountpoint so it does not contain or lie inside the dataset's. |
 
 ### What file-move does not support
 
-Each of these is checked before anything is created or deleted, except the quotas, which are a documented limit:
+Each of these is checked before anything is deleted, except the last four, which are documented limits:
 
 | Not supported | What `file-move` does |
 | --- | --- |
@@ -373,6 +375,9 @@ Each of these is checked before anything is created or deleted, except the quota
 | Child datasets | Refuses: use the [tree commands](#tree-commands), or `file-move` each child. |
 | Volumes | Refuses: use `seed` and `cutover`. |
 | Per-user, per-group and per-project quotas (`userquota@`, `groupquota@`, `projectquota@` and their `objquota@` forms) and file project IDs | Documented limit, not checked: they are not carried over (`zfs get all` does not list those quotas, rsync does not copy project IDs; `seed` and `cutover` keep both). Note them before the move (`zfs userspace`, `zfs groupspace`, `zfs projectspace`, `zfs project -r`) and set them again on the swapped dataset. |
+| Inode flags (`chattr +i`, `+a` and the others) | Documented limit, not checked: rsync does not copy them, so the copies have none. An immutable or append-only source file cannot be deleted, so the run stops at it (`PermissionError: [Errno 1] Operation not permitted`) until you clear the flag (`chattr -i -a FILE`) and rerun. Note the flags first (`lsattr -R`) and set them again after the swap. |
+| A `quota` or `refquota` on the stage or a parent of it | Documented limit, not checked: the staged dataset grows to the dataset's full size, so such a quota can stop a run with `Disk quota exceeded` from rsync. Raise or remove it and rerun. |
+| Data written under another `compression` than the current one | Documented limit: the copies are written with the current setting, so they may be bigger than the originals. The admission check counts that only when `compression` is now `off` (`logicalreferenced` minus `referenced`); otherwise keep spare room above `--min-free`. |
 
 ## Audit
 
