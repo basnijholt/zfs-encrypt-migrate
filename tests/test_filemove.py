@@ -257,6 +257,43 @@ def test_preflight_refuses_too_little_space_for_block_cloned_data(
     )
 
 
+def test_preflight_rerun_with_copies_near_the_block_clone_threshold(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+) -> None:
+    """The block-clone headroom is checked once, on the first run: later runs see the space earlier ones used."""
+    env = filemove_env
+    env.sim.datasets.add(STAGED)
+    env.sim.prop(STAGED, MARK_SOURCE, DATASET)
+    env.sim.pool_props["tank", "bclonesaved"] = str(CLONED)
+    # Copies a stopped run left behind took the space that the first run's check counted on.
+    env.sim.avail = settings.min_free + BATCH
+    assert preflight_file_move(env.zfs, settings, DATASET, batch_size=BATCH) == env.src
+
+
+@pytest.mark.parametrize("value", ["on", "sha256,verify"])
+def test_preflight_refuses_dedup(filemove_env: FileMoveEnv, settings: Settings, value: str) -> None:
+    """Deleting a deduplicated file frees nothing while another reference to its blocks remains."""
+    filemove_env.sim.prop(DATASET, "dedup", value)
+    refused(
+        filemove_env,
+        settings,
+        f"{DATASET} has dedup={value}; deleting deduplicated files frees no space, so file-move cannot run; "
+        "see the docs",
+    )
+
+
+def test_preflight_refuses_pool_with_deduplicated_blocks(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """Blocks deduplicated across the pool may be shared with the source, which turned dedup off since."""
+    filemove_env.sim.pool_props["tank", "dedupratio"] = "1.50"
+    refused(
+        filemove_env,
+        settings,
+        f"pool tank has dedupratio 1.50x; deduplicated blocks shared with {DATASET} would not be freed, "
+        "so file-move cannot run; see the docs",
+    )
+
+
 def test_preflight_reads_no_block_cloning_as_none(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """A pool without block cloning, or an OpenZFS without the property, has nothing cloned."""
     env = filemove_env
@@ -1367,6 +1404,8 @@ def swapped_hints(env: FileMoveEnv) -> tuple[str, ...]:
         f"  zfs set keylocation={FINAL} {DATASET}",
         "  zfs mount -a",
         f"  zfs set mountpoint={env.src} {DATASET}",
+        # Every write-affecting property the source inherits or defaults; the simulator lists only dedup.
+        f"  zfs inherit dedup {DATASET}",
         f"  zfs inherit {MARK_SOURCE} {DATASET}",
         f"  zfs inherit {MARK_DIRS} {DATASET}",
         f"  zfs inherit {MARK_KEY} {DATASET}",

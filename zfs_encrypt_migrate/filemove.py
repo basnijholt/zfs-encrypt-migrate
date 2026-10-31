@@ -180,6 +180,26 @@ def _refuse_block_cloned(zfs: Zfs, settings: Settings, dataset: str, batch_size:
         raise MigrationError(msg)
 
 
+def _refuse_dedup(zfs: Zfs, dataset: str) -> None:
+    """Refuse deduplicated data: deleting a file frees nothing while another reference to its blocks remains."""
+    value = zfs.get("dedup", dataset)
+    if value != "off":
+        msg = (
+            f"{dataset} has dedup={value}; deleting deduplicated files frees no space, so file-move cannot run; "
+            "see the docs"
+        )
+        raise MigrationError(msg)
+    pool = pool_of(dataset)
+    # zpool get -p prints the ratio without its x; blocks written while dedup was on stay shared after it is off.
+    ratio = zfs.pool_get("dedupratio", pool).removesuffix("x")
+    if float(ratio) > 1:
+        msg = (
+            f"pool {pool} has dedupratio {ratio}x; deduplicated blocks shared with {dataset} would not be freed, "
+            "so file-move cannot run; see the docs"
+        )
+        raise MigrationError(msg)
+
+
 def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str, *, batch_size: int) -> Path:
     """Refuse unless the run can start or resume; return the source mountpoint. Writes nothing."""
     check_key_file(settings)
@@ -190,14 +210,17 @@ def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str, *, batch_siz
     refuse_nested(settings, dataset)
     source = _refuse_source(zfs, dataset)
     _refuse_pinned_space(zfs, settings, dataset)
-    _refuse_block_cloned(zfs, settings, dataset, batch_size)
+    stage = settings.stage
+    staged = f"{stage}/{leaf_of(dataset)}"
+    staged_exists = zfs.exists(staged)
+    # Checked once, before anything is created or deleted: a later run sees the space the earlier ones used.
+    if not staged_exists:
+        _refuse_dedup(zfs, dataset)
+        _refuse_block_cloned(zfs, settings, dataset, batch_size)
     # Here as well as before each batch, so a snapshot stops the run before anything is written. Only while
     # files are left: then a snapshot pins nothing, and a rerun after a refused swap keeps its renamed enc-final.
     if zfs.snapshots(dataset) and scan(source):
         _refuse_snapshots(zfs, dataset)
-    stage = settings.stage
-    staged = f"{stage}/{leaf_of(dataset)}"
-    staged_exists = zfs.exists(staged)
     if staged_exists and zfs.get(MARK_SOURCE, staged) != dataset:
         msg = f"{staged} exists and is not a file-move of {dataset}"
         raise MigrationError(msg)

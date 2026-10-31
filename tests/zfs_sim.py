@@ -33,8 +33,12 @@ DEFAULTS = {
     "keystatus": "-",
     "encryptionroot": "-",
     "origin": "-",
+    "dedup": "off",
     "used": "100",
 }
+
+# zpool get -p prints a ratio without its x.
+POOL_DEFAULTS = {"dedupratio": "1.00"}
 
 
 class ZfsSim:
@@ -48,7 +52,7 @@ class ZfsSim:
         # (dataset, property) -> (value, origin dataset), read with source "inherited from <origin>".
         self.inherited: dict[tuple[str, str], tuple[str, str]] = {}
         self.avail = avail
-        # (pool, property) -> value, read by zpool get; unset ones read "-".
+        # (pool, property) -> value, read by zpool get; unset ones read POOL_DEFAULTS, else "-".
         self.pool_props: dict[tuple[str, str], str] = {}
         self.busy: set[str] = set()
         # Datasets mounted with "zfs mount -o noatime"; until unmounted, zfs reports atime=off as temporary.
@@ -117,7 +121,8 @@ class ZfsSim:
         verb = args[1]
         if args[0] == "zpool":
             if verb == "get":
-                return ok(f"{self.pool_props.get((args[-1], args[-2]), '-')}\n")
+                default = POOL_DEFAULTS.get(args[-2], "-")
+                return ok(f"{self.pool_props.get((args[-1], args[-2]), default)}\n")
             return ok()
         if verb == "list" and "avail" in args:
             return ok(f"{self.avail}\n")
