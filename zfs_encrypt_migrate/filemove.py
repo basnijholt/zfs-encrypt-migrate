@@ -292,10 +292,13 @@ def stdin_is_terminal() -> bool:
 
 
 def check_passphrase(zfs: Zfs, settings: Settings, staged: str) -> None:
-    """Prove the final key unlocks the staged dataset before any file is deleted."""
-    if zfs.get(MARK_KEY, staged) == "yes":
-        return
+    """Prove the final key unlocks the staged dataset before any file is deleted.
+
+    The marker records the location that was checked, so a rerun with another final location checks again.
+    """
     location = settings.final_keylocation
+    if zfs.get(MARK_KEY, staged) == location:
+        return
     if location == "prompt":
         if not stdin_is_terminal():
             msg = "run file-move once from a terminal so it can check the passphrase"
@@ -306,7 +309,7 @@ def check_passphrase(zfs: Zfs, settings: Settings, staged: str) -> None:
     if not loaded:
         msg = f"the key for {staged} did not load from {location}; nothing was deleted"
         raise MigrationError(msg)
-    zfs.set_prop(staged, MARK_KEY, "yes")
+    zfs.set_prop(staged, MARK_KEY, location)
 
 
 def wait_for_space(zfs: Zfs, settings: Settings, needed: int, sleep: Callable[[float], None]) -> None:

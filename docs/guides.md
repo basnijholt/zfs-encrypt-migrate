@@ -193,6 +193,7 @@ zfs-encrypt-migrate file-move tank/media --delete-source
 Every run first unmounts and remounts the dataset to prove no writer has it open.
 The first run then creates the encrypted dataset `tank/stage/media` with the source's properties, copies the directory tree, and checks the final passphrase.
 With the default `--final-keylocation prompt` it asks for the passphrase on the terminal, so start the first run from one; the passphrase must be the one in your key file.
+A rerun with a different `--final-keylocation` checks the key again, before it deletes anything more.
 Each batch then prints a line:
 
 ```text

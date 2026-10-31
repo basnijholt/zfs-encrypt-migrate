@@ -434,7 +434,7 @@ def test_check_passphrase_prompt_attached(
     monkeypatch.setattr(filemove, "stdin_is_terminal", lambda: True)
     check_passphrase(staged_env(filemove_env).zfs, settings, STAGED)
     assert filemove_env.runner.attached == [("zfs", "load-key", "-n", "-L", "prompt", STAGED)]
-    assert filemove_env.sim.props[STAGED, MARK_KEY] == "yes"
+    assert filemove_env.sim.props[STAGED, MARK_KEY] == "prompt"
 
 
 def test_check_passphrase_file_location_not_attached(filemove_env: FileMoveEnv, settings: Settings) -> None:
@@ -443,7 +443,7 @@ def test_check_passphrase_file_location_not_attached(filemove_env: FileMoveEnv, 
     check_passphrase(staged_env(filemove_env).zfs, settings, STAGED)
     assert filemove_env.runner.attached == []
     assert ("zfs", "load-key", "-n", "-L", "file:///keys/final", STAGED) in filemove_env.runner.calls
-    assert filemove_env.sim.props[STAGED, MARK_KEY] == "yes"
+    assert filemove_env.sim.props[STAGED, MARK_KEY] == "file:///keys/final"
 
 
 def test_check_passphrase_wrong_key_refuses(filemove_env: FileMoveEnv, settings: Settings) -> None:
@@ -458,10 +458,23 @@ def test_check_passphrase_wrong_key_refuses(filemove_env: FileMoveEnv, settings:
 
 def test_check_passphrase_skips_when_marked(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Check passphrase skips when marked."""
-    staged_env(filemove_env).sim.prop(STAGED, MARK_KEY, "yes")
+    staged_env(filemove_env).sim.prop(STAGED, MARK_KEY, "prompt")
     check_passphrase(filemove_env.zfs, settings, STAGED)
     assert filemove_env.runner.attached == []
     assert not [call for call in filemove_env.runner.calls if "load-key" in call]
+
+
+def test_check_passphrase_again_for_another_location(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """The marker records which location was checked; a rerun with another final location checks that one."""
+    env = staged_env(filemove_env)
+    check_passphrase(env.zfs, replace(settings, final_keylocation="file:///a"), STAGED)
+    assert env.sim.props[STAGED, MARK_KEY] == "file:///a"
+    check_passphrase(env.zfs, replace(settings, final_keylocation="file:///b"), STAGED)
+    assert [call for call in env.runner.calls if "load-key" in call] == [
+        ("zfs", "load-key", "-n", "-L", "file:///a", STAGED),
+        ("zfs", "load-key", "-n", "-L", "file:///b", STAGED),
+    ]
+    assert env.sim.props[STAGED, MARK_KEY] == "file:///b"
 
 
 # --- move loop ---
