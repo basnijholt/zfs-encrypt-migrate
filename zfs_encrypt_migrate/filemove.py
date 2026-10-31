@@ -78,6 +78,18 @@ def run_lock(path: Path) -> Iterator[None]:
         yield
 
 
+def _refuse_mounted_elsewhere(path: Path, dataset: str) -> None:
+    """Refuse unless ``dataset`` itself is the zfs filesystem mounted at ``path``.
+
+    zfs get strips the spaces around a mountpoint value, so the path it gives can be another directory.
+    """
+    found = mounted_at(path)
+    if found != (dataset, "zfs"):
+        there = f"{found[0]} of type {found[1]} is mounted there" if found else ""
+        msg = f"{path} is not where {dataset} is mounted ({there or 'nothing is mounted there'})"
+        raise MigrationError(msg)
+
+
 def _refuse_source(zfs: Zfs, dataset: str) -> Path:
     """Refuse a source dataset file-move cannot handle; return its mountpoint."""
     if not zfs.exists(dataset):
@@ -102,6 +114,8 @@ def _refuse_source(zfs: Zfs, dataset: str) -> Path:
     if zfs.get("mounted", dataset) != "yes":
         msg = f"{dataset} is not mounted"
         raise MigrationError(msg)
+    # Before anything reads the path: it may be another directory, or none at all.
+    _refuse_mounted_elsewhere(Path(mountpoint), dataset)
     reserved = Path(mountpoint) / SCRATCH
     # The staged copy keeps its scratch files under this name, so the source must not use it, not even as a
     # dangling symlink.
@@ -258,18 +272,6 @@ def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
         msg = f"{old} already exists"
         raise MigrationError(msg)
     return source
-
-
-def _refuse_mounted_elsewhere(path: Path, dataset: str) -> None:
-    """Refuse unless ``dataset`` itself is the zfs filesystem mounted at ``path``.
-
-    zfs get strips the spaces around a mountpoint value, so the path it gives can be another directory.
-    """
-    found = mounted_at(path)
-    if found != (dataset, "zfs"):
-        there = f"{found[0]} of type {found[1]} is mounted there" if found else ""
-        msg = f"{path} is not where {dataset} is mounted ({there or 'nothing is mounted there'})"
-        raise MigrationError(msg)
 
 
 def probe_writers(zfs: Zfs, dataset: str, path: Path) -> dict[str, Prop]:

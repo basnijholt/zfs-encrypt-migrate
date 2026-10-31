@@ -476,6 +476,19 @@ def test_file_move_refuses_a_mountpoint_zfs_get_strips(
     assert not [call for call in env.runner.calls if call[0] == "rsync"]
 
 
+def test_preflight_checks_the_mount_before_reading_the_path(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """The path zfs get gives may be missing: the mount check refuses before the snapshot check scans it."""
+    env = filemove_env
+    (tmp_path / "media ").mkdir()
+    env.sim.prop(DATASET, "mountpoint", str(tmp_path / "media "))
+    env.sim.snapshot(f"{DATASET}@auto")
+    refused(env, settings, f"{tmp_path / 'media'} is not where {DATASET} is mounted (nothing is mounted there)")
+
+
 REMOUNT_HINT = f"remount it with: zfs mount {DATASET}"
 
 
