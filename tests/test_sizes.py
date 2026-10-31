@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from zfs_encrypt_migrate.sizes import parse_size
+from zfs_encrypt_migrate.sizes import format_size, parse_size
 
 
 @pytest.mark.parametrize(
@@ -29,3 +29,12 @@ def test_parse_size_rejects_invalid_input(text: str) -> None:
     """Anything but digits plus an optional binary suffix is refused."""
     with pytest.raises(ValueError, match="invalid size"):
         parse_size(text)
+
+
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [(105_381_888_000, "98.1G"), (512, "512B"), (1536, "1.5K")],
+)
+def test_format_size(size: int, expected: str) -> None:
+    """Sizes print in binary units with one decimal."""
+    assert format_size(size) == expected

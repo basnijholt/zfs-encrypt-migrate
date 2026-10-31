@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import re
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .conftest import fail, ok
@@ -31,8 +34,13 @@ DEFAULTS = {
     "mountpoint": "/mnt",
     "keystatus": "-",
     "encryptionroot": "-",
+    "origin": "-",
+    "dedup": "off",
     "used": "100",
 }
+
+# zpool get -p prints a ratio without its x.
+POOL_DEFAULTS = {"dedupratio": "1.00", "dedup_table_size": "0"}
 
 
 class ZfsSim:
@@ -43,8 +51,16 @@ class ZfsSim:
         self.datasets = set(datasets)
         self.snapshots: dict[str, str] = {}
         self.props: dict[tuple[str, str], str] = {}
+        # (dataset, property) -> (value, origin dataset), read with source "inherited from <origin>".
+        self.inherited: dict[tuple[str, str], tuple[str, str]] = {}
         self.avail = avail
+        # (pool, property) -> value, read by zpool get; unset ones read POOL_DEFAULTS, else "-".
+        self.pool_props: dict[tuple[str, str], str] = {}
         self.busy: set[str] = set()
+        # Datasets mounted with "zfs mount -o noatime"; until unmounted, zfs reports atime=off as temporary.
+        self.noatime: set[str] = set()
+        # Datasets in the order zfs mount mounted them; a later mount on the same path covers an earlier one.
+        self.mount_order: list[str] = []
         self.volumes: set[str] = set()
         self.roots: list[str] = []
         self.log: list[tuple[str, ...]] = []
@@ -73,12 +89,48 @@ class ZfsSim:
             return "volume" if name in self.volumes else "filesystem"
         return self.props.get((name, prop), DEFAULTS.get(prop, "0"))
 
+    def _get_all(self, name: str) -> str:
+        """Answer ``zfs get -H -p -o property,value,source all``: local, inherited, then default properties."""
+        # Read-only properties have no source, as in real zfs.
+        readonly = {"mounted", "keystatus", "encryptionroot"}
+        rows = {
+            prop: (value, "-" if prop in readonly else "local") for (n, prop), value in self.props.items() if n == name
+        }
+        for (n, prop), (value, origin) in self.inherited.items():
+            if n == name and prop not in rows:
+                rows[prop] = (value, f"inherited from {origin}")
+        for prop, value in DEFAULTS.items():
+            rows.setdefault(prop, (value, "default"))
+        # Real zfs hides the dataset's own atime behind a differing temporary mount option.
+        if name in self.noatime and rows.get("atime", ("on", "default"))[0] != "off":
+            rows["atime"] = ("off", "temporary")
+        return "".join(f"{prop}\t{value}\t{source}\n" for prop, (value, source) in rows.items())
+
+    def mountinfo(self) -> bytes:
+        """Answer a read of /proc/self/mountinfo: a zfs line for each mounted dataset with a path, in mount order.
+
+        Datasets a test marked mounted come first, as if mounted before the simulation began. Like the kernel,
+        it lists the real path, with a space, tab, newline or backslash written as an octal escape.
+        """
+        mounted = [name for (name, prop), value in self.props.items() if prop == "mounted" and value == "yes"]
+        mounted.sort(key=lambda name: self.mount_order.index(name) if name in self.mount_order else -1)
+        lines = []
+        for number, name in enumerate(mounted, 100):
+            point = self.props.get((name, "mountpoint"), "")
+            if point.startswith("/"):
+                path = os.fsencode(os.path.realpath(point))
+                escaped = re.sub(rb"[ \t\n\\]", lambda m: b"\\%03o" % m[0][0], path)
+                lines.append(b"%d 1 0:%d / %s rw - zfs %s rw\n" % (number, number, escaped, name.encode()))
+        return b"".join(lines)
+
     def ops(self) -> list[tuple[str, ...]]:
         """Return the ordered log of commands that matter for safety: writes, streams, syncs, written@ reads."""
         return [
             call
             for call in self.log
-            if call[0] == "zpool" or call[1] in WRITE_VERBS or (call[1] == "get" and call[-2].startswith("written@"))
+            if call[:2] == ("zpool", "sync")
+            or (call[0] == "zfs" and call[1] in WRITE_VERBS)
+            or (call[1] == "get" and call[-2].startswith("written@"))
         ]
 
     def answer(self, args: Sequence[str]) -> CommandResult:
@@ -89,9 +141,15 @@ class ZfsSim:
     def _answer(self, args: Sequence[str]) -> CommandResult:  # noqa: C901, PLR0911, PLR0912
         verb = args[1]
         if args[0] == "zpool":
+            if verb == "get":
+                default = POOL_DEFAULTS.get(args[-2], "-")
+                return ok(f"{self.pool_props.get((args[-1], args[-2]), default)}\n")
             return ok()
         if verb == "list" and "avail" in args:
             return ok(f"{self.avail}\n")
+        if verb == "list" and "snapshot" in args:
+            prefix = f"{args[-1]}@"
+            return ok("".join(f"{s}\n" for s in sorted(self.snapshots) if s.startswith(prefix)))
         if verb == "list" and args[2] != "-rH":
             name = args[-1]
             if name in self.datasets or name in self.snapshots:
@@ -105,6 +163,10 @@ class ZfsSim:
             if "name,type" in args:
                 return ok("".join(f"{d}\t{'volume' if d in self.volumes else 'filesystem'}\n" for d in names))
             return ok("".join(f"{d}\n" for d in names))
+        if verb == "get" and args[-2] == "all":
+            return ok(self._get_all(args[-1]))
+        if verb == "get" and "-r" in args:
+            return self._get_local(args[-2], args[-1])
         if verb == "get":
             if (
                 args[-2].startswith("written@")
@@ -119,12 +181,12 @@ class ZfsSim:
                 self.snapshot(f"{d}@{name.split('@')[1]}")
             return ok()
         if verb == "unmount":
-            if args[-1] in self.busy:
-                return fail(f"cannot unmount '{args[-1]}': pool or dataset is busy\n")
-            self.prop(args[-1], "mounted", "no")
-        elif verb == "mount":
-            self.prop(args[-1], "mounted", "yes")
+            return self._unmount(args[-1])
+        if verb == "mount":
+            self._mount(args)
         elif verb == "load-key":
+            if "-n" in args:
+                return ok()
             self.prop(args[-1], "keystatus", "available")
         elif verb == "unload-key":
             for d in self._under(args[-1]):
@@ -136,8 +198,10 @@ class ZfsSim:
             return self._send(args)
         elif verb == "recv":
             return self._recv(args)
+        elif verb == "inherit":
+            self.props.pop((args[-1], args[-2]), None)
         elif verb == "create":
-            self.datasets.add(args[-1])
+            self._create(args)
         elif verb == "rename":
             old, new = args[-2:]
             self.datasets = {self._renamed(d, old, new) for d in self.datasets}
@@ -149,6 +213,39 @@ class ZfsSim:
                 for name, guid in self.snapshots.items()
             }
         return ok()
+
+    def _get_local(self, prop: str, root: str) -> CommandResult:
+        """Answer ``zfs get -H -r -s local -t filesystem -o name,value PROP ROOT``."""
+        names = [d for d in self._under(root) if d not in self.volumes and (d, prop) in self.props]
+        return ok("".join(f"{d}\t{self.props[d, prop]}\n" for d in names))
+
+    def _unmount(self, name: str) -> CommandResult:
+        if name in self.busy:
+            return fail(f"cannot unmount '{name}': pool or dataset is busy\n")
+        self.prop(name, "mounted", "no")
+        self.noatime.discard(name)
+        if name in self.mount_order:
+            self.mount_order.remove(name)
+        return ok()
+
+    def _mount(self, args: Sequence[str]) -> None:
+        self.prop(args[-1], "mounted", "yes")
+        if args[-1] in self.mount_order:
+            self.mount_order.remove(args[-1])
+        self.mount_order.append(args[-1])
+        if "noatime" in args:
+            self.noatime.add(args[-1])
+        # Only an explicitly set mountpoint: the DEFAULTS one is a placeholder, never a real path.
+        mountpoint = self.props.get((args[-1], "mountpoint"), "")
+        if mountpoint.startswith("/"):
+            Path(mountpoint).mkdir(parents=True, exist_ok=True)
+
+    def _create(self, args: Sequence[str]) -> None:
+        self.datasets.add(args[-1])
+        for index, arg in enumerate(args):
+            if arg == "-o":
+                prop, value = args[index + 1].split("=", 1)
+                self.prop(args[-1], prop, value)
 
     def _locked(self, name: str) -> bool:
         return self._get("encryption", name) != "off" and self._get("keystatus", name) != "available"

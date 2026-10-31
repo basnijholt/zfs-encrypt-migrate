@@ -41,3 +41,4 @@ def test_nix_job_builds_flake_checks() -> None:
     commands = "\n".join(step.get("run", "") for step in steps)
     assert "nix build .#checks.x86_64-linux.module " in commands
     assert "nix build .#checks.x86_64-linux.integration " in commands
+    assert "nix build .#checks.x86_64-linux.file-move " in commands

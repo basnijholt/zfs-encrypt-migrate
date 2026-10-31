@@ -34,6 +34,12 @@ The NixOS VM test runs every command against real OpenZFS on loopback pools insi
 nix build .#checks.x86_64-linux.integration -L
 ```
 
+`nix/file-move-test.nix` is a second VM test for `file-move`: it moves a dataset bigger than its pool's free space, survives an interrupt and a rerun, and checks the result:
+
+```bash
+nix build .#checks.x86_64-linux.file-move -L
+```
+
 Never point the CLI at real pools while developing: it renames and unmounts datasets.
 
 ## Code Quality
@@ -82,12 +88,14 @@ zfs_encrypt_migrate/              # Python package
 zfs_encrypt_migrate/cli.py        # Typer command registration, shared options and exit codes
 zfs_encrypt_migrate/migrate.py    # seed, catchup, cutover, the swap and the abort guard
 zfs_encrypt_migrate/tree.py       # tree-seed, tree-move and tree-finish
+zfs_encrypt_migrate/filemove.py   # file-move: batches, verification and the swap
 zfs_encrypt_migrate/audit.py      # Unencrypted-dataset audit
 zfs_encrypt_migrate/zfs.py        # zfs/zpool wrapper and dataset-name validation
 zfs_encrypt_migrate/process.py    # Command runner and the send | recv pipeline
 zfs_encrypt_migrate/sizes.py      # --min-free size parsing
 nix/nixos-module.nix              # NixOS module with the audit service and timer
 nix/integration-test.nix          # NixOS VM test against real OpenZFS
+nix/file-move-test.nix            # NixOS VM test for file-move
 tests/                            # Unit, CLI, packaging, workflow and NixOS module tests
 docs/                             # Zensical documentation site
 ```

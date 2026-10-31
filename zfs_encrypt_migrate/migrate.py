@@ -29,7 +29,8 @@ INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 def signals_ignored() -> Iterator[None]:
     """Ignore the interrupt signals so a second one cannot skip the cleanup inside.
 
-    Children inherit the ignore on purpose: the same keypress or hangup that reaches us reaches them.
+    Children started inside inherit the ignore. Those started with ``run`` sit in their own process group,
+    so a keypress or hangup never reaches them directly; they get only the signals the CLI sends them.
     """
     if threading.current_thread() is not threading.main_thread():
         yield
@@ -92,6 +93,8 @@ class AbortGuard:
         self.phase = ""
         self.canmount_on: list[str] = []
         self.cleanup: list[str] = []
+        self.mounted: list[str] = []
+        self.notes: list[str] = []
 
     def __enter__(self) -> Self:
         """Start guarding."""
@@ -109,6 +112,7 @@ class AbortGuard:
         with signals_ignored():
             hints = self._unload_hint()
         hints += self._phase_hints()
+        hints += self.notes
         if isinstance(exc, MigrationError):
             error = exc
         elif isinstance(exc, KeyboardInterrupt):
@@ -123,6 +127,15 @@ class AbortGuard:
         raise error from exc
 
     def _unload_hint(self) -> list[str]:
+        # A busy mount is never forced; the key stays loaded so the data stays readable. A name is listed before
+        # its mount, so one whose mount failed or never ran is skipped: zfs refuses to unmount it.
+        for name in reversed(self.mounted):
+            try:
+                busy = self.zfs.get("mounted", name) == "yes" and not self.zfs.unmount(name)
+            except MigrationError:
+                busy = True
+            if busy:
+                return [f"could not unmount {name}; run: zfs unmount {name} && zfs unload-key -r {self.staged}"]
         try:
             if self.zfs.exists(self.staged) and self.zfs.get("keystatus", self.staged) == "available":
                 self.zfs.unload_key(self.staged)
@@ -233,15 +246,7 @@ def check_free_space(zfs: Zfs, settings: Settings, dataset: str, size_props: str
 def preflight_seed(zfs: Zfs, settings: Settings, dataset: str, size_props: str = "used") -> None:
     """Refuse to seed unless the key, the dataset, the stage and the free space are in order."""
     refuse_nested(settings, dataset)
-    key_file = settings.key_file
-    # Anything other than a private regular file could leak the passphrase. Symlinks (secret
-    # managers use them) are followed: the target must be the regular file with mode 600.
-    if not key_file.is_file():
-        msg = f"key file {key_file} not found"
-        raise MigrationError(msg)
-    if stat.S_IMODE(key_file.stat().st_mode) != 0o600:  # noqa: PLR2004
-        msg = f"key file {key_file} must have mode 600"
-        raise MigrationError(msg)
+    check_key_file(settings)
     leaf = leaf_of(dataset)
     if not zfs.exists(dataset):
         msg = f"dataset {dataset} does not exist"
@@ -257,6 +262,19 @@ def preflight_seed(zfs: Zfs, settings: Settings, dataset: str, size_props: str =
             msg = f"{name} already exists"
             raise MigrationError(msg)
     check_free_space(zfs, settings, dataset, size_props)
+
+
+def check_key_file(settings: Settings) -> None:
+    """Refuse unless the key file is a private regular file."""
+    key_file = settings.key_file
+    # Anything other than a private regular file could leak the passphrase. Symlinks (secret
+    # managers use them) are followed: the target must be the regular file with mode 600.
+    if not key_file.is_file():
+        msg = f"key file {key_file} not found"
+        raise MigrationError(msg)
+    if stat.S_IMODE(key_file.stat().st_mode) != 0o600:  # noqa: PLR2004
+        msg = f"key file {key_file} must have mode 600"
+        raise MigrationError(msg)
 
 
 def load_stage_key(zfs: Zfs, staged: str) -> None:

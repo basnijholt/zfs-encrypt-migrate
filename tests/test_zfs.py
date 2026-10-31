@@ -7,10 +7,13 @@ from typing import TYPE_CHECKING
 import pytest
 import typer
 
+from zfs_encrypt_migrate.constants import COMMAND_STARTUP_ERROR_RETURNCODE
 from zfs_encrypt_migrate.errors import ZfsError
-from zfs_encrypt_migrate.zfs import Zfs, validate_child, validate_name
+from zfs_encrypt_migrate.zfs import Prop, Zfs, validate_child, validate_name
 
 from .conftest import FakeRunner, fail, ok
+from .helpers import make
+from .zfs_sim import ZfsSim
 
 if TYPE_CHECKING:
     from zfs_encrypt_migrate.process import CommandResult
@@ -122,6 +125,13 @@ def test_write_command_failure_raises() -> None:
         Zfs(FakeRunner(queue=[fail("nope\n")])).mount("tank/a")
 
 
+def test_mount_passes_temporary_options() -> None:
+    """Mount options go comma-joined after -o, for the duration of this mount only."""
+    runner = FakeRunner()
+    Zfs(runner).mount("tank/a", ["noatime", "ro"])
+    assert runner.calls == [("zfs", "mount", "-o", "noatime,ro", "tank/a")]
+
+
 def test_unmount_reports_busy_without_force() -> None:
     """A busy dataset returns False; no -f is ever used; other errors raise."""
     runner = FakeRunner(queue=[ok(), fail("cannot unmount 'tank/a': pool or dataset is busy\n"), fail("weird\n")])
@@ -141,6 +151,14 @@ def test_pool_avail() -> None:
 
     assert zfs.pool_avail("tank") == 12345  # noqa: PLR2004
     assert runner.calls == [("zfs", "list", "-Hp", "-o", "avail", "tank")]
+
+
+def test_pool_get_reads_one_pool_property() -> None:
+    """pool_get reads one pool property as a parsable value."""
+    runner = FakeRunner(queue=[ok("-\n")])
+
+    assert Zfs(runner).pool_get("checkpoint", "tank") == "-"
+    assert runner.calls == [("zpool", "get", "-H", "-p", "-o", "value", "checkpoint", "tank")]
 
 
 @pytest.mark.parametrize("name", ["tank", "tank/a.b_c-d:e", "a/b/c"])
@@ -222,3 +240,91 @@ def test_unload_key_retries_while_busy(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(ZfsError, match="busy"):
         Zfs(stuck).unload_key("tank/a")
     assert len(stuck.calls) == 20  # noqa: PLR2004
+
+
+def test_props_parses_value_and_source() -> None:
+    """Every property comes back with its value and source, user properties included."""
+    stdout = "compression\tlz4\tlocal\nrecordsize\t131072\tdefault\nuser:x\t1\tinherited from tank\n"
+    runner = FakeRunner(queue=[ok(stdout)])
+
+    assert Zfs(runner).props("tank/a") == {
+        "compression": Prop("lz4", "local"),
+        "recordsize": Prop("131072", "default"),
+        "user:x": Prop("1", "inherited from tank"),
+    }
+    assert runner.calls == [("zfs", "get", "-H", "-p", "-o", "property,value,source", "all", "tank/a")]
+
+
+def test_props_keeps_a_tab_inside_a_value() -> None:
+    """A user property value may hold a tab; only the first and the last tab separate the columns."""
+    runner = FakeRunner(queue=[ok("user:note\ta\tb\tlocal\nuser:empty\t\tlocal\n")])
+
+    assert Zfs(runner).props("tank/a") == {
+        "user:note": Prop("a\tb", "local"),
+        "user:empty": Prop("", "local"),
+    }
+
+
+def test_local_values_lists_where_a_property_is_set() -> None:
+    """local_values reads one property, set locally, across the filesystems under a root."""
+    runner = FakeRunner(queue=[ok("tank/a\tx\ntank/b/c\ty z\n")])
+
+    assert Zfs(runner).local_values("user:p", "tank") == [("tank/a", "x"), ("tank/b/c", "y z")]
+    assert runner.calls == [
+        ("zfs", "get", "-H", "-r", "-s", "local", "-t", "filesystem", "-o", "name,value", "user:p", "tank"),
+    ]
+
+
+def test_snapshots_lists_own_snapshots() -> None:
+    """Only the dataset's own snapshots are listed, by full name."""
+    runner = FakeRunner(queue=[ok("tank/a@one\ntank/a@two\n")])
+
+    assert Zfs(runner).snapshots("tank/a") == ["tank/a@one", "tank/a@two"]
+    assert runner.calls == [("zfs", "list", "-H", "-t", "snapshot", "-o", "name", "-d", "1", "tank/a")]
+
+
+def test_check_key_attached_uses_run_attached() -> None:
+    """An attached check goes through run_attached, not run."""
+    runner = FakeRunner()
+
+    assert Zfs(runner).check_key("tank/a", "prompt", attached=True) is True
+    assert runner.calls == []
+    assert runner.attached == [("zfs", "load-key", "-n", "-L", "prompt", "tank/a")]
+
+
+def test_check_key_returns_false_on_failure() -> None:
+    """A wrong key is False, not an error."""
+    runner = FakeRunner(queue=[fail("Key load error\n")])
+
+    assert Zfs(runner).check_key("tank/a", "file:///k", attached=False) is False
+    assert runner.calls == [("zfs", "load-key", "-n", "-L", "file:///k", "tank/a")]
+
+
+def test_check_key_raises_on_startup_error() -> None:
+    """A zfs that cannot start is an error, not a wrong key."""
+    runner = FakeRunner(queue=[fail("no zfs\n", returncode=COMMAND_STARTUP_ERROR_RETURNCODE)])
+
+    with pytest.raises(ZfsError, match="no zfs"):
+        Zfs(runner).check_key("tank/a", "prompt", attached=False)
+
+
+def test_sim_props_snapshots_inherit_and_check_key() -> None:
+    """The simulator answers the new commands the way zfs does."""
+    sim = ZfsSim(["tank/a"])
+    zfs, _ = make(sim)
+    zfs.create("tank/b", {"compression": "lz4"})
+    sim.inherited["tank/b", "user:x"] = ("1", "tank")
+    sim.snapshot("tank/b@s1")
+    sim.snapshot("tank/b/c@s2")
+
+    props = zfs.props("tank/b")
+    assert props["compression"] == Prop("lz4", "local")
+    assert props["user:x"] == Prop("1", "inherited from tank")
+    assert props["canmount"] == Prop("on", "default")
+    assert zfs.snapshots("tank/b") == ["tank/b@s1"]
+
+    zfs.inherit("tank/b", "compression")
+    assert "compression" not in zfs.props("tank/b")
+
+    assert zfs.check_key("tank/b", "prompt", attached=True) is True
+    assert sim.props.get(("tank/b", "keystatus")) is None

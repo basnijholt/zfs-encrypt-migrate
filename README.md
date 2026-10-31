@@ -47,18 +47,20 @@ flowchart LR
 ```
 
 A dataset with many large children can move child by child with `tree-seed`, `tree-move` and `tree-finish`, so you only ever need room for one child at a time.
+A single dataset bigger than its pool's free space can't be copied with `zfs send`; `file-move` encrypts it by moving its files in verified batches into a new encrypted dataset, deleting each source file only once its copy is verified (see the [guide](https://zfs-encrypt-migrate.nijho.lt/guides/#datasets-bigger-than-the-free-space)). It needs `rsync` 3.1.3 or newer, with ACL and xattr support, on `PATH`.
 An `audit` command lists every dataset that is still unencrypted, for a timer or a CI-style check.
 
 ## Safety model
 
 The tool runs as root against your only copy of the data, so it is built to stop rather than improvise:
 
-- **It never destroys anything.** It never runs `zfs destroy`. When something needs to go — the old copy after a cutover, a moved child — it prints the exact command and leaves it to you. A stale snapshot that blocks a retry gets a printed command that renames it aside instead.
+- **It never runs `zfs destroy`.** When something needs to go — the old copy after a cutover, a moved child — it prints the exact command and leaves it to you. A stale snapshot that blocks a retry gets a printed command that renames it aside instead.
 - **Staged keys stay unloaded.** The staged copy keeps every mountpoint set locally in the original tree, so its key is loaded only while the tool works on it. `seed`, `catchup`, `tree-seed` and `tree-move` unload it when they finish, and any failure or Ctrl-C part way through unloads it too.
 - **One migration in flight.** `seed` and `tree-seed` refuse while anything other than the `old` copies sits under the stage.
 - **A free-space floor.** `seed`, `tree-seed` and `tree-move` refuse unless the stage pool's free space, minus the size of what they copy, stays at least `--min-free` (default `1T`).
 - **No lost writes.** `cutover`, `tree-move` and `tree-finish` unmount the source first and refuse if it's busy (they never force). After the final snapshot they run `zpool sync` and refuse if `written@<snapshot>` is non-zero anywhere in the tree.
 - **Nothing lands unencrypted.** Catch-up and `tree-move` receives use `-x encryption`, so a child created after the seed, or moved with `tree-move`, inherits encryption instead of arriving in plaintext. After each catch-up and each `tree-move`, every dataset in the received tree is checked to have the staged copy as its `encryptionroot`, and the snapshots on both sides are compared by GUID.
+- **`file-move` is the one command that deletes data.** It deletes only source files whose encrypted copy is verified, and only with `--delete-source`. It refuses while the dataset has snapshots and checks your final key before the first deletion.
 - **Recovery hints that match the failure.** If a swap fails part way, the error lists the commands for the exact step it reached: remount, restore `canmount`, rename the original back, or finish setting the keylocation.
 - **Signals are cleanups, not crashes.** SIGINT, SIGTERM and SIGHUP (a dropped SSH session) all take the Ctrl-C path: a running `zfs send`/`zfs recv` is stopped, the staged key is unloaded, the hints are printed, and the exit status is 130. A signal that was already ignored when the tool started, as under `nohup`, stays ignored, so a `nohup` run survives a hangup.
 
@@ -164,7 +166,7 @@ zfs-encrypt-migrate audit --exact tank --subtree tank/stage tank
 ```
 
 `audit` prints each offending dataset and exits 1 if there are any, or if a pool can't be listed.
-The [guides](https://zfs-encrypt-migrate.nijho.lt/guides/) cover the tree commands, rebuilding a whole pool encrypted, unlocking after reboot, and sanoid/syncoid.
+The [guides](https://zfs-encrypt-migrate.nijho.lt/guides/) cover the tree commands, `file-move` for datasets bigger than the free space, rebuilding a whole pool encrypted, unlocking after reboot, and sanoid/syncoid.
 
 ## CLI
 
@@ -206,6 +208,10 @@ zfs-encrypt-migrate --help
 │ tree-finish  Send the parent's last changes and swap the staged tree into place once no children │
 │              remain.                                                                             │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ File-Move Commands ─────────────────────────────────────────────────────────────────────────────╮
+│ file-move    Move a dataset's files in verified batches into an encrypted dataset, then swap it  │
+│              into place.                                                                         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ Audit Commands ─────────────────────────────────────────────────────────────────────────────────╮
 │ audit        List unencrypted datasets outside the allowlists; exit 1 if there are any.          │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
@@ -214,7 +220,7 @@ zfs-encrypt-migrate --help
 
 <!-- OUTPUT:END -->
 
-The six migration and tree commands share these options, each with an environment variable fallback:
+The seven migration, tree and file-move commands share these options, each with an environment variable fallback:
 
 ```bash
 zfs-encrypt-migrate seed --help
