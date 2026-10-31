@@ -356,7 +356,7 @@ def rsync_dirs(zfs: Zfs, src: Path, dst: Path) -> None:
     )
 
 
-def copy_tree(zfs: Zfs, staged: str, src: Path, dst: Path) -> None:
+def copy_tree(zfs: Zfs, staged: str, src: Path, dst: Path, device: int) -> None:
     """Copy the directories twice, the second time into scratch so later batches can restore their mtimes."""
     if zfs.get(MARK_DIRS, staged) == "copied":
         return
@@ -364,6 +364,8 @@ def copy_tree(zfs: Zfs, staged: str, src: Path, dst: Path) -> None:
     shadow = dst / SCRATCH / "dirs"
     shadow.mkdir(parents=True, exist_ok=True)
     rsync_dirs(zfs, src, shadow)
+    # The marker vouches for copies in the staged dataset; after an unmount they went to the bare directory.
+    _refuse_unmounted(zfs, staged, dst, device)
     zfs.set_prop(staged, MARK_DIRS, "copied")
 
 
@@ -612,7 +614,7 @@ def file_move(
             if dst.is_relative_to(src) or src.is_relative_to(dst):
                 msg = f"{staged} is mounted at {dst}, which overlaps {dataset} at {src}"
                 raise MigrationError(msg)
-            copy_tree(zfs, staged, src, dst)
+            copy_tree(zfs, staged, src, dst, device)
             check_passphrase(zfs, settings, staged)
             move_files(zfs, settings, dataset, src, dst, batch_size, sleep, device=device)
             return finish(zfs, settings, dataset, src, dst, guard)

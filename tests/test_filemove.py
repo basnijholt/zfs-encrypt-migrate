@@ -526,8 +526,8 @@ def test_copy_tree_copies_dirs_twice_and_marks(filemove_env: FileMoveEnv, settin
     """Copy tree copies dirs twice and marks."""
     env = filemove_env
     guard = guard_for(env, settings)
-    dst, _ = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
-    copy_tree(env.zfs, STAGED, env.src, dst)
+    dst, device = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
+    copy_tree(env.zfs, STAGED, env.src, dst, device)
     for root in (dst, dst / SCRATCH / "dirs"):
         for rel in ("docs", "docs/deep", "empty"):
             assert (root / rel).is_dir()
@@ -538,12 +538,28 @@ def test_copy_tree_copies_dirs_twice_and_marks(filemove_env: FileMoveEnv, settin
 
 
 @needs_rsync
+def test_copy_tree_unmarked_when_staged_unmounted_meanwhile(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """The marker says the tree is in the staged dataset, so it is set only while that is still mounted.
+
+    Otherwise the copies went to the bare directory left behind, and a rerun would skip copying the tree.
+    """
+    env = filemove_env
+    guard = guard_for(env, settings)
+    dst, device = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
+    tamper_after_rsync(env, lambda n: env.zfs.unmount(STAGED) if n == 2 else None)  # noqa: PLR2004
+    with pytest.raises(MigrationError) as info:
+        copy_tree(env.zfs, STAGED, env.src, dst, device)
+    assert info.value.message == f"{STAGED} is no longer mounted at {dst}; nothing of this batch was deleted"
+    assert (STAGED, MARK_DIRS) not in env.sim.props
+
+
+@needs_rsync
 def test_copy_tree_skips_when_marked(filemove_env: FileMoveEnv) -> None:
     """Copy tree skips when marked."""
     env = filemove_env
     env.sim.prop(STAGED, MARK_DIRS, "copied")
     env.sim.datasets.add(STAGED)
-    copy_tree(env.zfs, STAGED, env.src, env.mount_root)
+    copy_tree(env.zfs, STAGED, env.src, env.mount_root, 0)
     assert not [call for call in env.runner.calls if call[0] == "rsync"]
 
 
@@ -1284,8 +1300,8 @@ def test_finish_refuses_files_appearing(filemove_env: FileMoveEnv, settings: Set
 
 def moved(env: FileMoveEnv, settings: Settings, guard: AbortGuard) -> Path:
     """Open the staged dataset, copy the tree and move every file; return the staged path."""
-    dst, _ = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
-    copy_tree(env.zfs, STAGED, env.src, dst)
+    dst, device = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
+    copy_tree(env.zfs, STAGED, env.src, dst, device)
     move(env, settings, dst, 10**9, recorder()[1])
     return dst
 
