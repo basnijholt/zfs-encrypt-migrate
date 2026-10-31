@@ -117,11 +117,13 @@ def write_file_list(path: Path, groups: Sequence[Group]) -> None:
                 f.write(os.fsencode(item.name) + b"\0")
 
 
-def _unchanged(src: Path, g: Group) -> bool:
+def _unchanged(src: Path, g: Group, *, missing_ok: bool = False) -> bool:
     for item in g.entries:
         try:
             st = os.lstat(src / item.name)
         except FileNotFoundError:
+            if missing_ok:
+                continue
             return False
         if st.st_ino != item.ino or st.st_ctime_ns != item.ctime_ns:
             return False
@@ -175,9 +177,16 @@ def verify(src: Path, dst: Path, groups: Sequence[Group]) -> tuple[list[Group], 
 
 
 def delete(src: Path, groups: Sequence[Group]) -> int:
-    """Unlink every name of every group (never directories); return how many were unlinked."""
+    """Unlink every name of every unchanged group (never directories); return how many were unlinked.
+
+    A group is re-checked against its scan entries first, because a writer can replace a name
+    between verify and delete; unlinking that new file would lose data that was never copied.
+    All names are checked before the first unlink, since unlinking one changes the inode's ctime.
+    """
     count = 0
     for g in groups:
+        if not _unchanged(src, g, missing_ok=True):
+            continue
         for item in g.entries:
             try:
                 (src / item.name).unlink()

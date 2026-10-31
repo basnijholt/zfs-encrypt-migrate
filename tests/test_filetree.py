@@ -354,3 +354,19 @@ def test_remove_scratch_restores_root_mtime(tmp_path: Path) -> None:
     assert not scratch.exists()
     st = os.lstat(tmp_path)
     assert (st.st_atime_ns, st.st_mtime_ns) == (1_000_000_000, 2_000_000_000)
+
+
+def test_delete_skips_group_replaced_after_verify(tmp_path: Path) -> None:
+    """A name replaced by a new inode after verify is kept, with its whole group."""
+    src, dst = make_pair(tmp_path)
+    (src / "cfg").write_text("old")
+    (src / "other").write_text("o")
+    groups = scanned(src)
+    copy_tree(src, dst, ["cfg", "other"])
+    verified, changed = verify(src, dst, groups)
+    assert changed == []
+    (src / "cfg.new").write_text("new")
+    (src / "cfg.new").replace(src / "cfg")
+    assert delete(src, verified) == 1
+    assert (src / "cfg").read_text() == "new"
+    assert not (src / "other").exists()
