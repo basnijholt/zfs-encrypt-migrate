@@ -21,7 +21,7 @@ from .constants import (
     SPACE_DELAY_SECONDS,
     STAGING_MOUNT_ROOT,
 )
-from .errors import Interrupted, MigrationError
+from .errors import Interrupted, MigrationError, ZfsError
 from .filetree import (
     delete,
     group_by_inode,
@@ -134,7 +134,39 @@ def _refuse_pinned_space(zfs: Zfs, dataset: str) -> None:
         raise MigrationError(msg)
 
 
-def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
+def _block_cloned(zfs: Zfs, pool: str) -> int:
+    """Return the bytes block cloning saves on ``pool``: 0 when nothing is cloned or OpenZFS has no block cloning."""
+    try:
+        value = zfs.pool_get("bclonesaved", pool)
+    except ZfsError as exc:
+        # OpenZFS before 2.2 has no such property.
+        if "invalid property" in exc.result.stderr:
+            return 0
+        raise
+    return int(value) if value.isdigit() else 0
+
+
+def _refuse_block_cloned(zfs: Zfs, settings: Settings, dataset: str, batch_size: int) -> None:
+    """Refuse unless free space covers what block-cloned files may cost on top of one batch.
+
+    A cloned file counts its full size, but deleting one reference frees nothing while another remains, and
+    its copy needs the full size. The pool's savings from cloning bound that extra space.
+    """
+    pool = pool_of(dataset)
+    saved = _block_cloned(zfs, pool)
+    if not saved:
+        return
+    budget = zfs.pool_avail(pool) - settings.min_free
+    if budget < saved + batch_size:
+        msg = (
+            f"pool {pool} has {format_size(saved)} of block-cloned data; copies are not clones, so file-move may "
+            f"need that much more space: free space above the floor ({format_size(max(budget, 0))}) must cover "
+            f"it plus one batch ({format_size(batch_size)})"
+        )
+        raise MigrationError(msg)
+
+
+def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str, *, batch_size: int) -> Path:
     """Refuse unless the run can start or resume; return the source mountpoint. Writes nothing."""
     check_key_file(settings)
     if "/" not in dataset:
@@ -144,6 +176,7 @@ def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
     refuse_nested(settings, dataset)
     source = _refuse_source(zfs, dataset)
     _refuse_pinned_space(zfs, dataset)
+    _refuse_block_cloned(zfs, settings, dataset, batch_size)
     # Here as well as before each batch, so a snapshot stops the run before anything is written. Only while
     # files are left: then a snapshot pins nothing, and a rerun after a refused swap keeps its renamed enc-final.
     if zfs.snapshots(dataset) and scan(source):
@@ -505,7 +538,7 @@ def file_move(
         raise MigrationError(msg)
     staged = f"{settings.stage}/{leaf_of(dataset)}"
     with run_lock(lock_path):
-        src = preflight_file_move(zfs, settings, dataset)
+        src = preflight_file_move(zfs, settings, dataset, batch_size=batch_size)
         source_props = probe_writers(zfs, dataset)
         with abort_guard(zfs, settings, staged, label="file-move") as guard:
             guard.notes = [
