@@ -108,8 +108,22 @@ def _refuse_source(zfs: Zfs, dataset: str) -> Path:
     return Path(mountpoint)
 
 
-def _refuse_pinned_space(zfs: Zfs, dataset: str) -> None:
+def _refuse_pinned_space(zfs: Zfs, settings: Settings, dataset: str) -> None:
     """Refuse when deleting the source's files would not free their space: the move would stall half-way."""
+    parts = dataset.split("/")
+    for depth in range(len(parts) - 1, 0, -1):
+        ancestor = "/".join(parts[:depth])
+        # From here up the ancestor holds the stage too, so the copies use what the deletes free in it.
+        if settings.stage.startswith(f"{ancestor}/"):
+            break
+        # A refreservation covers only the ancestor's own data, not what its descendants free.
+        value = zfs.get("reservation", ancestor)
+        if value not in {"none", "0"}:
+            msg = (
+                f"{ancestor} has reservation={value}, which keeps space freed in {dataset} reserved; clear it with: "
+                f"zfs set reservation=none {ancestor} (set it again after the move)"
+            )
+            raise MigrationError(msg)
     for prop in ("reservation", "refreservation"):
         value = zfs.get(prop, dataset)
         if value not in {"none", "0"}:
@@ -175,7 +189,7 @@ def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str, *, batch_siz
     refuse_cross_pool(settings, dataset, "file-move")
     refuse_nested(settings, dataset)
     source = _refuse_source(zfs, dataset)
-    _refuse_pinned_space(zfs, dataset)
+    _refuse_pinned_space(zfs, settings, dataset)
     _refuse_block_cloned(zfs, settings, dataset, batch_size)
     # Here as well as before each batch, so a snapshot stops the run before anything is written. Only while
     # files are left: then a snapshot pins nothing, and a rerun after a refused swap keeps its renamed enc-final.

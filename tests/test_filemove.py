@@ -153,6 +153,39 @@ def test_preflight_refuses_reserved_space(filemove_env: FileMoveEnv, settings: S
     )
 
 
+def nested_source(env: FileMoveEnv) -> str:
+    """Make the source tank/srv/media, under a parent tank/srv, and return its name."""
+    dataset = "tank/srv/media"
+    env.sim.datasets |= {"tank/srv", dataset}
+    env.sim.prop(dataset, "mountpoint", str(env.src))
+    env.sim.prop(dataset, "mounted", "yes")
+    return dataset
+
+
+def test_preflight_refuses_ancestor_reservation(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """A parent's reservation keeps the space freed in the source reserved for the parent, away from the stage."""
+    dataset = nested_source(filemove_env)
+    filemove_env.sim.prop("tank/srv", "reservation", "1073741824")
+    refused(
+        filemove_env,
+        settings,
+        f"tank/srv has reservation=1073741824, which keeps space freed in {dataset} reserved; clear it with: "
+        "zfs set reservation=none tank/srv (set it again after the move)",
+        dataset,
+    )
+
+
+def test_preflight_allows_ancestor_reservation_around_the_stage(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """A parent reservation that holds the stage too is spent on the copies; a refreservation covers its own data."""
+    dataset = nested_source(filemove_env)
+    filemove_env.sim.prop("tank/srv", "reservation", "1073741824")
+    inside = replace(settings, stage="tank/srv/stage")
+    assert preflight_file_move(filemove_env.zfs, inside, dataset, batch_size=BATCH) == filemove_env.src
+    filemove_env.sim.prop("tank/srv", "reservation", "0")
+    filemove_env.sim.prop("tank/srv", "refreservation", "1073741824")
+    assert preflight_file_move(filemove_env.zfs, settings, dataset, batch_size=BATCH) == filemove_env.src
+
+
 def test_preflight_refuses_clone(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """A clone's origin snapshot keeps the blocks of deleted files allocated."""
     filemove_env.sim.prop(DATASET, "origin", "tank/old@base")
