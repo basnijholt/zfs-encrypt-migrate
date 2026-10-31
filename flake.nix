@@ -42,6 +42,15 @@
 
             env.SETUPTOOLS_SCM_PRETEND_VERSION = version;
 
+            # file-move runs rsync. Appended, not prepended, so an rsync already
+            # on PATH (the host's, or a test's wrapper) wins.
+            makeWrapperArgs = [
+              "--suffix"
+              "PATH"
+              ":"
+              (pkgs.lib.makeBinPath [ pkgs.rsync ])
+            ];
+
             pythonImportsCheck = [ "zfs_encrypt_migrate" ];
             doCheck = false;
 
@@ -118,6 +127,11 @@
         # CI (KVM there); on other systems it would need cross-emulation.
         // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
           integration = import ./nix/integration-test.nix {
+            inherit pkgs;
+            module = self.nixosModules.default;
+            package = self.packages.${system}.default;
+          };
+          file-move = import ./nix/file-move-test.nix {
             inherit pkgs;
             module = self.nixosModules.default;
             package = self.packages.${system}.default;
