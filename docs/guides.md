@@ -168,8 +168,18 @@ At the end it swaps the new dataset into place under the same name and mountpoin
 Requirements, on top of the usual ones:
 
 - `rsync` 3.1.3 or newer, with ACL and xattr support, on `PATH`. The Nix package appends one to `PATH` for you; with pip or uv, install it from your distribution.
-- A dataset that is a leaf filesystem: no child datasets, no volumes. For a parent with children, use the [tree commands](#moving-a-big-tree), and `file-move` for a big child on its own.
-- Room for block-cloned data, if the pool has any (OpenZFS 2.2 and later): check `zpool get bcloneused,bclonesaved POOL`. A copy of a cloned file takes its full size, while deleting one reference frees nothing, so `file-move` needs free space above `--min-free` for `bclonesaved` plus one batch, and refuses otherwise.
+- Nothing from the list below. Check before you start: `zfs get dedup,reservation,refreservation,origin DATASET`, `zpool get dedupratio,checkpoint,bcloneused,bclonesaved POOL`, and `zfs list -r DATASET` for children.
+
+**Not supported.**
+`file-move` relies on every deleted file freeing its space, so it checks for what would stop that before it creates or deletes anything:
+
+- **Deduplication.** A dataset with `dedup` other than `off`, or a pool with deduplicated blocks (`dedupratio` above 1.00x), even with dedup off now: deleting a deduplicated file frees nothing while another reference to its blocks remains. Refused on the first run.
+- **Reservations.** A `reservation` or `refreservation` on the dataset, or a `reservation` on a parent that does not also hold the stage. Refused on every run, with the command that clears it; set it again after the swap.
+- **Clones.** A dataset that is a clone: its origin keeps the space of deleted files. Refused on every run; `zfs promote` it first.
+- **Pool checkpoints.** A checkpoint keeps deleted space allocated. Refused on every run; `zpool checkpoint -d POOL` first.
+- **Block-cloned data beyond the free space.** A copy of a cloned file takes its full size. Refused on the first run unless free space above `--min-free` covers the pool's `bclonesaved` plus one batch.
+- **Child datasets and volumes.** Refused: for a parent with children, use the [tree commands](#moving-a-big-tree), and `file-move` for a big child on its own; for a volume, `seed` and `cutover`.
+- **Per-user, per-group and per-project quotas and project IDs.** A documented limit, not checked: `userquota@`, `groupquota@` and `projectquota@` (and their `objquota@` forms) are not in `zfs get all`, and rsync doesn't copy a file's project ID, so they are not carried over (`seed` and `cutover` keep both). Note them before the move with `zfs userspace`, `zfs groupspace`, `zfs projectspace` and `zfs project -r`, and set them again on the new dataset after the swap.
 
 > [!CAUTION]
 > This is the one command that deletes your data. It deletes source files as it goes, so the files end up split between the original dataset and the encrypted copy, and the passphrase becomes the only way into the part that already moved. `file-move` checks that your final key opens the encrypted dataset before it deletes the first file, but store the passphrase safely first, and keep a backup.
@@ -206,7 +216,8 @@ When no files are left, it swaps the new dataset into place, and prints what to 
 
 **3. Stopping and continuing.**
 A stop before the swap is safe to continue from: rerun the same command.
-Files already copied are verified again and deleted without copying twice, and need no new free space.
+Files already copied are not copied again and need no new free space: rsync skips a copy whose size and mtime match the source, and the tool verifies it and deletes the source.
+So nothing may write to the dataset between runs either: a file rewritten in place with the same size and mtime would keep its old copy.
 After a power loss or `kill -9`, the rerun first removes the partial files rsync left in the encrypted dataset's `.zfs-encrypt-migrate/tmp`.
 A failure or Ctrl-C stops rsync, unmounts the encrypted dataset and unloads its key, and the hint tells you the files are split between the two datasets: do not destroy either.
 When the error is followed by `file-move aborted.`, the swap had begun: run the commands it prints first, rather than rerunning straight away (see [recovery hints](usage.md#recovery-hints)).
@@ -231,10 +242,11 @@ Then:
 
 **What the tool checks.**
 Before the first file moves, it refuses a dataset that is read-only, not mounted, has a mountpoint of `none` or `legacy`, or has an entry named `.zfs-encrypt-migrate` at its root, and it refuses while another migration is in flight under the stage or another `file-move` runs.
-It also refuses whatever would keep deleted files from freeing their space, since the move would then stall half-way: a `reservation` or `refreservation` on the dataset (clear it, and set it again on the new dataset after the swap), a `reservation` on a parent dataset that does not also hold the stage, a dataset that is a clone (`zfs promote` it first), and a checkpoint on the pool (`zpool checkpoint -d` it first).
+It also refuses everything in the **Not supported** list above that it can detect, since the move would otherwise stall half-way.
 Before each batch it checks that the encrypted dataset is still mounted at its private mountpoint, and it accepts only copies that are on that dataset: after an unmount (`zfs umount -a`, say) the mountpoint is a bare directory, and copies there would vanish.
 For each batch, rsync copies the files with hard links, ACLs, xattrs and sparseness, and the tool then compares every name against its copy: type, mode, owner and group, size and mtime for regular files, the target for symlinks, and one shared inode for all names of a hard-linked file.
-A file that changed in the source during its batch is left alone and picked up by the next pass; if a pass moves nothing, the run stops and asks you to stop the writers.
+A source file whose ctime changed during its batch is not deleted in that pass, and if a pass deletes nothing, the run stops and asks you to stop the writers.
+That is a safety net, not a way to run with writers: a file rewritten in place with the same size and mtime is not copied again, because rsync's quick check takes the earlier copy as current. Stop and disable every writer for the whole run (step 1).
 Only the verified names are deleted, after `zpool sync` has made the copies durable.
 If a hard-linked file has fewer names in the dataset than its link count says, the run refuses.
 
@@ -246,7 +258,6 @@ If a hard-linked file has fewer names in the dataset than its link count says, t
 - **Old plaintext blocks stay on disk until overwritten.** Deleting files frees their blocks; it doesn't wipe them.
 - **A nearly full pool is slow.** ZFS allocates slowly when little is free; use a smaller `--batch-size`.
 - **`sharenfs`, `sharesmb`, `reservation` and `refreservation` are set only after the swap,** so a stopped run never leaves them on the encrypted dataset's private mountpoint.
-- **Per-user, per-group and per-project quotas and project IDs are not carried over.** `userquota@`, `groupquota@` and `projectquota@` (and their `objquota@` forms) are not in `zfs get all`, and rsync doesn't copy a file's project ID; `seed` and `cutover` keep both because they send the dataset. Note them before the move with `zfs userspace`, `zfs groupspace`, `zfs projectspace` and `zfs project -r`, and set them again on the new dataset after the swap.
 
 ## Rebuilding a Whole Pool Encrypted
 
