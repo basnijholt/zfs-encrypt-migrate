@@ -126,7 +126,7 @@ pkgs.testers.runNixOSTest {
             " && chmod 640 movies/m03.bin && chmod 2750 big"
             # Last, since creating entries changes a directory's mtime.
             " && touch -d '2001-02-03 04:05:06.123456789' downloads tv/show"
-            " && touch -d 2010-01-01 tv movies big empty empty/nested ."
+            " && touch -d 2010-01-01 tv movies big empty empty/nested '#recycle' ."
         )
 
 
