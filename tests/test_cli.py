@@ -6,6 +6,7 @@ import os
 import re
 import signal
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -21,7 +22,6 @@ from .zfs_sim import ZfsSim, staged_ready
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from pathlib import Path
 
     from zfs_encrypt_migrate.process import CommandResult
     from zfs_encrypt_migrate.zfs import Zfs
@@ -587,7 +587,7 @@ def test_file_move_interrupt_in_writer_probe_exits_130_with_remount_hint(
         return sim.answer(args)
 
     def probe_only(zfs: Zfs, _settings: object, dataset: str, **_options: object) -> list[str]:
-        probe_writers(zfs, dataset)
+        probe_writers(zfs, dataset, Path("/mnt"))
         return []
 
     sim.runner.responder = interrupt_mount  # type: ignore[attr-defined]

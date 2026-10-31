@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -57,6 +59,8 @@ class ZfsSim:
         self.busy: set[str] = set()
         # Datasets mounted with "zfs mount -o noatime"; until unmounted, zfs reports atime=off as temporary.
         self.noatime: set[str] = set()
+        # Datasets in the order zfs mount mounted them; a later mount on the same path covers an earlier one.
+        self.mount_order: list[str] = []
         self.volumes: set[str] = set()
         self.roots: list[str] = []
         self.log: list[tuple[str, ...]] = []
@@ -101,6 +105,23 @@ class ZfsSim:
         if name in self.noatime and rows.get("atime", ("on", "default"))[0] != "off":
             rows["atime"] = ("off", "temporary")
         return "".join(f"{prop}\t{value}\t{source}\n" for prop, (value, source) in rows.items())
+
+    def mountinfo(self) -> bytes:
+        """Answer a read of /proc/self/mountinfo: a zfs line for each mounted dataset with a path, in mount order.
+
+        Datasets a test marked mounted come first, as if mounted before the simulation began. Like the kernel,
+        it lists the real path, with a space, tab, newline or backslash written as an octal escape.
+        """
+        mounted = [name for (name, prop), value in self.props.items() if prop == "mounted" and value == "yes"]
+        mounted.sort(key=lambda name: self.mount_order.index(name) if name in self.mount_order else -1)
+        lines = []
+        for number, name in enumerate(mounted, 100):
+            point = self.props.get((name, "mountpoint"), "")
+            if point.startswith("/"):
+                path = os.fsencode(os.path.realpath(point))
+                escaped = re.sub(rb"[ \t\n\\]", lambda m: b"\\%03o" % m[0][0], path)
+                lines.append(b"%d 1 0:%d / %s rw - zfs %s rw\n" % (number, number, escaped, name.encode()))
+        return b"".join(lines)
 
     def ops(self) -> list[tuple[str, ...]]:
         """Return the ordered log of commands that matter for safety: writes, streams, syncs, written@ reads."""
@@ -160,11 +181,8 @@ class ZfsSim:
                 self.snapshot(f"{d}@{name.split('@')[1]}")
             return ok()
         if verb == "unmount":
-            if args[-1] in self.busy:
-                return fail(f"cannot unmount '{args[-1]}': pool or dataset is busy\n")
-            self.prop(args[-1], "mounted", "no")
-            self.noatime.discard(args[-1])
-        elif verb == "mount":
+            return self._unmount(args[-1])
+        if verb == "mount":
             self._mount(args)
         elif verb == "load-key":
             if "-n" in args:
@@ -201,8 +219,20 @@ class ZfsSim:
         names = [d for d in self._under(root) if d not in self.volumes and (d, prop) in self.props]
         return ok("".join(f"{d}\t{self.props[d, prop]}\n" for d in names))
 
+    def _unmount(self, name: str) -> CommandResult:
+        if name in self.busy:
+            return fail(f"cannot unmount '{name}': pool or dataset is busy\n")
+        self.prop(name, "mounted", "no")
+        self.noatime.discard(name)
+        if name in self.mount_order:
+            self.mount_order.remove(name)
+        return ok()
+
     def _mount(self, args: Sequence[str]) -> None:
         self.prop(args[-1], "mounted", "yes")
+        if args[-1] in self.mount_order:
+            self.mount_order.remove(args[-1])
+        self.mount_order.append(args[-1])
         if "noatime" in args:
             self.noatime.add(args[-1])
         # Only an explicitly set mountpoint: the DEFAULTS one is a placeholder, never a real path.

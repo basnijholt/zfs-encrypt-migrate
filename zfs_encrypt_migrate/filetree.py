@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .constants import SCRATCH
@@ -13,7 +15,6 @@ from .errors import MigrationError
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
-    from pathlib import Path
 
 _BLOCK = 512
 
@@ -212,6 +213,37 @@ def mount_device(path: Path) -> int | None:
     except FileNotFoundError:
         return None
     return st.st_dev if st.st_dev != path.parent.stat().st_dev else None
+
+
+MOUNTINFO = Path("/proc/self/mountinfo")
+# mountinfo writes a space, tab, newline or backslash in a field as a backslash and three octal digits.
+_ESCAPE = re.compile(rb"\\([0-7]{3})")
+
+
+def read_mountinfo() -> bytes:
+    """Return the kernel's list of the mounts this process sees."""
+    return MOUNTINFO.read_bytes()
+
+
+def _field(raw: bytes) -> str:
+    return os.fsdecode(_ESCAPE.sub(lambda match: bytes([int(match[1], 8)]), raw))
+
+
+def mounted_at(path: Path) -> tuple[str, str] | None:
+    """Return the source and type of the filesystem mounted at ``path``; None when ``path`` is no mount point.
+
+    mount resolves symlinks, so the kernel lists the real path. Of several mounts on one path, the one listed
+    last covers the others.
+    """
+    target = os.path.realpath(path)
+    found = None
+    for line in read_mountinfo().splitlines():
+        # ID, parent ID, device, root, mount point, options, optional fields, "-", type, source, options.
+        fields = line.split(b" ")
+        if _field(fields[4]) == target:
+            separator = fields.index(b"-", 6)
+            found = (_field(fields[separator + 2]), _field(fields[separator + 1]))
+    return found
 
 
 def temp_dir(dst: Path) -> Path:

@@ -108,7 +108,7 @@ class FileMoveEnv:
 def filemove_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FileMoveEnv:
     """Build the file-move environment; rsync commands run for real, zfs commands go to the sim."""
     # Imported here: helpers and zfs_sim import this module.
-    from zfs_encrypt_migrate import filemove  # noqa: PLC0415
+    from zfs_encrypt_migrate import filemove, filetree  # noqa: PLC0415
 
     from .helpers import make  # noqa: PLC0415
     from .zfs_sim import ZfsSim  # noqa: PLC0415
@@ -140,5 +140,7 @@ def filemove_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FileMoveEnv
         return path.stat().st_dev if mounted and path.is_dir() else None
 
     monkeypatch.setattr(filemove, "mount_device", mount_device)
+    # What the kernel would list: each dataset the simulator has mounted, at its mountpoint.
+    monkeypatch.setattr(filetree, "read_mountinfo", sim.mountinfo)
     zfs, runner = make(sim, responder)
     return FileMoveEnv(sim, zfs, runner, src, tmp_path / "run")

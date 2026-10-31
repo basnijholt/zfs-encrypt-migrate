@@ -27,6 +27,7 @@ from .filetree import (
     delete,
     group_by_inode,
     mount_device,
+    mounted_at,
     plan_batches,
     remove_partials,
     remove_scratch,
@@ -238,11 +239,24 @@ def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
     return source
 
 
-def probe_writers(zfs: Zfs, dataset: str) -> dict[str, Prop]:
+def _refuse_mounted_elsewhere(path: Path, dataset: str) -> None:
+    """Refuse unless ``dataset`` itself is the zfs filesystem mounted at ``path``.
+
+    zfs get strips the spaces around a mountpoint value, so the path it gives can be another directory.
+    """
+    found = mounted_at(path)
+    if found != (dataset, "zfs"):
+        there = f"{found[0]} of type {found[1]} is mounted there" if found else ""
+        msg = f"{path} is not where {dataset} is mounted ({there or 'nothing is mounted there'})"
+        raise MigrationError(msg)
+
+
+def probe_writers(zfs: Zfs, dataset: str, path: Path) -> dict[str, Prop]:
     """Unmount the source and mount it again with noatime: a busy dataset means a writer is still running.
 
     Return the source's properties, read while it is unmounted: once mounted with noatime, zfs reports
-    atime as a temporary value and hides the dataset's own.
+    atime as a temporary value and hides the dataset's own. Refuse unless the dataset is then what is
+    mounted at ``path``, the mountpoint file-move works on.
     """
     if not zfs.unmount(dataset):
         msg = f"cannot unmount {dataset}; a writer is probably still running"
@@ -263,6 +277,7 @@ def probe_writers(zfs: Zfs, dataset: str) -> dict[str, Prop]:
     except Exception as exc:
         msg = f"{type(exc).__name__}: {exc}"
         raise MigrationError(msg, [hint]) from exc
+    _refuse_mounted_elsewhere(path, dataset)
     return props
 
 
@@ -276,7 +291,8 @@ def open_staged(  # noqa: PLR0917
 ) -> tuple[Path, int]:
     """Create the encrypted staged dataset on the first run; load its key and mount it.
 
-    Return its mountpoint and the device of the mounted dataset, which every later copy must be on.
+    Refuse unless it is then the filesystem mounted at its mountpoint. Return that mountpoint and the device of
+    the mounted dataset, which every later copy must be on.
     """
     leaf = leaf_of(dataset)
     staged = f"{settings.stage}/{leaf}"
@@ -304,6 +320,7 @@ def open_staged(  # noqa: PLR0917
     if device is None:
         msg = f"{staged} is not mounted at {path}"
         raise MigrationError(msg)
+    _refuse_mounted_elsewhere(path, staged)
     return path, device
 
 
@@ -534,7 +551,7 @@ def finish(  # noqa: PLR0917
     refuse_stale(zfs, FINAL_SNAPSHOT, [dataset], recursive=False)
     # Unmounting finishes what the last batch's deletes left pending and the sync commits it, so it does not
     # count in written@enc-final; a busy source means a writer came back.
-    probe_writers(zfs, dataset)
+    probe_writers(zfs, dataset, src)
     zfs.pool_sync(pool_of(dataset))
     # Taken before the last scan, so written@ catches a writer between that scan and the unmount.
     zfs.snapshot(f"{dataset}@{FINAL_SNAPSHOT}", recursive=False)
@@ -618,7 +635,7 @@ def file_move(
     staged = f"{settings.stage}/{leaf_of(dataset)}"
     with run_lock(lock_path):
         src = preflight_file_move(zfs, settings, dataset)
-        source_props = probe_writers(zfs, dataset)
+        source_props = probe_writers(zfs, dataset, src)
         with abort_guard(zfs, settings, staged, label="file-move") as guard:
             guard.notes = [
                 f"file-move stopped; the files are split between {dataset} and {staged}; do not destroy either.",

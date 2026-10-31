@@ -354,15 +354,57 @@ def test_probe_writers_busy_refuses(filemove_env: FileMoveEnv) -> None:
     """Probe writers busy refuses."""
     filemove_env.sim.busy.add(DATASET)
     with pytest.raises(MigrationError) as info:
-        probe_writers(filemove_env.zfs, DATASET)
+        probe_writers(filemove_env.zfs, DATASET, filemove_env.src)
     assert info.value.message == f"cannot unmount {DATASET}; a writer is probably still running"
     assert [op for op in filemove_env.sim.ops() if op[1] == "mount"] == []
 
 
 def test_probe_writers_remounts_without_atime(filemove_env: FileMoveEnv) -> None:
     """The remount skips atime updates, so reading the source after enc-final never writes to it."""
-    probe_writers(filemove_env.zfs, DATASET)
+    probe_writers(filemove_env.zfs, DATASET, filemove_env.src)
     assert filemove_env.sim.ops() == [("zfs", "unmount", DATASET), ("zfs", "mount", "-o", "noatime", DATASET)]
+
+
+def mounted_there(monkeypatch: pytest.MonkeyPatch, path: Path, source: str) -> None:
+    """Make /proc/self/mountinfo show ``source`` as the zfs filesystem mounted at ``path``."""
+    line = f"36 22 0:44 / {os.path.realpath(path)} rw,relatime shared:20 - zfs {source} rw\n"
+    monkeypatch.setattr(filetree, "read_mountinfo", line.encode)
+
+
+def test_probe_writers_refuses_another_filesystem_at_the_path(
+    filemove_env: FileMoveEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The path file-move works on must show the dataset itself, not whatever else is mounted there."""
+    env = filemove_env
+    mounted_there(monkeypatch, env.src, "tank/other")
+    with pytest.raises(MigrationError) as info:
+        probe_writers(env.zfs, DATASET, env.src)
+    assert (
+        info.value.message == f"{env.src} is not where {DATASET} is mounted (tank/other of type zfs is mounted there)"
+    )
+    assert info.value.hints == ()
+
+
+@needs_rsync
+def test_file_move_refuses_a_mountpoint_zfs_get_strips(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """A trailing space in a mountpoint is stripped by zfs get, so the path it gives is another directory.
+
+    Moving files out of that directory would move someone else's files; nothing is created or deleted.
+    """
+    env = filemove_env
+    env.sim.prop(DATASET, "mountpoint", f"{env.src} ")
+    before = source_files(env)
+    with pytest.raises(MigrationError) as info:
+        run_file_move(env, settings, tmp_path)
+    assert info.value.message == f"{env.src} is not where {DATASET} is mounted (nothing is mounted there)"
+    assert source_files(env) == before
+    assert STAGED not in env.sim.datasets
+    assert not [call for call in env.runner.calls if call[0] == "rsync"]
 
 
 REMOUNT_HINT = f"remount it with: zfs mount {DATASET}"
@@ -372,7 +414,7 @@ def test_probe_writers_failed_mount_hints(filemove_env: FileMoveEnv) -> None:
     """A failed remount keeps its zfs error and says how to remount."""
     zfs, _ = make(filemove_env.sim, fail_on("zfs", "mount"))
     with pytest.raises(ZfsError) as info:
-        probe_writers(zfs, DATASET)
+        probe_writers(zfs, DATASET, filemove_env.src)
     assert info.value.message == f"zfs mount -o noatime {DATASET} failed: injected"
     assert info.value.hints == (REMOUNT_HINT,)
 
@@ -387,7 +429,7 @@ def test_probe_writers_interrupt_before_remount_hints(filemove_env: FileMoveEnv)
 
     zfs, _ = make(filemove_env.sim, interrupt_mount)
     with pytest.raises(Interrupted) as info:
-        probe_writers(zfs, DATASET)
+        probe_writers(zfs, DATASET, filemove_env.src)
     assert info.value.message == "interrupted"
     assert info.value.hints == (REMOUNT_HINT,)
 
@@ -403,7 +445,7 @@ def test_probe_writers_unexpected_error_before_remount_hints(filemove_env: FileM
 
     zfs, _ = make(filemove_env.sim, broken_read)
     with pytest.raises(MigrationError) as info:
-        probe_writers(zfs, DATASET)
+        probe_writers(zfs, DATASET, filemove_env.src)
     assert info.value.message == "OSError: boom"
     assert info.value.hints == (REMOUNT_HINT,)
 
@@ -446,6 +488,22 @@ def test_open_staged_refuses_a_mountpoint_nothing_is_mounted_on(
     with pytest.raises(MigrationError) as info:
         open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard_for(env, settings))
     assert info.value.message == f"{STAGED} is not mounted at {env.mount_root / 'media'}"
+
+
+def test_open_staged_refuses_another_filesystem_at_its_mountpoint(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mount point that shows another dataset is no place for the copies, whatever its device says."""
+    env = filemove_env
+    path = env.mount_root / "media"
+    mounted_there(monkeypatch, path, "tank/stage/other")
+    with pytest.raises(MigrationError) as info:
+        open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard_for(env, settings))
+    assert (
+        info.value.message == f"{path} is not where {STAGED} is mounted (tank/stage/other of type zfs is mounted there)"
+    )
 
 
 @needs_rsync

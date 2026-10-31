@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from zfs_encrypt_migrate import filetree
 from zfs_encrypt_migrate.constants import SCRATCH
 from zfs_encrypt_migrate.errors import MigrationError
 from zfs_encrypt_migrate.filetree import (
@@ -18,6 +19,7 @@ from zfs_encrypt_migrate.filetree import (
     delete,
     group_by_inode,
     mount_device,
+    mounted_at,
     plan_batches,
     remove_scratch,
     scan,
@@ -232,6 +234,74 @@ def test_mount_device_needs_a_mount_point(tmp_path: Path) -> None:
     proc = Path("/proc")
     if os.path.ismount(proc):
         assert mount_device(proc) == proc.stat().st_dev
+
+
+def mountinfo(monkeypatch: pytest.MonkeyPatch, *lines: str) -> None:
+    """Make the given lines what /proc/self/mountinfo reads."""
+    monkeypatch.setattr(filetree, "read_mountinfo", lambda: os.fsencode("".join(f"{line}\n" for line in lines)))
+
+
+def test_mounted_at_gives_source_and_type(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The mount source and filesystem type of the line whose mount point is the path, any optional fields."""
+    root = Path(os.path.realpath(tmp_path))
+    mountinfo(
+        monkeypatch,
+        "22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw",
+        f"36 22 0:44 / {root}/media rw,noatime shared:20 master:3 - zfs tank/media rw,xattr,noacl",
+        f"37 22 0:45 / {root}/music rw - zfs tank/music rw",
+    )
+    assert mounted_at(root / "media") == ("tank/media", "zfs")
+    assert mounted_at(root / "music") == ("tank/music", "zfs")
+    assert mounted_at(Path("/")) == ("/dev/sda1", "ext4")
+
+
+def test_mounted_at_is_none_without_a_mount_line(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A path that is no mount point, or a directory inside one, has no line of its own."""
+    root = Path(os.path.realpath(tmp_path))
+    mountinfo(monkeypatch, f"36 22 0:44 / {root}/media rw shared:20 - zfs tank/media rw")
+    assert mounted_at(root / "other") is None
+    assert mounted_at(root / "media" / "sub") is None
+
+
+def test_mounted_at_decodes_escaped_spaces(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    r"""The kernel writes a space in a mount point as \040, so a trailing space zfs get strips is seen."""
+    root = Path(os.path.realpath(tmp_path))
+    mountinfo(
+        monkeypatch,
+        rf"36 22 0:44 / {root}/my\040media rw shared:20 - zfs tank/media rw",
+        rf"37 22 0:45 / {root}/music\040 rw shared:21 - zfs tank/music rw",
+        rf"38 22 0:46 / {root}/tab\011back\134slash rw shared:22 - zfs tank/odd rw",
+    )
+    assert mounted_at(root / "my media") == ("tank/media", "zfs")
+    assert mounted_at(root / "music") is None
+    assert mounted_at(root / "music ") == ("tank/music", "zfs")
+    assert mounted_at(root / "tab\tback\\slash") == ("tank/odd", "zfs")
+
+
+def test_mounted_at_gives_the_mount_on_top(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Of two mounts on one path, the later one covers the earlier; mountinfo lists it after."""
+    root = Path(os.path.realpath(tmp_path))
+    mountinfo(
+        monkeypatch,
+        f"36 22 0:44 / {root}/media rw shared:20 - zfs tank/media rw",
+        f"40 36 0:50 / {root}/media rw shared:30 - tmpfs tmpfs rw",
+    )
+    assert mounted_at(root / "media") == ("tmpfs", "tmpfs")
+
+
+def test_mounted_at_follows_symlinks_like_the_kernel(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The kernel resolves symlinks in a mount's target, so mountinfo lists the real path."""
+    root = Path(os.path.realpath(tmp_path))
+    (root / "real").mkdir()
+    (root / "link").symlink_to("real")
+    mountinfo(monkeypatch, f"36 22 0:44 / {root}/real/media rw shared:20 - zfs tank/media rw")
+    assert mounted_at(root / "link" / "media") == ("tank/media", "zfs")
+
+
+@pytest.mark.skipif(not Path("/proc/self/mountinfo").exists(), reason="no /proc/self/mountinfo")
+def test_mounted_at_reads_this_host() -> None:
+    """The root directory is a mount point on every Linux host."""
+    assert mounted_at(Path("/")) is not None
 
 
 def test_verify_type_mismatch_raises(tmp_path: Path) -> None:

@@ -245,6 +245,7 @@ Then:
 
 **What the tool checks.**
 Before the first file moves, it refuses a dataset that is read-only, not mounted, has a mountpoint of `none` or `legacy`, or has an entry named `.zfs-encrypt-migrate` at its root, and it refuses while another migration is in flight under the stage or another `file-move` runs.
+It works only on a path that `/proc/self/mountinfo` lists as the dataset's own mount point, for the dataset and for the encrypted copy: a mountpoint ending in a space, which `zfs get` strips, would otherwise point it at another directory.
 It also refuses everything in the **Not supported** list above that it can detect, since the move would otherwise stall half-way.
 Before each batch it checks that the encrypted dataset is still mounted at its private mountpoint, and it accepts only copies that are on that dataset: after an unmount (`zfs umount -a`, say) the mountpoint is a bare directory, and copies there would vanish.
 For each batch, rsync copies the files with hard links, ACLs, xattrs and sparseness, and the tool then compares every name against its copy: type, mode, owner and group, size and mtime for regular files, the target for symlinks, and one shared inode for all names of a hard-linked file.
