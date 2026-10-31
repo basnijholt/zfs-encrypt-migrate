@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .conftest import fail, ok
@@ -43,6 +44,8 @@ class ZfsSim:
         self.datasets = set(datasets)
         self.snapshots: dict[str, str] = {}
         self.props: dict[tuple[str, str], str] = {}
+        # (dataset, property) -> (value, origin dataset), read with source "inherited from <origin>".
+        self.inherited: dict[tuple[str, str], tuple[str, str]] = {}
         self.avail = avail
         self.busy: set[str] = set()
         self.volumes: set[str] = set()
@@ -73,6 +76,16 @@ class ZfsSim:
             return "volume" if name in self.volumes else "filesystem"
         return self.props.get((name, prop), DEFAULTS.get(prop, "0"))
 
+    def _get_all(self, name: str) -> str:
+        """Answer ``zfs get -H -p -o property,value,source all``: local, inherited, then default properties."""
+        rows = {prop: (value, "local") for (n, prop), value in self.props.items() if n == name}
+        for (n, prop), (value, origin) in self.inherited.items():
+            if n == name and prop not in rows:
+                rows[prop] = (value, f"inherited from {origin}")
+        for prop, value in DEFAULTS.items():
+            rows.setdefault(prop, (value, "default"))
+        return "".join(f"{prop}\t{value}\t{source}\n" for prop, (value, source) in rows.items())
+
     def ops(self) -> list[tuple[str, ...]]:
         """Return the ordered log of commands that matter for safety: writes, streams, syncs, written@ reads."""
         return [
@@ -92,6 +105,9 @@ class ZfsSim:
             return ok()
         if verb == "list" and "avail" in args:
             return ok(f"{self.avail}\n")
+        if verb == "list" and "snapshot" in args:
+            prefix = f"{args[-1]}@"
+            return ok("".join(f"{s}\n" for s in sorted(self.snapshots) if s.startswith(prefix)))
         if verb == "list" and args[2] != "-rH":
             name = args[-1]
             if name in self.datasets or name in self.snapshots:
@@ -105,6 +121,8 @@ class ZfsSim:
             if "name,type" in args:
                 return ok("".join(f"{d}\t{'volume' if d in self.volumes else 'filesystem'}\n" for d in names))
             return ok("".join(f"{d}\n" for d in names))
+        if verb == "get" and args[-2] == "all":
+            return ok(self._get_all(args[-1]))
         if verb == "get":
             if (
                 args[-2].startswith("written@")
@@ -124,7 +142,13 @@ class ZfsSim:
             self.prop(args[-1], "mounted", "no")
         elif verb == "mount":
             self.prop(args[-1], "mounted", "yes")
+            # Only an explicitly set mountpoint: the DEFAULTS one is a placeholder, never a real path.
+            mountpoint = self.props.get((args[-1], "mountpoint"), "")
+            if mountpoint.startswith("/"):
+                Path(mountpoint).mkdir(parents=True, exist_ok=True)
         elif verb == "load-key":
+            if "-n" in args:
+                return ok()
             self.prop(args[-1], "keystatus", "available")
         elif verb == "unload-key":
             for d in self._under(args[-1]):
@@ -136,8 +160,10 @@ class ZfsSim:
             return self._send(args)
         elif verb == "recv":
             return self._recv(args)
+        elif verb == "inherit":
+            self.props.pop((args[-1], args[-2]), None)
         elif verb == "create":
-            self.datasets.add(args[-1])
+            self._create(args)
         elif verb == "rename":
             old, new = args[-2:]
             self.datasets = {self._renamed(d, old, new) for d in self.datasets}
@@ -149,6 +175,13 @@ class ZfsSim:
                 for name, guid in self.snapshots.items()
             }
         return ok()
+
+    def _create(self, args: Sequence[str]) -> None:
+        self.datasets.add(args[-1])
+        for index, arg in enumerate(args):
+            if arg == "-o":
+                prop, value = args[index + 1].split("=", 1)
+                self.prop(args[-1], prop, value)
 
     def _locked(self, name: str) -> bool:
         return self._get("encryption", name) != "off" and self._get("keystatus", name) != "available"

@@ -3,18 +3,19 @@
 from __future__ import annotations
 
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 
 import typer
 
 from .constants import COMMAND_STARTUP_ERROR_RETURNCODE, DATASET_NAME_RE
 from .errors import ZfsError
+from .process import CommandResult
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
-    from .process import CommandResult, CommandRunner
+    from .process import CommandRunner
 
 # A freshly received volume is held open by udev for a moment, which makes unload-key report "busy".
 _UNLOAD_ATTEMPTS = 20
@@ -41,6 +42,14 @@ def validate_child(name: str) -> str:
         msg = f"invalid child name {name!r}: give the name of a direct child, without /"
         raise typer.BadParameter(msg)
     return name
+
+
+@dataclass(frozen=True)
+class Prop:
+    """A property value and where it comes from (local, default, inherited from ...)."""
+
+    value: str
+    source: str
 
 
 class Zfs:
@@ -75,6 +84,17 @@ class Zfs:
     def get(self, prop: str, name: str) -> str:
         """Read one property as a parsable value."""
         return self._run(["zfs", "get", "-H", "-p", "-o", "value", prop, name]).stdout.strip()
+
+    def props(self, name: str) -> dict[str, Prop]:
+        """Read every property, user properties included, with its source."""
+        result = self._run(["zfs", "get", "-H", "-p", "-o", "property,value,source", "all", name])
+        rows = (line.split("\t") for line in result.stdout.splitlines() if line)
+        return {row[0]: Prop(row[1], row[2]) for row in rows}
+
+    def snapshots(self, name: str) -> list[str]:
+        """List the dataset's own snapshots by full name."""
+        result = self._run(["zfs", "list", "-H", "-t", "snapshot", "-o", "name", "-d", "1", name])
+        return result.stdout.split()
 
     def subtree(self, name: str) -> list[str]:
         """List a dataset and its descendants, parents first."""
@@ -146,6 +166,19 @@ class Zfs:
     def load_key(self, name: str) -> None:
         """Load the encryption key using the dataset's keylocation."""
         self._run(["zfs", "load-key", name])
+
+    def check_key(self, name: str, location: str, *, attached: bool) -> bool:
+        """Return whether the key at ``location`` unlocks the dataset, without loading it."""
+        args = ["zfs", "load-key", "-n", "-L", location, name]
+        if attached:
+            returncode = self.runner.run_attached(args)
+            result = None
+        else:
+            result = self.runner.run(args)
+            returncode = result.returncode
+        if returncode == COMMAND_STARTUP_ERROR_RETURNCODE:
+            raise ZfsError(result or CommandResult(returncode, "", "could not start zfs\n"), args)
+        return returncode == 0
 
     def unload_key(self, name: str) -> None:
         """Unload the key of a dataset and its descendants."""

@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 _MAX_PIPELINE_SECONDS = 10
+_EXIT_CODE = 3
 
 
 def test_run_captures_output_and_returncode() -> None:
@@ -115,3 +116,13 @@ def test_children_see_c_locale() -> None:
     assert first.returncode == 0
     assert second.stdout == "C"
     assert runner.pipeline(["true"], script)[1].stdout == "C"
+
+
+def test_run_attached_returns_exit_code() -> None:
+    """An attached command reports only its exit status."""
+    assert SubprocessRunner().run_attached(["sh", "-c", "exit 3"]) == _EXIT_CODE
+
+
+def test_run_attached_missing_binary_returns_sentinel() -> None:
+    """A binary that cannot start returns the startup sentinel."""
+    assert SubprocessRunner().run_attached(["/nonexistent/binary"]) == COMMAND_STARTUP_ERROR_RETURNCODE

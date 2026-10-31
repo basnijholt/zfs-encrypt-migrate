@@ -40,6 +40,7 @@ class FakeRunner:
         self.responder = responder or (lambda _args: OK)
         self.queue: deque[CommandResult] = deque(queue)
         self.calls: list[tuple[str, ...]] = []
+        self.attached: list[tuple[str, ...]] = []
         self.pipelines: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
 
     def _answer(self, args: Sequence[str]) -> CommandResult:
@@ -49,6 +50,11 @@ class FakeRunner:
         """Record the command and return the next answer."""
         self.calls.append(tuple(args))
         return self._answer(args)
+
+    def run_attached(self, args: Sequence[str]) -> int:
+        """Record the command and return the exit code of the next answer."""
+        self.attached.append(tuple(args))
+        return self._answer(args).returncode
 
     def pipeline(self, first: Sequence[str], second: Sequence[str]) -> tuple[CommandResult, CommandResult]:
         """Record both commands and answer each in order."""

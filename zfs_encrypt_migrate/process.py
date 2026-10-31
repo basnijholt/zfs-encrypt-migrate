@@ -40,6 +40,9 @@ class CommandRunner(Protocol):
     def run(self, args: Sequence[str]) -> CommandResult:
         """Run a command and return its result."""
 
+    def run_attached(self, args: Sequence[str]) -> int:
+        """Run a command on the caller's stdin, stdout and stderr and return its exit code."""
+
     def pipeline(self, first: Sequence[str], second: Sequence[str]) -> tuple[CommandResult, CommandResult]:
         """Run ``first | second`` and return both results."""
 
@@ -86,6 +89,19 @@ class SubprocessRunner:
         except OSError as exc:
             return _startup_failure(exc)
         return CommandResult(returncode=result.returncode, stdout=result.stdout, stderr=result.stderr)
+
+    def run_attached(self, args: Sequence[str]) -> int:
+        """Run a command on the caller's terminal, e.g. for a passphrase prompt, and return its exit code."""
+        try:
+            process = subprocess.Popen(list(args), env=_child_env())
+        except OSError:
+            return COMMAND_STARTUP_ERROR_RETURNCODE
+        try:
+            return process.wait()
+        except BaseException:
+            # Includes KeyboardInterrupt: never leave the child running.
+            _terminate(process)
+            raise
 
     def pipeline(self, first: Sequence[str], second: Sequence[str]) -> tuple[CommandResult, CommandResult]:
         """Run ``first | second``, capturing stderr of both and stdout of the second."""
