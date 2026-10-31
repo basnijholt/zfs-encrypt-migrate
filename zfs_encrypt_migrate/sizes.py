@@ -16,3 +16,15 @@ def parse_size(text: str) -> int:
         raise ValueError(msg)
     unit = match["unit"]
     return int(match["number"]) * (_UNITS[unit.upper()] if unit else 1)
+
+
+def format_size(size: int) -> str:
+    """Format bytes in binary units: whole bytes, else one decimal and a K/M/G/T/P suffix."""
+    if size < 1024:  # noqa: PLR2004
+        return f"{size}B"
+    value = float(size)
+    for unit in "KMGTP":
+        value /= 1024
+        if value < 1024 or unit == "P":  # noqa: PLR2004
+            return f"{value:.1f}{unit}"
+    raise AssertionError  # pragma: no cover

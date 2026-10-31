@@ -28,7 +28,8 @@ By hand, that means juggling free space, a final catch-up while writers are stop
 1. Pick a stage on the same pool, such as `tank/stage`.
 2. `seed` each dataset into an encrypted copy under the stage, with its snapshots and properties.
 3. Stop the writers and `cutover`: the encrypted copy takes the dataset's name, and the original waits read-only under `tank/stage/old` until you delete it.
-4. Run `audit`, by hand or on a timer, to confirm nothing unencrypted is left.
+4. For a dataset bigger than the free space, `file-move` moves its files in verified batches instead; see the [guide](guides.md#datasets-bigger-than-the-free-space).
+5. Run `audit`, by hand or on a timer, to confirm nothing unencrypted is left.
 
 ```mermaid
 flowchart LR

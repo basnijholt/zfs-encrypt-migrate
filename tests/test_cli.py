@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import threading
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -12,6 +14,7 @@ from typer.testing import CliRunner
 
 from zfs_encrypt_migrate import cli
 from zfs_encrypt_migrate.constants import COMMAND_STARTUP_ERROR_RETURNCODE
+from zfs_encrypt_migrate.filemove import probe_writers
 from zfs_encrypt_migrate.process import SubprocessRunner
 
 from .conftest import FakeRunner, fail, ok
@@ -19,11 +22,18 @@ from .zfs_sim import ZfsSim, staged_ready
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
-    from pathlib import Path
 
     from zfs_encrypt_migrate.process import CommandResult
+    from zfs_encrypt_migrate.zfs import Zfs
 
 runner = CliRunner()
+# Rich styles the help whenever it believes it writes to a terminal, as it does on GitHub Actions.
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def plain(text: str) -> str:
+    """Return the text without its color and style codes."""
+    return ANSI.sub("", text)
 
 
 @pytest.fixture
@@ -497,3 +507,93 @@ def test_tree_commands_are_in_their_own_help_panel() -> None:
     assert "Tree Commands" in result.output
     for name in ("tree-seed", "tree-move", "tree-finish"):
         assert name in result.output
+
+
+# --- file-move ---
+
+
+def test_file_move_help_lists_options() -> None:
+    """The help names the batch size, its env var and the delete confirmation."""
+    result = runner.invoke(cli.app, ["file-move", "--help"], env={"COLUMNS": "200"})
+    listing = runner.invoke(cli.app, ["--help"])
+
+    assert result.exit_code == 0
+    for text in ("--batch-size", "--delete-source", "Target size of each batch"):
+        assert text in plain(result.output)
+    assert "File-Move Commands" in plain(listing.output)
+
+
+def test_file_move_without_delete_source_exits_1(sim: ZfsSim) -> None:
+    """Without --delete-source the command refuses on stderr before any zfs call."""
+    result = runner.invoke(cli.app, ["file-move", "tank/data"])
+
+    assert result.exit_code == 1
+    assert "pass --delete-source to confirm" in result.stderr
+    assert sim.runner.calls == []  # type: ignore[attr-defined]
+
+
+@pytest.mark.usefixtures("sim")
+def test_file_move_batch_size_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The env var sets the batch size; the default is 100G."""
+    seen: list[tuple[int, bool]] = []
+
+    def record(_zfs: object, _settings: object, _dataset: str, *, batch_size: int, delete_source: bool) -> list[str]:
+        seen.append((batch_size, delete_source))
+        return []
+
+    monkeypatch.setattr(cli, "file_move", record)
+
+    assert runner.invoke(cli.app, ["file-move", "tank/data", "--delete-source"]).exit_code == 0
+    monkeypatch.setenv("ZFS_ENCRYPT_MIGRATE_BATCH_SIZE", "2K")
+    assert runner.invoke(cli.app, ["file-move", "tank/data", "--delete-source"]).exit_code == 0
+
+    assert seen == [(100 * 1024**3, True), (2048, True)]
+
+
+@pytest.mark.parametrize("value", ["0", "0G", "junk"])
+def test_file_move_rejects_bad_batch_size(sim: ZfsSim, value: str) -> None:
+    """A zero or unparsable batch size is a usage error before zfs."""
+    result = runner.invoke(cli.app, ["file-move", "tank/data", "--delete-source", "--batch-size", value])
+
+    assert result.exit_code == 2  # noqa: PLR2004
+    assert sim.runner.calls == []  # type: ignore[attr-defined]
+
+
+@pytest.mark.usefixtures("sim")
+def test_file_move_rejects_zero_batch_size_message() -> None:
+    """The zero refusal names the rule."""
+    result = runner.invoke(cli.app, ["file-move", "tank/data", "--delete-source", "--batch-size", "0"])
+
+    assert "batch size must be above 0" in result.output.replace("\n", " ")
+
+
+def test_file_move_rejects_bad_dataset_name(sim: ZfsSim) -> None:
+    """A bad dataset name is a usage error before zfs."""
+    result = runner.invoke(cli.app, ["file-move", "tank/da ta", "--delete-source"])
+
+    assert result.exit_code == 2  # noqa: PLR2004
+    assert sim.runner.calls == []  # type: ignore[attr-defined]
+
+
+def test_file_move_interrupt_in_writer_probe_exits_130_with_remount_hint(
+    sim: ZfsSim,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ctrl-C between the writer probe's unmount and remount exits 130 and says how to remount."""
+
+    def interrupt_mount(args: Sequence[str]) -> CommandResult:
+        if tuple(args[:2]) == ("zfs", "mount"):
+            raise KeyboardInterrupt
+        return sim.answer(args)
+
+    def probe_only(zfs: Zfs, _settings: object, dataset: str, **_options: object) -> list[str]:
+        probe_writers(zfs, dataset, Path("/mnt"))
+        return []
+
+    sim.runner.responder = interrupt_mount  # type: ignore[attr-defined]
+    monkeypatch.setattr(cli, "file_move", probe_only)
+
+    result = runner.invoke(cli.app, ["file-move", "tank/data", "--delete-source"])
+
+    assert result.exit_code == 130  # noqa: PLR2004
+    assert "remount it with: zfs mount tank/data" in result.output

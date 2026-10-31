@@ -19,11 +19,12 @@ Bare `zfs-encrypt-migrate` only shows help.
 | `tree-seed DATASET` | Copy only the parent to an encrypted staged dataset; its children move one by one. |
 | `tree-move DATASET CHILD` | Copy one child subtree under the staged parent; the source stays until you destroy it. |
 | `tree-finish DATASET` | Send the parent's last changes and swap the staged tree into place once no children remain. |
+| `file-move DATASET --delete-source` | Move a dataset's files in verified batches into an encrypted dataset, deleting each source file once its copy is verified, then swap it into place. |
 | `audit [--exact NAME]... [--subtree NAME]... POOL...` | List unencrypted datasets outside the allowlists; exit 1 if there are any. |
 
 ## Shared Options
 
-The six migration and tree commands take the same options.
+The seven migration, tree and file-move commands take the same options.
 `audit` takes none of them.
 
 | Option | Environment variable | Default | Description |
@@ -47,6 +48,7 @@ Because staged names use only the leaf, `tank/a/data` and `tank/b/data` both sta
 It must be a regular file with mode `600`; a symlink is followed, and its target must be that file.
 Only `seed` and `tree-seed` read it: they record it on the staged copy as `keylocation=file://<path>`, and later commands load the key from that keylocation.
 Keep the file in place until the swap.
+`file-move` refuses it, and a `--final-keylocation file://PATH`, inside the dataset it moves, by path or through a bind mount.
 It must be an absolute path; a relative one is a usage error, because `zfs` would reject the relative `file://` keylocation only after `seed` had taken its snapshots.
 
 **`--min-free`.**
@@ -262,6 +264,128 @@ tree-finish done; once verified, free the old copy with: zfs destroy -r STAGE/ol
 | `enc-tree-final snapshots of DATASET and STAGE/LEAF differ` | The received copy doesn't match; investigate before retrying. |
 | `written since the final snapshot:` followed by the dataset | Run the two `zfs rename ...@enc-tree-final @enc-tree-final-N` commands it prints, then rerun. |
 
+## File-Move Commands
+
+For one dataset that is bigger than its pool's free space, `file-move` moves the files instead of sending the dataset.
+See the [file-move guide](guides.md#datasets-bigger-than-the-free-space) for a walkthrough and its limits.
+It needs `rsync` 3.1.3 or newer, with ACL and xattr support, on `PATH`.
+
+### file-move
+
+```bash
+zfs-encrypt-migrate file-move tank/media --delete-source
+```
+
+Takes the [shared options](#shared-options) and:
+
+| Option | Environment variable | Default | Description |
+| --- | --- | --- | --- |
+| `--batch-size SIZE` | `ZFS_ENCRYPT_MIGRATE_BATCH_SIZE` | `100G` | Target bytes per batch, in the `--min-free` size syntax. A hard-linked file group bigger than this forms a batch of its own. |
+| `--delete-source` | none | off | Required. Confirms that each source file is deleted once its encrypted copy is verified. |
+
+One run does the whole job, and a rerun after a stop before the swap continues where it left off.
+Stop everything that uses the dataset first, and keep it stopped until the swap.
+Without `--delete-source` it refuses before it touches anything: `file-move deletes each source file once its encrypted copy is verified; pass --delete-source to confirm`.
+
+It runs, in this order:
+
+1. Takes an exclusive lock on `/run/zfs-encrypt-migrate.lock`, so two `file-move` runs never overlap.
+2. Refuses, changing nothing, unless the key file is valid and the dataset is a mounted leaf filesystem, not a pool root, volume or already encrypted dataset, writable, with a real mountpoint, on the stage's pool and outside the stage, with nothing named `.zfs-encrypt-migrate` at its root, and nothing else in flight under the stage. Before it reads anything at the mountpoint, it refuses unless `/proc/self/mountinfo` lists the dataset itself, of type `zfs`, as mounted there: `zfs get` strips the spaces around a mountpoint, so the path it gives could be another directory, or none. It refuses a key file inside the dataset's mountpoint, symlinks followed, or on the dataset's device, which a path elsewhere reaches through a bind mount: the `--key-file`, or the file of a `--final-keylocation file://PATH` once it exists, which a batch would move into the dataset that needs it to unlock. It also refuses whatever would keep deleted files from freeing their space: a `reservation` or `refreservation` on the dataset, a `reservation` on a parent that does not also hold the stage, a dataset that is a clone, a checkpoint on the pool, or, while files are left to move, a snapshot of the dataset. It refuses a pool imported with an `altroot` (`zpool import -R`), which `zfs get` adds to every mountpoint, so the swap would store it in the new dataset's mountpoint. On the first run only (before the staged dataset exists) it also refuses while a dataset under another stage already holds a file-move of this dataset (it carries `zfs-encrypt-migrate:file-move=DATASET`), and refuses a dataset with `dedup` other than `off` and a pool with deduplicated blocks (a dedup table, `dedup_table_size` above 0; before OpenZFS 2.3, a `dedupratio` above 1.00x): deleting a deduplicated file frees nothing while another reference to its blocks remains.
+3. Unmounts the dataset, which fails while a writer has it open, and mounts it again with `-o noatime`, so the tool's own reads never write access times. Then it checks the mount in `/proc/self/mountinfo` again, as in step 2.
+4. On the first run, creates `STAGE/LEAF` with `aes-256-gcm`, `canmount=noauto`, a private mountpoint under `/run/zfs-encrypt-migrate/` and the source's properties (`mountpoint`, `canmount`, `sharenfs`, `sharesmb`, `reservation` and `refreservation` wait until the swap). Every run loads its key and mounts it. It refuses unless the dataset is then the filesystem mounted at that mountpoint, by its device and by `/proc/self/mountinfo`.
+5. Copies the directory tree, twice: into the staged root, and into a pristine copy of the original directory attributes under `.zfs-encrypt-migrate/dirs` there.
+6. Before the first deletion, checks the final key: with `--final-keylocation prompt` it needs a terminal and runs `zfs load-key -n -L prompt STAGE/LEAF`; with another location it runs `zfs load-key -n -L LOCATION STAGE/LEAF`. The staged dataset records which location passed, so a rerun with another `--final-keylocation` checks again.
+7. Removes the partial files that an rsync stopped by a power loss or SIGKILL left in `.zfs-encrypt-migrate/tmp` of the staged dataset (nothing else there). Then repeats until no files remain. Scans the dataset, refuses if it has a snapshot, groups the names by inode, and cuts batches of at most `--batch-size`, by allocated size; each non-empty regular file counts as at least 4K, because an encrypted dataset cannot embed a tiny file in its block pointer, so its copy takes a whole sector. Once per move, after the first scan and before anything is deleted, it admits the move only if the free space above `--min-free` covers its worst case, and records that on the staged dataset (`zfs-encrypt-migrate:admitted=yes`), so reruns do not check again: the largest batch (`--batch-size`, or all the files when they take less) or, if bigger, the largest file (moving the other files first frees only what their copies take), plus the pool's block-cloned savings `bclonesaved` (a copy of a cloned file takes its full size, while deleting one reference frees nothing), plus, when the dataset's `compression` is now `off`, `logicalreferenced` minus `referenced` (old compressed data is copied uncompressed). For each batch: refuses unless the staged dataset is still the filesystem mounted at its mountpoint (after an unmount that path is a bare directory, and copies there would vanish), waits until the files without a copy yet fit above `--min-free` (`zpool sync`, up to 30 tries, 10 seconds apart; copies an earlier stopped run left need no new space), copies with `rsync -aHAXS --numeric-ids --modify-window=-1` (times compared to the nanosecond, so a copy that is off by less than a second is copied again), verifies every name against its copy (which must be on the staged dataset), runs `zpool sync`, refuses if a snapshot appeared meanwhile, and only then deletes the verified source names. It never uses `rsync --delete` or `--remove-source-files`.
+8. When only directories are left: unmounts the dataset again (refusing while it is busy), mounts it with `-o noatime`, checks the mount as in step 2 and runs `zpool sync`, so the last deletes are settled; then `zfs snapshot DATASET@enc-final`, rescan, rsync the directory attributes (restoring the original directory mtimes), unmount the dataset, `zpool sync`, and refuse if `written@enc-final` is non-zero.
+9. Removes `.zfs-encrypt-migrate` from the staged dataset and unmounts it, then swaps as `cutover` does (rename the original to `STAGE/old/LEAF`, then the staged dataset into place), and sets the source's `mountpoint`, `sharenfs`, `sharesmb`, `reservation`, `refreservation` and `canmount` on the swapped dataset, removes its marker properties and mounts it.
+
+Each batch prints one line:
+
+```text
+batch 7: 1204 files, 99.8G moved, 4.2T left
+```
+
+On success it prints:
+
+```text
+verify the key with: zfs load-key -n DATASET
+remount NFS clients: the new dataset has new file handles
+re-enable snapshot tools for DATASET; replication restarts with a full send
+file-move done; once verified, free the old copy with: zfs destroy -r STAGE/old/LEAF
+```
+
+The verification of a name compares type, mode, owner and group; for regular files size and mtime; for symlinks the target; for device nodes `st_rdev`; and requires all copies of a hard-linked file to share one inode.
+A source file whose `ctime` changed since the scan is skipped for that pass, and a destination mismatch fails the run with nothing of the batch deleted.
+
+On a failure or interrupt, rsync is stopped and the staged dataset is unmounted and its key unloaded.
+Once files have been deleted, by this run or an earlier run of the same move, and until the swap, the hint is `file-move stopped; the files are split between DATASET and STAGE/LEAF; do not destroy either.` followed by `Rerun the same command to continue.`
+Before the first delete every file is still in DATASET, and that note is not printed.
+From the swap on, the [recovery hints](#recovery-hints) of `cutover` apply, followed by the commands that finish the property fix-ups; follow them rather than rerunning.
+A stop between unmounting the dataset and mounting it again in step 3 or step 8 adds `remount it with: zfs mount DATASET`.
+From the final unmount of step 8 on, the hints remount with `zfs mount -a` instead.
+
+| Message | Fix |
+| --- | --- |
+| `another file-move is running (lock PATH)` | Wait for it, or check for a stuck process. |
+| `DATASET is a pool root; file-move is not supported` | Not possible; see [rebuilding a pool encrypted](guides.md#rebuilding-a-whole-pool-encrypted). |
+| `DATASET has child datasets; use the tree commands, or file-move each child` | Use the [tree commands](#tree-commands), or `file-move` a big child on its own. |
+| `DATASET is a volume; file-move moves the files of a filesystem` | Use `seed` and `cutover`. |
+| `DATASET is already encrypted` | Nothing to do, unless DATASET still carries `zfs-encrypt-migrate:*` properties (`zfs get all DATASET`): then a stop between the swap and its final steps left them. Run the recovery commands printed then: they inherit the markers, set `mountpoint` and `canmount`, and mount it. |
+| `DATASET is read-only; file-move must delete its files` | `zfs set readonly=off DATASET`, then rerun. |
+| `DATASET has mountpoint none; file-move needs a mounted path` (or `legacy`) | Give it a real mountpoint. |
+| `DATASET is not mounted` | `zfs mount DATASET`, then rerun. |
+| `PATH exists; file-move needs that name for its own files` | Rename that entry in the dataset. |
+| `key file PATH is inside DATASET, which file-move empties; keep the key outside the dataset` (or `final key file PATH ...`) | Move the key file out of the dataset, for example to `/run`, point `--key-file` (or `--final-keylocation file://PATH`) at it, and rerun. PATH is the path you gave; a symlink counts by its target, and a path outside the dataset counts when it is on the dataset's device (a bind mount of one of its directories). |
+| `DATASET has reservation=BYTES, which keeps deleted space reserved; clear it with: zfs set reservation=none DATASET (set it again on the new dataset after the move)` (or `refreservation`) | Run the printed `zfs set`, then rerun; set the reservation on the new dataset after the swap. |
+| `PARENT has reservation=BYTES, which keeps space freed in DATASET reserved; clear it with: zfs set reservation=none PARENT (set it again after the move)` | Run the printed `zfs set`, then rerun; set the reservation again after the swap. Or use a stage inside PARENT. |
+| `DATASET is a clone of ORIGIN; its origin keeps the space of deleted files; promote it first: zfs promote DATASET` | `zfs promote DATASET`, then rerun. The promote moves the origin's snapshots to DATASET, so the snapshot refusal follows until they are destroyed, which needs the former origin dataset gone first. |
+| `pool POOL has a checkpoint, which keeps deleted space allocated; discard it first: zpool checkpoint -d POOL` | `zpool checkpoint -d POOL`, then rerun. |
+| `pool POOL is imported with altroot=PATH; file-move needs a normal import` | Not supported: export the pool and import it without `-R` (`zpool export POOL`, then `zpool import POOL`), then rerun. |
+| `DATASET has dedup=VALUE; deleting deduplicated files frees no space, so file-move cannot run; see the docs` | Not supported: see [what file-move does not support](#what-file-move-does-not-support). |
+| `pool POOL has a dedup table (SIZE); deduplicated blocks shared with DATASET would not be freed, so file-move cannot run; see the docs` | Not supported: see [what file-move does not support](#what-file-move-does-not-support). |
+| `pool POOL has dedupratio RATIOx; deduplicated blocks shared with DATASET would not be freed, so file-move cannot run; see the docs` | Not supported: see [what file-move does not support](#what-file-move-does-not-support). |
+| `OTHER already holds a file-move of DATASET; rerun with --stage OTHERSTAGE` | An earlier run used another `--stage`; the files are split between DATASET and OTHER. Rerun with the stage it names. |
+| `STAGE/LEAF exists and is not a file-move of DATASET` | Another migration owns that name; finish or clear it first. |
+| `a migration is already in flight under STAGE` | Finish the other migration first. |
+| `STAGE/old/LEAF already exists` | Destroy or rename the old copy of an earlier migration. |
+| `cannot unmount DATASET; a writer is probably still running` | Stop the writer and rerun. |
+| `PATH is not where DATASET is mounted (nothing is mounted there)` (or `(SOURCE of type TYPE is mounted there)`) | PATH, the mountpoint `zfs get` gives, is not where the kernel mounted DATASET (the dataset, or `STAGE/LEAF`). Usually the mountpoint ends in a space, which `zfs get` strips; `findmnt --source DATASET` shows where it is mounted. Set a mountpoint without the space, and rerun. |
+| `run file-move once from a terminal so it can check the passphrase` | Run it from a terminal (tmux), or pass `--final-keylocation file:///absolute/path`. |
+| `the key for STAGE/LEAF did not load from LOCATION; nothing was deleted` | Fix the key or location; the first mistyped passphrase deletes nothing. |
+| `DATASET has snapshots, which keep deleted files allocated: ...` | Disable snapshot tools for the dataset, then destroy the snapshots it lists (`zfs destroy SNAPSHOT`). |
+| `PATH has N hard links but only M were found` | The dataset changed during the scan: a writer added or removed a link. Stop the writers and rerun. |
+| `free space on POOL above the floor (SIZE) does not cover the worst case of this move (SIZE: largest batch or file SIZE, block-cloned data SIZE, lost compression SIZE)` | Nothing was deleted, as the hint says: `nothing was deleted; to give up, remove the staged dataset: zfs destroy -r STAGE/LEAF`. Free space on the pool, lower `--batch-size` if the largest batch is the biggest term, or remove clones you no longer need (`zpool get bcloneused,bclonesaved POOL`), then rerun. Or give up with that `zfs destroy -r`. |
+| `not enough free space on POOL for the next batch (SIZE) above the floor SIZE` | Free space or lower `--batch-size`, then rerun. |
+| `STAGE/LEAF is no longer mounted at PATH; nothing of this batch was deleted` | Something unmounted the staged dataset or mounted over it during the run (for example `zfs umount -a`). Rerun: it mounts the dataset again and continues. |
+| `STAGE/LEAF is not mounted at PATH` | `zfs mount` succeeded but nothing is mounted at the staged dataset's mountpoint; check `zfs get mountpoint,mounted STAGE/LEAF` and `findmnt PATH`. |
+| `the copy of NAME is not on the staged dataset` | The copy landed outside the staged dataset; nothing of the batch was deleted. Rerun. |
+| `N files kept changing during the move; stop the writers and rerun` | Stop whatever writes to the dataset. |
+| `N files appeared in DATASET during the swap; stop the writers and rerun` | Stop the writers and rerun. |
+| `DATASET was written after the final scan` | Rename `@enc-final` aside with the commands it prints, then rerun. |
+| `rsync ... failed: ... Disk quota exceeded ...` | A `quota` or `refquota` is full. The dataset's own was copied to `STAGE/LEAF`: raise it there (`zfs set quota=SIZE STAGE/LEAF`, or `refquota`), and set it back after the swap. One on the stage or a parent of it: raise or remove it. Then rerun. |
+| `PermissionError: [Errno 1] Operation not permitted: 'PATH'` | An immutable or append-only file; clear the flag (`chattr -i -a PATH`), then rerun. |
+| `STAGE/LEAF is mounted at PATH, which overlaps DATASET at PATH` | Change the staged mountpoint so it does not contain or lie inside the dataset's. |
+
+### What file-move does not support
+
+Each of these is checked before anything is deleted, except the last four, which are documented limits:
+
+| Not supported | What `file-move` does |
+| --- | --- |
+| `dedup` other than `off` on the dataset | Refuses on the first run, before it creates anything: deleting a deduplicated file frees nothing while another reference to its blocks remains. |
+| A pool with deduplicated blocks (a dedup table, `dedup_table_size` above 0; before OpenZFS 2.3, `dedupratio` above 1.00x, which rounds a little deduplication down to 1.00x) | Refuses on the first run: blocks written while dedup was on may be shared with the dataset, even with dedup off now. |
+| A `reservation` or `refreservation` on the dataset, or a `reservation` on a parent that does not also hold the stage | Refuses on every run, with the `zfs set ...=none` command; set it again after the swap. |
+| A dataset that is a clone | Refuses on every run: its origin keeps the space of deleted files. `zfs promote` it first. |
+| A checkpoint on the pool | Refuses on every run: it keeps deleted space allocated. `zpool checkpoint -d POOL` first. |
+| A pool imported with an `altroot` (`zpool import -R`) | Refuses on every run: `zfs get` adds the altroot to every mountpoint, so the swap would store it in the new dataset's mountpoint. Import the pool without `-R` first. |
+| Block-cloned data beyond the free space | Refuses before the first delete of the move unless free space above `--min-free` covers its worst case, the pool's `bclonesaved` included: a copy of a cloned file takes its full size. |
+| Child datasets | Refuses: use the [tree commands](#tree-commands), or `file-move` each child. |
+| Volumes | Refuses: use `seed` and `cutover`. |
+| Per-user, per-group and per-project quotas (`userquota@`, `groupquota@`, `projectquota@` and their `objquota@` forms) and file project IDs | Documented limit, not checked: they are not carried over (`zfs get all` does not list those quotas, rsync does not copy project IDs; `seed` and `cutover` keep both). Note them before the move (`zfs userspace`, `zfs groupspace`, `zfs projectspace`, `zfs project -r`) and set them again on the swapped dataset. |
+| Inode flags (`chattr +i`, `+a` and the others) | Documented limit, not checked: rsync does not copy them, so the copies have none. An immutable or append-only source file cannot be deleted, so the run stops at it (`PermissionError: [Errno 1] Operation not permitted`) until you clear the flag (`chattr -i -a FILE`) and rerun. Note the flags first (`lsattr -R`) and set them again after the swap. |
+| A `quota` or `refquota` on the dataset, or on the stage or a parent of it | Documented limit, not checked: the dataset's own is copied to `STAGE/LEAF`, which holds the directory tree twice (the pristine copy too) besides the files, and a quota on the stage or a parent of it covers `STAGE/LEAF` as it grows to the dataset's full size. Either can stop a run with `Disk quota exceeded`. Raise the one on `STAGE/LEAF` (and set it back after the swap), or raise or remove the other, then rerun. |
+| Data written under other `copies`, `recordsize` or `compression` settings than the current ones | Documented limit: the copies are written with the current settings, so data written with fewer `copies`, with a smaller `recordsize` while `compression` is `off` (each file's last block is padded to a whole record), or under a stronger compression may take more space as copies. The admission check counts only what compression saved (`logicalreferenced` minus `referenced`), and only when `compression` is now `off`; keep spare room above `--min-free` for the rest. Growth beyond that first uses up `--min-free`; then the space check before a batch refuses, with nothing of that batch deleted: free space and rerun. |
+
 ## Audit
 
 ```bash
@@ -291,7 +415,7 @@ When a `zfs` or `zpool` command fails, the message is the command followed by `f
 | `0` | Success; for `audit`, nothing unencrypted outside the allowlists. |
 | `1` | A refusal or a failed `zfs` command; for `audit`, an unencrypted dataset or a pool it couldn't list. |
 | `2` | Usage error: a missing `--stage`, an invalid name, size or keylocation, or no pool for `audit`. |
-| `130` | A migration or tree command interrupted by Ctrl-C, SIGTERM or SIGHUP. `audit` has nothing to clean up: Ctrl-C ends it with 1, and SIGTERM or SIGHUP end it like any other process. |
+| `130` | A migration, tree or file-move command interrupted by Ctrl-C, SIGTERM or SIGHUP. `audit` has nothing to clean up: Ctrl-C ends it with 1, and SIGTERM or SIGHUP end it like any other process. |
 
 ## Recovery Hints
 
@@ -340,19 +464,20 @@ For a long seed over SSH, `nohup zfs-encrypt-migrate seed ...` therefore survive
 
 ## Safety Model
 
-- **It never destroys anything.** It never runs `zfs destroy`. Old copies and moved children are left for you, with the exact command printed; stale snapshots get a printed rename instead.
+- **It never runs `zfs destroy`.** Old copies and moved children are left for you, with the exact command printed; stale snapshots get a printed rename instead. The one thing it does delete is, with `file-move --delete-source`, a source file whose encrypted copy is verified.
 - **Staged keys stay unloaded.** The staged copy keeps every mountpoint set locally in the original tree, so its key is loaded only while the tool works on it. `seed`, `catchup`, `tree-seed` and `tree-move` unload it when they finish, and any failure or interrupt part way through unloads it too.
 - **One migration in flight.** `seed` and `tree-seed` refuse while anything other than `<stage>`, `<stage>/old` and the old copies under it exists under the stage.
 - **A free-space floor.** `seed`, `tree-seed` and `tree-move` refuse unless the stage pool's free space minus the size of what they copy stays at least `--min-free`.
 - **No lost writes.** `cutover`, `tree-move` and `tree-finish` unmount the source first and refuse if it's busy. After the final snapshot they run `zpool sync` and refuse if `written@<snapshot>` is non-zero anywhere in the tree.
 - **Nothing lands unencrypted.** Catch-up and `tree-move` receives use `-x encryption`. After each catch-up and each `tree-move`, every dataset in the received tree is checked to have the staged copy as its `encryptionroot`, and snapshots are compared by GUID.
+- **`file-move` deletes only verified files, only with consent.** Each source file is unlinked only after its copy matches in type, mode, owner, size, mtime and link structure and the pool has synced, and only with `--delete-source`. It refuses while the dataset has snapshots, and checks your final key before the first deletion.
 - **Recovery hints that match the failure.** See [recovery hints](#recovery-hints).
 - **Signals are cleanups, not crashes.** See [interrupts and hangups](#interrupts-and-hangups).
 
 And its limits:
 
 - **Old plaintext blocks stay on disk until they're overwritten.** Destroying the old copy frees its blocks; it doesn't wipe them.
-- **You need free space for one dataset at a time** (or the parent plus one child), until you destroy the old copy.
+- **You need free space for one dataset at a time** (or the parent plus one child), until you destroy the old copy. `file-move` needs one batch (or the largest file, if bigger) plus the floor, plus the pool's block-cloned savings (`bclonesaved`), plus lost compression when `compression` is now `off`.
 - **Plan for writer downtime during the cutover.** The dataset is unmounted for the final catch-up and the swap.
 - **NFS clients see stale file handles after a swap.** The path is now served by a different dataset; remount it on the clients.
 - **Children moved with `tree-move` get no old copy to fall back on.** Once you destroy a moved source child, the encrypted copy is the only one; only the parent lands in `<stage>/old`. Check the passphrase you stored first, with the `zfs load-key -n -L prompt STAGE/LEAF` line that `tree-move` prints.

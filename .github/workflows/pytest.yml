@@ -64,5 +64,7 @@ jobs:
         run: nix build .#checks.x86_64-linux.module --no-link --no-write-lock-file
       - name: Run ZFS integration VM test
         run: nix build .#checks.x86_64-linux.integration --no-link --no-write-lock-file --print-build-logs
+      - name: Run file-move VM test
+        run: nix build .#checks.x86_64-linux.file-move --no-link --no-write-lock-file --print-build-logs
       - name: Test NixOS modules
         run: uv run pytest tests/test_nixos_module.py -q
