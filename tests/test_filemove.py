@@ -250,15 +250,48 @@ def test_preflight_refuses_dedup(filemove_env: FileMoveEnv, settings: Settings, 
     )
 
 
-def test_preflight_refuses_pool_with_deduplicated_blocks(filemove_env: FileMoveEnv, settings: Settings) -> None:
-    """Blocks deduplicated across the pool may be shared with the source, which turned dedup off since."""
-    filemove_env.sim.pool_props["tank", "dedupratio"] = "1.50"
+def test_preflight_refuses_pool_with_a_dedup_table(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """Blocks deduplicated across the pool may be shared with the source, which turned dedup off since.
+
+    dedupratio rounds a little deduplication down to 1.00x; a dedup table of any size shows it.
+    """
+    filemove_env.sim.pool_props["tank", "dedup_table_size"] = "4096"
     refused(
         filemove_env,
         settings,
-        f"pool tank has dedupratio 1.50x; deduplicated blocks shared with {DATASET} would not be freed, "
+        f"pool tank has a dedup table (4.0K); deduplicated blocks shared with {DATASET} would not be freed, "
         "so file-move cannot run; see the docs",
     )
+
+
+def no_dedup_table_size(args: Sequence[str]) -> CommandResult | None:
+    """Answer zpool get dedup_table_size as an OpenZFS before 2.3 does."""
+    if tuple(args[:2]) == ("zpool", "get") and "dedup_table_size" in args:
+        return fail("bad property list: invalid property 'dedup_table_size'\n", 2)
+    return None
+
+
+@pytest.mark.parametrize(("ratio", "refuses"), [("1.50", True), ("1.00", False)])
+def test_preflight_falls_back_to_dedupratio(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    ratio: str,
+    refuses: bool,  # noqa: FBT001
+) -> None:
+    """Without dedup_table_size (OpenZFS before 2.3), a dedupratio above 1.00x is the sign of deduplication."""
+    env = filemove_env
+    env.sim.pool_props["tank", "dedupratio"] = ratio
+    zfs, _ = make(env.sim, no_dedup_table_size)
+    if not refuses:
+        assert preflight_file_move(zfs, settings, DATASET) == env.src
+        return
+    with pytest.raises(MigrationError) as info:
+        preflight_file_move(zfs, settings, DATASET)
+    assert info.value.message == (
+        f"pool tank has dedupratio 1.50x; deduplicated blocks shared with {DATASET} would not be freed, "
+        "so file-move cannot run; see the docs"
+    )
+    assert env.sim.ops() == []
 
 
 def test_preflight_refuses_foreign_staged(filemove_env: FileMoveEnv, settings: Settings) -> None:

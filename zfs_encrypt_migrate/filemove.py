@@ -171,7 +171,18 @@ def _refuse_dedup(zfs: Zfs, dataset: str) -> None:
         )
         raise MigrationError(msg)
     pool = pool_of(dataset)
-    # zpool get -p prints the ratio without its x; blocks written while dedup was on stay shared after it is off.
+    # Blocks written while dedup was on stay shared after it is off. dedupratio rounds a little deduplication
+    # down to 1.00x, so the dedup table's size (OpenZFS 2.3 and later) says it first.
+    table = _pool_number(zfs, pool, "dedup_table_size")
+    if table:
+        msg = (
+            f"pool {pool} has a dedup table ({format_size(table)}); deduplicated blocks shared with {dataset} would "
+            "not be freed, so file-move cannot run; see the docs"
+        )
+        raise MigrationError(msg)
+    if table is not None:
+        return
+    # zpool get -p prints the ratio without its x.
     ratio = zfs.pool_get("dedupratio", pool).removesuffix("x")
     if float(ratio) > 1:
         msg = (

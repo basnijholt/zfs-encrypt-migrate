@@ -92,6 +92,10 @@ pkgs.testers.runNixOSTest {
     # The package appends its own rsync to PATH, after any rsync already there.
     assert "${pkgs.rsync}/bin" in machine.succeed("cat \"$(readlink -f \"$(command -v zfs-encrypt-migrate)\")\"")
     machine.succeed("zpool create -O mountpoint=/tank tank /dev/vdb")
+    # The pool properties file-move reads exist on this OpenZFS, in the form it parses: no dedup table,
+    # a ratio without its x, nothing cloned, no checkpoint.
+    pool_props = machine.succeed("zpool get -Hp -o value dedup_table_size,dedupratio,bclonesaved,checkpoint tank")
+    assert pool_props.split() == ["0", "1.00", "0", "-"], pool_props
     machine.succeed(
         "printf test-passphrase-123 > /run/zfs-encrypt-migrate.key && chmod 600 /run/zfs-encrypt-migrate.key"
         " && cp -p /run/zfs-encrypt-migrate.key /run/final.key"

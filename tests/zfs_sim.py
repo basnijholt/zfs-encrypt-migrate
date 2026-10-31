@@ -38,7 +38,7 @@ DEFAULTS = {
 }
 
 # zpool get -p prints a ratio without its x.
-POOL_DEFAULTS = {"dedupratio": "1.00"}
+POOL_DEFAULTS = {"dedupratio": "1.00", "dedup_table_size": "0"}
 
 
 class ZfsSim:

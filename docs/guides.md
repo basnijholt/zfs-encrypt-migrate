@@ -168,12 +168,12 @@ At the end it swaps the new dataset into place under the same name and mountpoin
 Requirements, on top of the usual ones:
 
 - `rsync` 3.1.3 or newer, with ACL and xattr support, on `PATH`. The Nix package appends one to `PATH` for you; with pip or uv, install it from your distribution.
-- Nothing from the list below. Check before you start: `zfs get dedup,reservation,refreservation,origin DATASET`, `zpool get dedupratio,checkpoint,bcloneused,bclonesaved POOL`, and `zfs list -r DATASET` for children.
+- Nothing from the list below. Check before you start: `zfs get dedup,reservation,refreservation,origin DATASET`, `zpool get dedup_table_size,dedupratio,checkpoint,bcloneused,bclonesaved POOL`, and `zfs list -r DATASET` for children.
 
 **Not supported.**
 `file-move` relies on every deleted file freeing its space, so it checks for what would stop that before it creates or deletes anything:
 
-- **Deduplication.** A dataset with `dedup` other than `off`, or a pool with deduplicated blocks (`dedupratio` above 1.00x), even with dedup off now: deleting a deduplicated file frees nothing while another reference to its blocks remains. Refused on the first run.
+- **Deduplication.** A dataset with `dedup` other than `off`, or a pool with deduplicated blocks (a dedup table, `dedup_table_size` above 0; before OpenZFS 2.3, `dedupratio` above 1.00x), even with dedup off now: deleting a deduplicated file frees nothing while another reference to its blocks remains. Refused on the first run.
 - **Reservations.** A `reservation` or `refreservation` on the dataset, or a `reservation` on a parent that does not also hold the stage. Refused on every run, with the command that clears it; set it again after the swap.
 - **Clones.** A dataset that is a clone: its origin keeps the space of deleted files. Refused on every run; `zfs promote` it first.
 - **Pool checkpoints.** A checkpoint keeps deleted space allocated. Refused on every run; `zpool checkpoint -d POOL` first.
