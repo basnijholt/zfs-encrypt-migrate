@@ -98,6 +98,12 @@ class Zfs:
             props[prop] = Prop(value, source)
         return props
 
+    def local_values(self, prop: str, root: str) -> list[tuple[str, str]]:
+        """List the filesystems under ``root`` that have ``prop`` set locally, with its value."""
+        args = ["zfs", "get", "-H", "-r", "-s", "local", "-t", "filesystem", "-o", "name,value", prop, root]
+        rows = (line.split("\t", 1) for line in self._run(args).stdout.splitlines() if line)
+        return [(row[0], row[1]) for row in rows]
+
     def snapshots(self, name: str) -> list[str]:
         """List the dataset's own snapshots by full name."""
         result = self._run(["zfs", "list", "-H", "-t", "snapshot", "-o", "name", "-d", "1", name])

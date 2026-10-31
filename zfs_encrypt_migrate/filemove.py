@@ -192,6 +192,18 @@ def _refuse_dedup(zfs: Zfs, dataset: str) -> None:
         raise MigrationError(msg)
 
 
+def _refuse_other_stage(zfs: Zfs, dataset: str) -> None:
+    """Refuse a first run while another stage holds a file-move of ``dataset``.
+
+    Its files are split between the source and that staged dataset; a second staged dataset would get only
+    the rest, and its swap would finish with half the files.
+    """
+    for name, value in zfs.local_values(MARK_SOURCE, pool_of(dataset)):
+        if value == dataset:
+            msg = f"{name} already holds a file-move of {dataset}; rerun with --stage {name.rsplit('/', 1)[0]}"
+            raise MigrationError(msg)
+
+
 def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
     """Refuse unless the run can start or resume; return the source mountpoint. Writes nothing."""
     check_key_file(settings)
@@ -208,6 +220,7 @@ def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
     # Checked once, before anything is created or deleted: a later run sees the space the earlier ones used.
     if not staged_exists:
         _refuse_dedup(zfs, dataset)
+        _refuse_other_stage(zfs, dataset)
     # Here as well as before each batch, so a snapshot stops the run before anything is written. Only while
     # files are left: then a snapshot pins nothing, and a rerun after a refused swap keeps its renamed enc-final.
     if zfs.snapshots(dataset) and scan(source):

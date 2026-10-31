@@ -144,6 +144,8 @@ class ZfsSim:
             return ok("".join(f"{d}\n" for d in names))
         if verb == "get" and args[-2] == "all":
             return ok(self._get_all(args[-1]))
+        if verb == "get" and "-r" in args:
+            return self._get_local(args[-2], args[-1])
         if verb == "get":
             if (
                 args[-2].startswith("written@")
@@ -193,6 +195,11 @@ class ZfsSim:
                 for name, guid in self.snapshots.items()
             }
         return ok()
+
+    def _get_local(self, prop: str, root: str) -> CommandResult:
+        """Answer ``zfs get -H -r -s local -t filesystem -o name,value PROP ROOT``."""
+        names = [d for d in self._under(root) if d not in self.volumes and (d, prop) in self.props]
+        return ok("".join(f"{d}\t{self.props[d, prop]}\n" for d in names))
 
     def _mount(self, args: Sequence[str]) -> None:
         self.prop(args[-1], "mounted", "yes")

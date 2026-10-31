@@ -265,6 +265,16 @@ def test_props_keeps_a_tab_inside_a_value() -> None:
     }
 
 
+def test_local_values_lists_where_a_property_is_set() -> None:
+    """local_values reads one property, set locally, across the filesystems under a root."""
+    runner = FakeRunner(queue=[ok("tank/a\tx\ntank/b/c\ty z\n")])
+
+    assert Zfs(runner).local_values("user:p", "tank") == [("tank/a", "x"), ("tank/b/c", "y z")]
+    assert runner.calls == [
+        ("zfs", "get", "-H", "-r", "-s", "local", "-t", "filesystem", "-o", "name,value", "user:p", "tank"),
+    ]
+
+
 def test_snapshots_lists_own_snapshots() -> None:
     """Only the dataset's own snapshots are listed, by full name."""
     runner = FakeRunner(queue=[ok("tank/a@one\ntank/a@two\n")])

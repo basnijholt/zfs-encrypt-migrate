@@ -294,6 +294,27 @@ def test_preflight_falls_back_to_dedupratio(
     assert env.sim.ops() == []
 
 
+def test_preflight_refuses_a_file_move_under_another_stage(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """A first run under one stage, while another stage holds this dataset's moved files, would finish with half."""
+    env = filemove_env
+    env.sim.datasets |= {"tank/elsewhere", "tank/elsewhere/media", "tank/elsewhere/music"}
+    env.sim.prop("tank/elsewhere/music", MARK_SOURCE, "tank/music")
+    env.sim.prop("tank/elsewhere/media", MARK_SOURCE, DATASET)
+    refused(
+        env,
+        settings,
+        f"tank/elsewhere/media already holds a file-move of {DATASET}; rerun with --stage tank/elsewhere",
+    )
+
+
+def test_preflight_allows_file_moves_of_other_datasets(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """Only a file-move of this dataset counts."""
+    env = filemove_env
+    env.sim.datasets |= {"tank/elsewhere", "tank/elsewhere/music"}
+    env.sim.prop("tank/elsewhere/music", MARK_SOURCE, "tank/music")
+    assert preflight_file_move(env.zfs, settings, DATASET) == env.src
+
+
 def test_preflight_refuses_foreign_staged(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Preflight refuses foreign staged."""
     filemove_env.sim.datasets.add(STAGED)
