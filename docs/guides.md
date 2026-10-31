@@ -162,7 +162,7 @@ The children you destroyed in step 2 have none, so from step 2 on the encrypted 
 
 `seed` and `cutover` copy a whole dataset with `zfs send`, so the pool needs room for a second copy.
 When a single dataset is bigger than the pool's free space, and it has no children to move one by one, `file-move` encrypts it in place instead: it moves the files into a new encrypted dataset in verified batches, and deletes each source file only after its encrypted copy is verified.
-The pool needs room for one batch (default `100G`) plus the `--min-free` floor, not for the whole dataset.
+The pool needs room for one batch (default `100G`), or the largest file if that is bigger, plus the `--min-free` floor, plus the pool's block-cloned savings (`bclonesaved`), plus lost compression when `compression` is now `off`; not for the whole dataset.
 At the end it swaps the new dataset into place under the same name and mountpoint, like `cutover`.
 
 Requirements, on top of the usual ones:

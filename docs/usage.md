@@ -477,7 +477,7 @@ For a long seed over SSH, `nohup zfs-encrypt-migrate seed ...` therefore survive
 And its limits:
 
 - **Old plaintext blocks stay on disk until they're overwritten.** Destroying the old copy frees its blocks; it doesn't wipe them.
-- **You need free space for one dataset at a time** (or the parent plus one child), until you destroy the old copy. `file-move` needs only one batch plus the floor.
+- **You need free space for one dataset at a time** (or the parent plus one child), until you destroy the old copy. `file-move` needs one batch (or the largest file, if bigger) plus the floor, plus the pool's block-cloned savings (`bclonesaved`), plus lost compression when `compression` is now `off`.
 - **Plan for writer downtime during the cutover.** The dataset is unmounted for the final catch-up and the swap.
 - **NFS clients see stale file handles after a swap.** The path is now served by a different dataset; remount it on the clients.
 - **Children moved with `tree-move` get no old copy to fall back on.** Once you destroy a moved source child, the encrypted copy is the only one; only the parent lands in `<stage>/old`. Check the passphrase you stored first, with the `zfs load-key -n -L prompt STAGE/LEAF` line that `tree-move` prints.
