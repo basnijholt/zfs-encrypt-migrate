@@ -180,6 +180,12 @@ def open_staged(  # noqa: PLR0917
     return Path(zfs.get("mountpoint", staged))
 
 
+# rsync compares times in whole seconds by default; a negative window (rsync 3.1.3+) adds the nanoseconds.
+# Without it, a copy whose time is off by less than a second is skipped by the quick check, then refused by
+# verify on every rerun, and the pristine pass cannot restore a directory time off by less than a second.
+MODIFY_WINDOW = "--modify-window=-1"
+
+
 def _rsync(zfs: Zfs, args: list[str]) -> None:
     result = zfs.runner.run(args)
     if result.returncode != 0:
@@ -198,6 +204,7 @@ def rsync_files(zfs: Zfs, src: Path, dst: Path, file_list: Path) -> None:
             "rsync",
             "-aHAXS",
             "--numeric-ids",
+            MODIFY_WINDOW,
             "--from0",
             f"--files-from={file_list}",
             f"--temp-dir={temp}",
@@ -215,6 +222,7 @@ def rsync_dirs(zfs: Zfs, src: Path, dst: Path) -> None:
             "rsync",
             "-aAX",
             "--numeric-ids",
+            MODIFY_WINDOW,
             "--exclude=/.zfs",
             "--include=*/",
             "--exclude=*",

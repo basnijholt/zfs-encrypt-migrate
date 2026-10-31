@@ -21,6 +21,8 @@ from zfs_encrypt_migrate.filemove import (
     open_staged,
     preflight_file_move,
     probe_writers,
+    rsync_dirs,
+    rsync_files,
     run_lock,
     wait_for_space,
 )
@@ -29,6 +31,7 @@ from zfs_encrypt_migrate.process import SubprocessRunner
 
 from .conftest import STAGE, FileMoveEnv, fail, needs_rsync
 from .helpers import fail_on, make
+from .zfs_sim import ZfsSim
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -292,6 +295,56 @@ def test_copy_tree_skips_when_marked(filemove_env: FileMoveEnv) -> None:
     assert not [call for call in env.runner.calls if call[0] == "rsync"]
 
 
+def test_rsync_argument_lists(tmp_path: Path) -> None:
+    """The exact rsync calls: never --delete or --remove-source-files, and times compared to the nanosecond."""
+    zfs, runner = make(ZfsSim())
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    rsync_files(zfs, src, dst, dst / "list")
+    rsync_dirs(zfs, src, dst)
+    assert runner.calls == [
+        (
+            "rsync",
+            "-aHAXS",
+            "--numeric-ids",
+            "--modify-window=-1",
+            "--from0",
+            f"--files-from={dst / 'list'}",
+            f"--temp-dir={dst / SCRATCH / 'tmp'}",
+            f"{src}/",
+            f"{dst}/",
+        ),
+        (
+            "rsync",
+            "-aAX",
+            "--numeric-ids",
+            "--modify-window=-1",
+            "--exclude=/.zfs",
+            "--include=*/",
+            "--exclude=*",
+            f"{src}/",
+            f"{dst}/",
+        ),
+    ]
+
+
+# Two times in the same second: rsync's default --modify-window=0 compares whole seconds only.
+EARLY_NS = 1_200_000_000_100_000_000
+LATE_NS = 1_200_000_000_900_000_000
+
+
+@needs_rsync
+def test_directory_time_off_below_a_second_is_restored(filemove_env: FileMoveEnv, tmp_path: Path) -> None:
+    """A directory whose copy differs from the source only in nanoseconds gets the source's time."""
+    env = filemove_env
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    rsync_dirs(env.zfs, env.src, dst)
+    os.utime(env.src / "docs", ns=(EARLY_NS, EARLY_NS))
+    os.utime(dst / "docs", ns=(LATE_NS, LATE_NS))
+    rsync_dirs(env.zfs, env.src, dst)
+    assert (dst / "docs").stat().st_mtime_ns == EARLY_NS
+
+
 def staged_env(env: FileMoveEnv) -> FileMoveEnv:
     """Staged env."""
     env.sim.datasets.add(STAGED)
@@ -434,6 +487,28 @@ def test_moves_names_rsync_reads_as_comments(filemove_env: FileMoveEnv, settings
 
 SNAPSHOT_REFUSAL = f"{DATASET} has snapshots, which keep deleted files allocated: {DATASET}@auto"
 SNAPSHOT_HINTS = (f"disable snapshot tools for {DATASET}, then remove them: zfs destroy {DATASET}@auto",)
+
+
+@needs_rsync
+def test_same_second_same_size_change_is_copied_again(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """A copy left by an earlier run that matches in size and second, but not nanosecond, is copied again.
+
+    rsync's quick check would otherwise skip it, and verify would refuse the mtime on every rerun.
+    """
+    env = filemove_env
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    (dst / "a.txt").write_text("z")
+    os.utime(dst / "a.txt", ns=(LATE_NS, LATE_NS))
+    os.utime(env.src / "a.txt", ns=(EARLY_NS, EARLY_NS))
+    move(env, settings, dst, 10**9, recorder()[1])
+    assert source_files(env) == []
+    assert (dst / "a.txt").read_text() == "a"
+    assert (dst / "a.txt").stat().st_mtime_ns == EARLY_NS
 
 
 @needs_rsync

@@ -167,7 +167,7 @@ At the end it swaps the new dataset into place under the same name and mountpoin
 
 Requirements, on top of the usual ones:
 
-- `rsync` 3.1 or newer, with ACL and xattr support, on `PATH`. The Nix package appends one to `PATH` for you; with pip or uv, install it from your distribution.
+- `rsync` 3.1.3 or newer, with ACL and xattr support, on `PATH`. The Nix package appends one to `PATH` for you; with pip or uv, install it from your distribution.
 - A dataset that is a leaf filesystem: no child datasets, no volumes. For a parent with children, use the [tree commands](#moving-a-big-tree), and `file-move` for a big child on its own.
 
 > [!CAUTION]
