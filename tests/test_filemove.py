@@ -379,6 +379,24 @@ def test_moves_everything_in_batches(
 
 
 @needs_rsync
+def test_moves_names_rsync_reads_as_comments(filemove_env: FileMoveEnv, settings: Settings, tmp_path: Path) -> None:
+    """Names starting with # or ; are copied: rsync skips such --files-from lines as comments."""
+    env = filemove_env
+    (env.src / "#x").write_text("hash")
+    (env.src / ";y").write_text("semi")
+    (env.src / "#dir").mkdir()
+    (env.src / "#dir" / "f").write_text("in hash dir")
+    os.link(env.src / ";y", env.src / "#dir" / "y-link")
+    before = contents(env.src)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    move(env, settings, dst, 10**9, recorder()[1])
+    assert source_files(env) == []
+    assert {name: text for name, text in contents(dst).items() if not name.startswith(SCRATCH)} == before
+    assert (dst / ";y").stat().st_ino == (dst / "#dir" / "y-link").stat().st_ino
+
+
+@needs_rsync
 def test_snapshot_appearing_mid_run_stops_before_next_batch(
     filemove_env: FileMoveEnv,
     settings: Settings,

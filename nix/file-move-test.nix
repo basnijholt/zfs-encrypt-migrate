@@ -115,6 +115,8 @@ pkgs.testers.runNixOSTest {
             f" && head -c {big} /dev/urandom > big/huge.bin"
             r" && printf a > 'downloads/with space.txt' && printf b > $'downloads/new\nline.txt'"
             r" && printf c > downloads/-dash.txt && printf d > $'downloads/bad\xffname.txt'"
+            # At the root, where rsync would read a listed name starting with # or ; as a comment.
+            " && mkdir '#recycle' && printf f > '#recycle/old.txt' && printf g > ';semi.txt'"
             " && ln -s ../../downloads/ep1.mkv tv/show/latest.mkv && mkfifo downloads/pipe"
             " && setfattr -n user.comment -v hello downloads/ep2.mkv && setfattr -n user.shelf -v tv tv"
             " && setfacl -m u:1234:rw movies/m01.bin"

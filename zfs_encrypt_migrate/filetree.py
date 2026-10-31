@@ -110,11 +110,15 @@ def plan_batches(groups: Sequence[Group], batch_size: int) -> list[list[Group]]:
 
 
 def write_file_list(path: Path, groups: Sequence[Group]) -> None:
-    """Write every name NUL-terminated, for ``rsync --from0 --files-from``."""
+    """Write every name NUL-terminated, for ``rsync --from0 --files-from``.
+
+    rsync reads a listed name that starts with ``#`` or ``;`` as a comment, even with ``--from0``, and
+    skips it without an error; the ``./`` prefix keeps every name a path.
+    """
     with path.open("wb") as f:
         for g in groups:
             for item in g.entries:
-                f.write(os.fsencode(item.name) + b"\0")
+                f.write(b"./" + os.fsencode(item.name) + b"\0")
 
 
 def _unchanged(src: Path, g: Group, *, missing_ok: bool = False) -> bool:

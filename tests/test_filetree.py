@@ -157,14 +157,14 @@ def test_plan_batches_big_group_alone() -> None:
 
 
 def test_write_file_list_nul_separated(tmp_path: Path) -> None:
-    """Write file list nul separated."""
-    names = ["new\nline", BAD_NAME, "plain"]
+    """Every name is NUL-terminated and starts with ./, so rsync never reads a # or ; name as a comment."""
+    names = ["new\nline", BAD_NAME, "plain", "#hash", ";semi", "#dir/f"]
     groups = [Group((entry(n),)) for n in names]
     out = tmp_path / "list"
     write_file_list(out, groups)
     raw = out.read_bytes()
     assert raw.endswith(b"\0")
-    assert [os.fsdecode(p) for p in raw.split(b"\0")[:-1]] == names
+    assert [os.fsdecode(p) for p in raw.split(b"\0")[:-1]] == [f"./{name}" for name in names]
 
 
 def test_verify_ok_after_copy(tmp_path: Path) -> None:
