@@ -32,6 +32,7 @@ DEFAULTS = {
     "mountpoint": "/mnt",
     "keystatus": "-",
     "encryptionroot": "-",
+    "origin": "-",
     "used": "100",
 }
 
@@ -47,6 +48,8 @@ class ZfsSim:
         # (dataset, property) -> (value, origin dataset), read with source "inherited from <origin>".
         self.inherited: dict[tuple[str, str], tuple[str, str]] = {}
         self.avail = avail
+        # (pool, property) -> value, read by zpool get; unset ones read "-".
+        self.pool_props: dict[tuple[str, str], str] = {}
         self.busy: set[str] = set()
         # Datasets mounted with "zfs mount -o noatime"; until unmounted, zfs reports atime=off as temporary.
         self.noatime: set[str] = set()
@@ -100,7 +103,9 @@ class ZfsSim:
         return [
             call
             for call in self.log
-            if call[0] == "zpool" or call[1] in WRITE_VERBS or (call[1] == "get" and call[-2].startswith("written@"))
+            if call[:2] == ("zpool", "sync")
+            or (call[0] == "zfs" and call[1] in WRITE_VERBS)
+            or (call[1] == "get" and call[-2].startswith("written@"))
         ]
 
     def answer(self, args: Sequence[str]) -> CommandResult:
@@ -111,6 +116,8 @@ class ZfsSim:
     def _answer(self, args: Sequence[str]) -> CommandResult:  # noqa: C901, PLR0911, PLR0912
         verb = args[1]
         if args[0] == "zpool":
+            if verb == "get":
+                return ok(f"{self.pool_props.get((args[-1], args[-2]), '-')}\n")
             return ok()
         if verb == "list" and "avail" in args:
             return ok(f"{self.avail}\n")

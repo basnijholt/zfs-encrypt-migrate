@@ -133,6 +133,39 @@ def test_preflight_refuses_reserved_name(filemove_env: FileMoveEnv, settings: Se
     refused(filemove_env, settings, f"{reserved} exists; file-move needs that name for its own files")
 
 
+@pytest.mark.parametrize("prop", ["reservation", "refreservation"])
+def test_preflight_refuses_reserved_space(filemove_env: FileMoveEnv, settings: Settings, prop: str) -> None:
+    """A reservation keeps the space of deleted files reserved for the source, so no batch would ever fit."""
+    filemove_env.sim.prop(DATASET, prop, "1073741824")
+    refused(
+        filemove_env,
+        settings,
+        f"{DATASET} has {prop}=1073741824, which keeps deleted space reserved; clear it with: "
+        f"zfs set {prop}=none {DATASET} (set it again on the new dataset after the move)",
+    )
+
+
+def test_preflight_refuses_clone(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """A clone's origin snapshot keeps the blocks of deleted files allocated."""
+    filemove_env.sim.prop(DATASET, "origin", "tank/old@base")
+    refused(
+        filemove_env,
+        settings,
+        f"{DATASET} is a clone of tank/old@base; its origin keeps the space of deleted files; "
+        f"promote it first: zfs promote {DATASET}",
+    )
+
+
+def test_preflight_refuses_pool_checkpoint(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """A pool checkpoint keeps every deleted block allocated until it is discarded."""
+    filemove_env.sim.pool_props["tank", "checkpoint"] = "1052672"
+    refused(
+        filemove_env,
+        settings,
+        "pool tank has a checkpoint, which keeps deleted space allocated; discard it first: zpool checkpoint -d tank",
+    )
+
+
 def test_preflight_refuses_foreign_staged(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Preflight refuses foreign staged."""
     filemove_env.sim.datasets.add(STAGED)

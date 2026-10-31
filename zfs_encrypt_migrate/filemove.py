@@ -106,6 +106,32 @@ def _refuse_source(zfs: Zfs, dataset: str) -> Path:
     return Path(mountpoint)
 
 
+def _refuse_pinned_space(zfs: Zfs, dataset: str) -> None:
+    """Refuse when deleting the source's files would not free their space: the move would stall half-way."""
+    for prop in ("reservation", "refreservation"):
+        value = zfs.get(prop, dataset)
+        if value not in {"none", "0"}:
+            msg = (
+                f"{dataset} has {prop}={value}, which keeps deleted space reserved; clear it with: "
+                f"zfs set {prop}=none {dataset} (set it again on the new dataset after the move)"
+            )
+            raise MigrationError(msg)
+    origin = zfs.get("origin", dataset)
+    if origin != "-":
+        msg = (
+            f"{dataset} is a clone of {origin}; its origin keeps the space of deleted files; "
+            f"promote it first: zfs promote {dataset}"
+        )
+        raise MigrationError(msg)
+    pool = pool_of(dataset)
+    if zfs.pool_get("checkpoint", pool) != "-":
+        msg = (
+            f"pool {pool} has a checkpoint, which keeps deleted space allocated; "
+            f"discard it first: zpool checkpoint -d {pool}"
+        )
+        raise MigrationError(msg)
+
+
 def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
     """Refuse unless the run can start or resume; return the source mountpoint. Writes nothing."""
     check_key_file(settings)
@@ -115,6 +141,7 @@ def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
     refuse_cross_pool(settings, dataset, "file-move")
     refuse_nested(settings, dataset)
     source = _refuse_source(zfs, dataset)
+    _refuse_pinned_space(zfs, dataset)
     stage = settings.stage
     staged = f"{stage}/{leaf_of(dataset)}"
     staged_exists = zfs.exists(staged)

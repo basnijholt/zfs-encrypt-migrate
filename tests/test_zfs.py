@@ -153,6 +153,14 @@ def test_pool_avail() -> None:
     assert runner.calls == [("zfs", "list", "-Hp", "-o", "avail", "tank")]
 
 
+def test_pool_get_reads_one_pool_property() -> None:
+    """pool_get reads one pool property as a parsable value."""
+    runner = FakeRunner(queue=[ok("-\n")])
+
+    assert Zfs(runner).pool_get("checkpoint", "tank") == "-"
+    assert runner.calls == [("zpool", "get", "-H", "-p", "-o", "value", "checkpoint", "tank")]
+
+
 @pytest.mark.parametrize("name", ["tank", "tank/a.b_c-d:e", "a/b/c"])
 def test_validate_name_accepts(name: str) -> None:
     """Plain dataset names pass through unchanged."""

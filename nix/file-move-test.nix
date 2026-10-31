@@ -172,6 +172,19 @@ pkgs.testers.runNixOSTest {
         out = machine.fail(f"{CLI} {FINAL} --delete-source tank/media 2>&1")
         assert "cannot unmount tank/media; a writer is probably still running" in out, out
         machine.succeed("systemctl stop busy")
+        # Each of these keeps deleted files from freeing their space, so the move would stall half-way.
+        machine.succeed("zfs set reservation=1M tank/media")
+        out = machine.fail(f"{CLI} {FINAL} --delete-source tank/media 2>&1")
+        assert "tank/media has reservation=1048576, which keeps deleted space reserved" in out, out
+        machine.succeed("zfs set reservation=none tank/media")
+        machine.succeed("zpool checkpoint tank")
+        out = machine.fail(f"{CLI} {FINAL} --delete-source tank/media 2>&1")
+        assert "pool tank has a checkpoint, which keeps deleted space allocated" in out, out
+        machine.succeed("zpool checkpoint -d -w tank")
+        machine.succeed("zfs snapshot tank/media@base && zfs clone -o mountpoint=/srv/clone tank/media@base tank/clone")
+        out = machine.fail(f"{CLI} {FINAL} --delete-source tank/clone 2>&1")
+        assert "tank/clone is a clone of tank/media@base" in out, out
+        machine.succeed("zfs destroy tank/clone && zfs destroy tank/media@base")
         # Nothing was created by any refusal so far.
         machine.fail("zfs list tank/stage")
         machine.succeed("zfs snapshot tank/media@autosnap_1")

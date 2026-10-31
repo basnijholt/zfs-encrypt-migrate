@@ -196,6 +196,10 @@ class Zfs:
         """Return free bytes in a pool."""
         return int(self._run(["zfs", "list", "-Hp", "-o", "avail", pool]).stdout.strip())
 
+    def pool_get(self, prop: str, pool: str) -> str:
+        """Read one pool property as a parsable value."""
+        return self._run(["zpool", "get", "-H", "-p", "-o", "value", prop, pool]).stdout.strip()
+
     def pool_sync(self, pool: str) -> None:
         """Flush pending writes of a pool."""
         self._run(["zpool", "sync", pool])

@@ -289,7 +289,7 @@ Without `--delete-source` it refuses before it touches anything: `file-move dele
 It runs, in this order:
 
 1. Takes an exclusive lock on `/run/zfs-encrypt-migrate.lock`, so two `file-move` runs never overlap.
-2. Refuses, changing nothing, unless the key file is valid and the dataset is a mounted leaf filesystem, not a pool root, volume or already encrypted dataset, writable, with a real mountpoint, on the stage's pool and outside the stage, with nothing named `.zfs-encrypt-migrate` at its root, and nothing else in flight under the stage.
+2. Refuses, changing nothing, unless the key file is valid and the dataset is a mounted leaf filesystem, not a pool root, volume or already encrypted dataset, writable, with a real mountpoint, on the stage's pool and outside the stage, with nothing named `.zfs-encrypt-migrate` at its root, and nothing else in flight under the stage. It also refuses whatever would keep deleted files from freeing their space: a `reservation` or `refreservation` on the dataset, a dataset that is a clone, or a checkpoint on the pool.
 3. Unmounts the dataset, which fails while a writer has it open, and mounts it again with `-o noatime`, so the tool's own reads never write access times.
 4. On the first run, creates `STAGE/LEAF` with `aes-256-gcm`, `canmount=noauto`, a private mountpoint under `/run/zfs-encrypt-migrate/` and the source's properties (`mountpoint`, `canmount`, `sharenfs`, `sharesmb`, `reservation` and `refreservation` wait until the swap). Every run loads its key and mounts it.
 5. Copies the directory tree, twice: into the staged root, and into a pristine copy of the original directory attributes under `.zfs-encrypt-migrate/dirs` there.
@@ -332,6 +332,9 @@ From the final unmount of step 8 on, the hints remount with `zfs mount -a` inste
 | `DATASET has mountpoint none; file-move needs a mounted path` (or `legacy`) | Give it a real mountpoint. |
 | `DATASET is not mounted` | `zfs mount DATASET`, then rerun. |
 | `PATH exists; file-move needs that name for its own files` | Rename that entry in the dataset. |
+| `DATASET has reservation=BYTES, which keeps deleted space reserved; clear it with: zfs set reservation=none DATASET (set it again on the new dataset after the move)` (or `refreservation`) | Run the printed `zfs set`, then rerun; set the reservation on the new dataset after the swap. |
+| `DATASET is a clone of ORIGIN; its origin keeps the space of deleted files; promote it first: zfs promote DATASET` | `zfs promote DATASET`, then rerun. The promote moves the origin's snapshots to DATASET, so the snapshot refusal follows until they are destroyed, which needs the former origin dataset gone first. |
+| `pool POOL has a checkpoint, which keeps deleted space allocated; discard it first: zpool checkpoint -d POOL` | `zpool checkpoint -d POOL`, then rerun. |
 | `STAGE/LEAF exists and is not a file-move of DATASET` | Another migration owns that name; finish or clear it first. |
 | `a migration is already in flight under STAGE` | Finish the other migration first. |
 | `STAGE/old/LEAF already exists` | Destroy or rename the old copy of an earlier migration. |

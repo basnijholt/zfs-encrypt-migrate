@@ -228,6 +228,7 @@ Then:
 
 **What the tool checks.**
 Before the first file moves, it refuses a dataset that is read-only, not mounted, has a mountpoint of `none` or `legacy`, or has an entry named `.zfs-encrypt-migrate` at its root, and it refuses while another migration is in flight under the stage or another `file-move` runs.
+It also refuses whatever would keep deleted files from freeing their space, since the move would then stall half-way: a `reservation` or `refreservation` on the dataset (clear it, and set it again on the new dataset after the swap), a dataset that is a clone (`zfs promote` it first), and a checkpoint on the pool (`zpool checkpoint -d` it first).
 For each batch, rsync copies the files with hard links, ACLs, xattrs and sparseness, and the tool then compares every name against its copy: type, mode, owner and group, size and mtime for regular files, the target for symlinks, and one shared inode for all names of a hard-linked file.
 A file that changed in the source during its batch is left alone and picked up by the next pass; if a pass moves nothing, the run stops and asks you to stop the writers.
 Only the verified names are deleted, after `zpool sync` has made the copies durable.
