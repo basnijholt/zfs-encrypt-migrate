@@ -66,7 +66,6 @@ pkgs.testers.runNixOSTest {
       environment.systemPackages = [
         pkgs.acl
         pkgs.attr
-        pkgs.gawk
         pkgs.rsync
         pkgs.util-linux
       ];
