@@ -282,7 +282,7 @@ Takes the [shared options](#shared-options) and:
 | `--batch-size SIZE` | `ZFS_ENCRYPT_MIGRATE_BATCH_SIZE` | `100G` | Target bytes per batch, in the `--min-free` size syntax. A hard-linked file group bigger than this forms a batch of its own. |
 | `--delete-source` | none | off | Required. Confirms that each source file is deleted once its encrypted copy is verified. |
 
-One run does the whole job, and a rerun after any stop continues where it left off.
+One run does the whole job, and a rerun after a stop before the swap continues where it left off.
 Stop everything that uses the dataset first, and keep it stopped until the swap.
 Without `--delete-source` it refuses before it touches anything: `file-move deletes each source file once its encrypted copy is verified; pass --delete-source to confirm`.
 
@@ -294,14 +294,14 @@ It runs, in this order:
 4. On the first run, creates `STAGE/LEAF` with `aes-256-gcm`, `canmount=noauto`, a private mountpoint under `/run/zfs-encrypt-migrate/` and the source's properties (`mountpoint`, `canmount`, `sharenfs`, `sharesmb`, `reservation` and `refreservation` wait until the swap). Every run loads its key and mounts it.
 5. Copies the directory tree, twice: into the staged root, and into a pristine copy of the original directory attributes under `.zfs-encrypt-migrate/dirs` there.
 6. Before the first deletion, checks the final key: with `--final-keylocation prompt` it needs a terminal and runs `zfs load-key -n -L prompt STAGE/LEAF`; with another location it runs `zfs load-key -n -L LOCATION STAGE/LEAF`.
-7. Repeats until no files remain. Scans the dataset, refuses if it has a snapshot, groups the names by inode, and cuts batches of at most `--batch-size`. For each batch: waits for free space above `--min-free` (`zpool sync`, up to 30 tries, 10 seconds apart), copies with `rsync -aHAXS --numeric-ids`, verifies every name against its copy, runs `zpool sync`, and only then deletes the verified source names. It never uses `rsync --delete` or `--remove-source-files`.
-8. When only directories are left: `zfs snapshot DATASET@enc-final`, rescan, rsync the directory attributes (restoring the original directory mtimes), unmount the dataset, `zpool sync`, and refuse if `written@enc-final` is non-zero.
+7. Repeats until no files remain. Scans the dataset, refuses if it has a snapshot, groups the names by inode, and cuts batches of at most `--batch-size`. For each batch: waits for free space above `--min-free` (`zpool sync`, up to 30 tries, 10 seconds apart), copies with `rsync -aHAXS --numeric-ids`, verifies every name against its copy, runs `zpool sync`, refuses if a snapshot appeared meanwhile, and only then deletes the verified source names. It never uses `rsync --delete` or `--remove-source-files`.
+8. When only directories are left: unmounts the dataset again (refusing while it is busy), mounts it with `-o noatime` and runs `zpool sync`, so the last deletes are settled; then `zfs snapshot DATASET@enc-final`, rescan, rsync the directory attributes (restoring the original directory mtimes), unmount the dataset, `zpool sync`, and refuse if `written@enc-final` is non-zero.
 9. Removes `.zfs-encrypt-migrate` from the staged dataset and unmounts it, then swaps as `cutover` does (rename the original to `STAGE/old/LEAF`, then the staged dataset into place), and sets the source's `mountpoint`, `sharenfs`, `sharesmb`, `reservation`, `refreservation` and `canmount` on the swapped dataset, removes its marker properties and mounts it.
 
 Each batch prints one line:
 
 ```text
-batch 7: 1204 files, 99.8 GiB moved, 4.2 TiB left
+batch 7: 1204 files, 99.8G moved, 4.2T left
 ```
 
 On success it prints:
@@ -317,8 +317,9 @@ The verification of a name compares type, mode, owner and group; for regular fil
 A source file whose `ctime` changed since the scan is skipped for that pass, and a destination mismatch fails the run with nothing of the batch deleted.
 
 On a failure or interrupt, rsync is stopped, the staged dataset is unmounted and its key unloaded, and before the swap the hint is `file-move stopped; the files are split between DATASET and STAGE/LEAF; do not destroy either.` followed by `Rerun the same command to continue.`
-From the swap on, the [recovery hints](#recovery-hints) of `cutover` apply, followed by the commands that finish the property fix-ups.
-If the dataset was left unmounted, the hint gives `zfs mount DATASET`.
+From the swap on, the [recovery hints](#recovery-hints) of `cutover` apply, followed by the commands that finish the property fix-ups; follow them rather than rerunning.
+A stop between unmounting the dataset and mounting it again in step 3 or step 8 adds `remount it with: zfs mount DATASET`.
+From the final unmount of step 8 on, the hints remount with `zfs mount -a` instead.
 
 | Message | Fix |
 | --- | --- |

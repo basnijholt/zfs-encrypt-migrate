@@ -178,7 +178,7 @@ A 30 TB dataset takes a day or two, and the dataset is not usable meanwhile: fil
 
 - Stop the services that read or write it, including containers that bind-mount it. The tool refuses a dataset it can't unmount, but a container's bind mount is not detected.
 - Stop the NFS server and Samba exports of it.
-- Disable snapshot tools (sanoid, zfs-auto-snapshot) for the dataset, then destroy its snapshots. A snapshot keeps deleted files allocated, so no space would be freed; `file-move` refuses while one exists, and again if one appears between batches.
+- Disable snapshot tools (sanoid, zfs-auto-snapshot) for the dataset, then destroy its snapshots. A snapshot keeps deleted files allocated, so no space would be freed; `file-move` refuses while one exists, and checks again before each batch is copied and before it is deleted.
 
 **2. Run it in tmux or screen.**
 
@@ -190,20 +190,22 @@ zfs-encrypt-migrate file-move tank/media --delete-source
 `--delete-source` is required: without it the command refuses before it touches anything.
 `--batch-size` (default `100G`, or `ZFS_ENCRYPT_MIGRATE_BATCH_SIZE`) sets how much goes into each batch; a bigger batch means fewer pauses and more free space needed.
 
-The first run unmounts and remounts the dataset to prove no writer has it open, creates the encrypted dataset `tank/stage/media` with the source's properties, copies the directory tree, and then checks the final passphrase.
+Every run first unmounts and remounts the dataset to prove no writer has it open.
+The first run then creates the encrypted dataset `tank/stage/media` with the source's properties, copies the directory tree, and checks the final passphrase.
 With the default `--final-keylocation prompt` it asks for the passphrase on the terminal, so start the first run from one; the passphrase must be the one in your key file.
 Each batch then prints a line:
 
 ```text
-batch 7: 1204 files, 99.8 GiB moved, 4.2 TiB left
+batch 7: 1204 files, 99.8G moved, 4.2T left
 ```
 
 When no files are left, it swaps the new dataset into place, and prints what to do next.
 
 **3. Stopping and continuing.**
-Every stop is safe to continue from: rerun the same command.
+A stop before the swap is safe to continue from: rerun the same command.
 Files already copied are verified again and deleted without copying twice.
 A failure or Ctrl-C stops rsync, unmounts the encrypted dataset and unloads its key, and the hint tells you the files are split between the two datasets: do not destroy either.
+When the error is followed by `file-move aborted.`, the swap had begun: run the commands it prints first, rather than rerunning straight away (see [recovery hints](usage.md#recovery-hints)).
 
 - Ctrl-C, SIGTERM and SIGHUP stop the run cleanly. Use Ctrl-C.
 - Ctrl-Z and Ctrl-\ are not caught: they stop only the CLI, while the current rsync batch finishes in the background. Don't use them.
