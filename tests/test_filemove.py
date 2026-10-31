@@ -297,7 +297,7 @@ def test_open_staged_creates_with_planned_props(filemove_env: FileMoveEnv, setti
     env = filemove_env
     env.sim.prop(DATASET, "compression", "zstd")
     guard = guard_for(env, settings)
-    path = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
+    path, device = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
     create = next(call for call in env.sim.log if call[1] == "create" and call[-1] == STAGED)
     options = {create[i + 1] for i, arg in enumerate(create) if arg == "-o"}
     assert {
@@ -309,8 +309,47 @@ def test_open_staged_creates_with_planned_props(filemove_env: FileMoveEnv, setti
     } <= options
     assert path == env.mount_root / "media"
     assert path.is_dir()
+    assert device == path.stat().st_dev
     assert guard.mounted == [STAGED]
     assert {STAGE, f"{STAGE}/old"} <= env.sim.datasets
+
+
+def test_open_staged_refuses_a_mountpoint_nothing_is_mounted_on(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When zfs reports the staged dataset mounted but its mountpoint is a bare directory, nothing is copied there."""
+    env = filemove_env
+    monkeypatch.setattr(filemove, "mount_device", lambda _path: None)
+    with pytest.raises(MigrationError) as info:
+        open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard_for(env, settings))
+    assert info.value.message == f"{STAGED} is not mounted at {env.mount_root / 'media'}"
+
+
+@needs_rsync
+def test_staged_on_another_device_stops_the_next_batch(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Something else mounted over the staged mountpoint, while zfs still says it is mounted, stops the run too."""
+    env = filemove_env
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    real_delete = filetree.delete
+
+    def delete_then_cover(src: Path, groups: Sequence[Group]) -> int:
+        count = real_delete(src, groups)
+        monkeypatch.setattr(filemove, "mount_device", lambda _path: dst.stat().st_dev + 1)
+        return count
+
+    monkeypatch.setattr(filemove, "delete", delete_then_cover)
+    with pytest.raises(MigrationError) as info:
+        move(env, settings, dst, 1, recorder()[1])
+    assert info.value.message == f"{STAGED} is no longer mounted at {dst}; nothing of this batch was deleted"
+    assert len(source_files(env)) == 2  # noqa: PLR2004
 
 
 def test_open_staged_reuses_mounted_staged(filemove_env: FileMoveEnv, settings: Settings) -> None:
@@ -371,7 +410,7 @@ def test_copy_tree_copies_dirs_twice_and_marks(filemove_env: FileMoveEnv, settin
     """Copy tree copies dirs twice and marks."""
     env = filemove_env
     guard = guard_for(env, settings)
-    dst = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
+    dst, _ = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
     copy_tree(env.zfs, STAGED, env.src, dst)
     for root in (dst, dst / SCRATCH / "dirs"):
         for rel in ("docs", "docs/deep", "empty"):
@@ -539,8 +578,10 @@ def tamper_after_rsync(env: FileMoveEnv, action: Callable[[int], object]) -> Non
 
 
 def move(env: FileMoveEnv, settings: Settings, dst: Path, batch_size: int, sleep: Callable[[float], None]) -> None:
-    """Run the move loop on the environment."""
-    move_files(env.zfs, settings, DATASET, env.src, dst, batch_size, sleep)
+    """Run the move loop on the environment, with the staged dataset mounted at ``dst``."""
+    env.sim.prop(STAGED, "mountpoint", str(dst))
+    env.sim.prop(STAGED, "mounted", "yes")
+    move_files(env.zfs, settings, DATASET, env.src, dst, batch_size, sleep, device=dst.stat().st_dev)
 
 
 def source_files(env: FileMoveEnv) -> list[str]:
@@ -648,6 +689,74 @@ def test_snapshot_appearing_mid_run_stops_before_next_batch(
     assert len(moved) == 1
     assert len(source_files(env)) == 2  # noqa: PLR2004
     assert not (env.src / moved[0]).exists()
+
+
+@needs_rsync
+def test_staged_unmounted_between_batches_stops_before_copying(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the staged dataset unmounted, its mountpoint is a bare directory: copies there would vanish.
+
+    The run stops before the next batch copies anything, so no source file is deleted against such a copy.
+    """
+    env = filemove_env
+    real_delete = filetree.delete
+    hidden = tmp_path / "hidden"
+
+    def delete_then_unmount(src: Path, groups: Sequence[Group]) -> int:
+        count = real_delete(src, groups)
+        if not hidden.exists():
+            # What zfs unmount does: the copies go with the dataset, an empty directory stays behind.
+            env.zfs.unmount(STAGED)
+            staged_dir(env).rename(hidden)
+            staged_dir(env).mkdir()
+        return count
+
+    monkeypatch.setattr(filemove, "delete", delete_then_unmount)
+    with pytest.raises(MigrationError) as info:
+        run_file_move(env, settings, tmp_path)
+    unmounted = f"{STAGED} is no longer mounted at {staged_dir(env)}; nothing of this batch was deleted"
+    assert info.value.message == unmounted
+    assert len(source_files(env)) == 2  # noqa: PLR2004
+    assert [p for p in staged_dir(env).rglob("*") if p.is_file()] == []
+
+
+@needs_rsync
+def test_staged_unmounted_between_passes_deletes_nothing_more(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pass that starts after the staged dataset was unmounted copies nothing into the bare directory left behind.
+
+    Without the check the pass recreated scratch there, copied, verified against that copy and deleted the source.
+    """
+    env = filemove_env
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    hidden = tmp_path / "hidden"
+    # A changed file is skipped by the first pass, so a second pass follows.
+    tamper_after_rsync(env, lambda n: (env.src / "a.txt").write_text("changed") if n == 1 else None)
+    real_delete = filetree.delete
+
+    def delete_then_unmount(src: Path, groups: Sequence[Group]) -> int:
+        count = real_delete(src, groups)
+        if not hidden.exists():
+            env.zfs.unmount(STAGED)
+            dst.rename(hidden)
+            dst.mkdir()
+        return count
+
+    monkeypatch.setattr(filemove, "delete", delete_then_unmount)
+    with pytest.raises(MigrationError) as info:
+        move(env, settings, dst, 10**9, recorder()[1])
+    assert info.value.message == f"{STAGED} is no longer mounted at {dst}; nothing of this batch was deleted"
+    assert source_files(env) == ["a.txt"]
+    assert list(dst.iterdir()) == []
 
 
 @needs_rsync
@@ -1008,7 +1117,7 @@ def test_finish_refuses_files_appearing(filemove_env: FileMoveEnv, settings: Set
 
 def moved(env: FileMoveEnv, settings: Settings, guard: AbortGuard) -> Path:
     """Open the staged dataset, copy the tree and move every file; return the staged path."""
-    dst = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
+    dst, _ = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
     copy_tree(env.zfs, STAGED, env.src, dst)
     move(env, settings, dst, 10**9, recorder()[1])
     return dst
@@ -1134,7 +1243,8 @@ def test_rerun_after_interrupt_mid_delete_keeps_links(
     monkeypatch.setattr(os, "unlink", interrupt_between_names)
     with pytest.raises(Interrupted):
         run_file_move(env, settings, tmp_path, batch_size=10**9)
-    monkeypatch.undo()
+    # Only os.unlink: undo() would also drop the fixture's mount stand-in.
+    monkeypatch.setattr(os, "unlink", unlink)
     dst = staged_dir(env)
     assert source_files(env) == ["docs/a-link.txt", "docs/b.txt", "docs/deep/c.txt"]
     inode = (dst / "a.txt").stat().st_ino

@@ -134,14 +134,17 @@ def _unchanged(src: Path, g: Group, *, missing_ok: bool = False) -> bool:
     return True
 
 
-def _check_copy(src: Path, dst: Path, name: str) -> int:
-    """Raise unless ``dst/name`` matches ``src/name``; return the copy's inode."""
+def _check_copy(src: Path, dst: Path, name: str, device: int) -> int:
+    """Raise unless ``dst/name`` matches ``src/name`` and lives on ``device``; return the copy's inode."""
     s = os.lstat(src / name)
     try:
         d = os.lstat(dst / name)
     except FileNotFoundError:
         msg = f"{name} is missing from the copy"
         raise MigrationError(msg) from None
+    if d.st_dev != device:
+        msg = f"the copy of {name} is not on the staged dataset"
+        raise MigrationError(msg)
     checks: list[tuple[str, object, object]] = [
         ("type", stat.S_IFMT(s.st_mode), stat.S_IFMT(d.st_mode)),
         ("mode", stat.S_IMODE(s.st_mode), stat.S_IMODE(d.st_mode)),
@@ -161,10 +164,12 @@ def _check_copy(src: Path, dst: Path, name: str) -> int:
     return d.st_ino
 
 
-def verify(src: Path, dst: Path, groups: Sequence[Group]) -> tuple[list[Group], list[Group]]:
+def verify(src: Path, dst: Path, groups: Sequence[Group], *, device: int) -> tuple[list[Group], list[Group]]:
     """Split groups into verified copies and groups whose source changed since the scan.
 
-    Any mismatch between source and copy raises, so nothing unverified is ever deleted.
+    Any mismatch between source and copy raises, so nothing unverified is ever deleted. Every copy must be
+    on ``device``, the staged dataset: a copy in the bare directory under an unmounted dataset looks complete
+    but vanishes once something mounts over it or the host reboots.
     """
     verified: list[Group] = []
     changed: list[Group] = []
@@ -172,7 +177,7 @@ def verify(src: Path, dst: Path, groups: Sequence[Group]) -> tuple[list[Group], 
         if not _unchanged(src, g):
             changed.append(g)
             continue
-        inodes = {_check_copy(src, dst, item.name) for item in g.entries}
+        inodes = {_check_copy(src, dst, item.name, device) for item in g.entries}
         if len(inodes) != 1:
             msg = f"hard links of {g.first} were not kept in the copy"
             raise MigrationError(msg)
@@ -198,6 +203,15 @@ def delete(src: Path, groups: Sequence[Group]) -> int:
                 continue
             count += 1
     return count
+
+
+def mount_device(path: Path) -> int | None:
+    """Return the device of the filesystem mounted at ``path``; None when ``path`` is missing or no mount point."""
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    return st.st_dev if st.st_dev != path.parent.stat().st_dev else None
 
 
 def temp_dir(dst: Path) -> Path:

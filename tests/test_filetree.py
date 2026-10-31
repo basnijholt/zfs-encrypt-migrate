@@ -17,6 +17,7 @@ from zfs_encrypt_migrate.filetree import (
     Group,
     delete,
     group_by_inode,
+    mount_device,
     plan_batches,
     remove_scratch,
     scan,
@@ -179,7 +180,7 @@ def test_verify_ok_after_copy(tmp_path: Path) -> None:
     os.mkfifo(dst / "fifo")
     (dst / "fifo").chmod(stat.S_IMODE(os.lstat(src / "fifo").st_mode))
     os.link(dst / "d" / "f", dst / "h")
-    verified, changed = verify(src, dst, groups)
+    verified, changed = verify(src, dst, groups, device=dst.stat().st_dev)
     assert verified == groups
     assert changed == []
 
@@ -193,7 +194,7 @@ def test_verify_changed_source_is_skipped(tmp_path: Path) -> None:
     copy_tree(src, dst, ["f", "g"])
     os.utime(src / "f", ns=(1, 2))
     (src / "g").unlink()
-    verified, changed = verify(src, dst, groups)
+    verified, changed = verify(src, dst, groups, device=dst.stat().st_dev)
     assert verified == []
     assert [g.first for g in changed] == ["f", "g"]
 
@@ -201,7 +202,7 @@ def test_verify_changed_source_is_skipped(tmp_path: Path) -> None:
 def verify_message(src: Path, dst: Path) -> str:
     """Verify message."""
     with pytest.raises(MigrationError) as exc:
-        verify(src, dst, scanned(src))
+        verify(src, dst, scanned(src), device=dst.stat().st_dev)
     return exc.value.message
 
 
@@ -210,6 +211,27 @@ def test_verify_missing_copy_raises(tmp_path: Path) -> None:
     src, dst = make_pair(tmp_path)
     (src / "f").write_text("x")
     assert verify_message(src, dst) == "f is missing from the copy"
+
+
+def test_verify_copy_on_another_device_raises(tmp_path: Path) -> None:
+    """A copy that is not on the staged dataset's device is never trusted, however well it matches."""
+    src, dst = make_pair(tmp_path)
+    (src / "f").write_text("x")
+    copy_tree(src, dst, ["f"])
+    with pytest.raises(MigrationError) as exc:
+        verify(src, dst, scanned(src), device=dst.stat().st_dev + 1)
+    assert exc.value.message == "the copy of f is not on the staged dataset"
+
+
+def test_mount_device_needs_a_mount_point(tmp_path: Path) -> None:
+    """A plain or missing directory has no filesystem mounted on it; a mount point gives its device."""
+    assert mount_device(tmp_path) in {None, tmp_path.stat().st_dev}
+    (tmp_path / "plain").mkdir()
+    assert mount_device(tmp_path / "plain") is None
+    assert mount_device(tmp_path / "missing") is None
+    proc = Path("/proc")
+    if os.path.ismount(proc):
+        assert mount_device(proc) == proc.stat().st_dev
 
 
 def test_verify_type_mismatch_raises(tmp_path: Path) -> None:
@@ -248,7 +270,7 @@ def test_verify_owner_mismatch_raises(tmp_path: Path, monkeypatch: pytest.Monkey
     groups = scanned(src)
     monkeypatch.setattr(os, "lstat", fake)
     with pytest.raises(MigrationError) as exc:
-        verify(src, dst, groups)
+        verify(src, dst, groups, device=dst.stat().st_dev)
     assert exc.value.message == "f differs from its copy (uid)"
 
 
@@ -270,7 +292,7 @@ def test_verify_group_mismatch_raises(tmp_path: Path, monkeypatch: pytest.Monkey
     groups = scanned(src)
     monkeypatch.setattr(os, "lstat", fake)
     with pytest.raises(MigrationError) as exc:
-        verify(src, dst, groups)
+        verify(src, dst, groups, device=dst.stat().st_dev)
     assert exc.value.message == "f differs from its copy (gid)"
 
 
@@ -319,7 +341,7 @@ def test_verify_device_mismatch_raises(tmp_path: Path, monkeypatch: pytest.Monke
     groups = scanned(src)
     monkeypatch.setattr(os, "lstat", fake)
     with pytest.raises(MigrationError) as exc:
-        verify(src, dst, groups)
+        verify(src, dst, groups, device=dst.stat().st_dev)
     assert exc.value.message == "dev differs from its copy (rdev)"
 
 
@@ -372,7 +394,7 @@ def test_delete_skips_group_replaced_after_verify(tmp_path: Path) -> None:
     (src / "other").write_text("o")
     groups = scanned(src)
     copy_tree(src, dst, ["cfg", "other"])
-    verified, changed = verify(src, dst, groups)
+    verified, changed = verify(src, dst, groups, device=dst.stat().st_dev)
     assert changed == []
     (src / "cfg.new").write_text("new")
     (src / "cfg.new").replace(src / "cfg")

@@ -25,6 +25,7 @@ from .errors import Interrupted, MigrationError
 from .filetree import (
     delete,
     group_by_inode,
+    mount_device,
     plan_batches,
     remove_partials,
     remove_scratch,
@@ -198,8 +199,11 @@ def open_staged(  # noqa: PLR0917
     source_props: Mapping[str, Prop],
     mount_root: Path,
     guard: AbortGuard,
-) -> Path:
-    """Create the encrypted staged dataset on the first run; load its key and mount it. Return its path."""
+) -> tuple[Path, int]:
+    """Create the encrypted staged dataset on the first run; load its key and mount it.
+
+    Return its mountpoint and the device of the mounted dataset, which every later copy must be on.
+    """
     leaf = leaf_of(dataset)
     staged = f"{settings.stage}/{leaf}"
     if not zfs.exists(staged):
@@ -221,7 +225,12 @@ def open_staged(  # noqa: PLR0917
     guard.mounted.append(staged)
     if zfs.get("mounted", staged) != "yes":
         zfs.mount(staged)
-    return Path(zfs.get("mountpoint", staged))
+    path = Path(zfs.get("mountpoint", staged))
+    device = mount_device(path)
+    if device is None:
+        msg = f"{staged} is not mounted at {path}"
+        raise MigrationError(msg)
+    return path, device
 
 
 # rsync compares times in whole seconds by default; a negative window (rsync 3.1.3+) adds the nanoseconds.
@@ -337,6 +346,17 @@ def _refuse_snapshots(zfs: Zfs, dataset: str) -> None:
         raise MigrationError(msg, hints)
 
 
+def _refuse_unmounted(zfs: Zfs, staged: str, dst: Path, device: int) -> None:
+    """Refuse unless the staged dataset is still the filesystem mounted at ``dst``.
+
+    Once it is unmounted, ``dst`` is a bare directory: copies there pass verify, and the source files deleted
+    against them are gone once the dataset mounts over them again or the host reboots.
+    """
+    if zfs.get("mounted", staged) != "yes" or mount_device(dst) != device:
+        msg = f"{staged} is no longer mounted at {dst}; nothing of this batch was deleted"
+        raise MigrationError(msg)
+
+
 def move_files(  # noqa: PLR0917
     zfs: Zfs,
     settings: Settings,
@@ -345,19 +365,27 @@ def move_files(  # noqa: PLR0917
     dst: Path,
     batch_size: int,
     sleep: Callable[[float], None],
+    *,
+    device: int,
 ) -> None:
-    """Move every file into the copy in verified batches; delete a batch only after its copy is verified and synced."""
+    """Move every file into the copy in verified batches; delete a batch only after its copy is verified and synced.
+
+    ``device`` is the device of the staged dataset mounted at ``dst``; every copy must be on it.
+    """
     pool = pool_of(settings.stage)
+    staged = f"{settings.stage}/{leaf_of(dataset)}"
     scratch = dst / SCRATCH
     # Before any space check, since they hold space; the run lock keeps every other run out of scratch.
     remove_partials(dst)
     batch_number = 0
     while entries := scan(src):
-        # Created only when files remain: a rerun after finish removed scratch must not change the copy's root.
-        scratch.mkdir(parents=True, exist_ok=True)
         left = sum(group.allocated for group in group_by_inode(entries, src))
         deleted = 0
         for batch in plan_batches(group_by_inode(entries, src), batch_size):
+            # Before anything is written into dst: it may have become a bare directory since the last batch.
+            _refuse_unmounted(zfs, staged, dst, device)
+            # Created only when files remain: a rerun after finish removed scratch must not change the copy's root.
+            scratch.mkdir(exist_ok=True)
             # Checked before every batch: a snapshot that appears mid-run would pin the deleted files.
             _refuse_snapshots(zfs, dataset)
             moved = sum(group.allocated for group in batch)
@@ -366,7 +394,7 @@ def move_files(  # noqa: PLR0917
             wait_for_space(zfs, settings, missing, sleep)
             write_file_list(scratch / "files", batch)
             rsync_files(zfs, src, dst, scratch / "files")
-            verified, _changed = verify(src, dst, batch)
+            verified, _changed = verify(src, dst, batch, device=device)
             zfs.pool_sync(pool)
             # And again right before deleting: a snapshot taken while the batch copied would pin it.
             _refuse_snapshots(zfs, dataset)
@@ -484,12 +512,12 @@ def file_move(
                 f"file-move stopped; the files are split between {dataset} and {staged}; do not destroy either.",
                 "Rerun the same command to continue.",
             ]
-            dst = open_staged(zfs, settings, dataset, source_props, mount_root, guard)
+            dst, device = open_staged(zfs, settings, dataset, source_props, mount_root, guard)
             # Copying into or over the source would verify each file against itself and delete it.
             if dst.is_relative_to(src) or src.is_relative_to(dst):
                 msg = f"{staged} is mounted at {dst}, which overlaps {dataset} at {src}"
                 raise MigrationError(msg)
             copy_tree(zfs, staged, src, dst)
             check_passphrase(zfs, settings, staged)
-            move_files(zfs, settings, dataset, src, dst, batch_size, sleep)
+            move_files(zfs, settings, dataset, src, dst, batch_size, sleep, device=device)
             return finish(zfs, settings, dataset, src, dst, guard)
