@@ -168,7 +168,7 @@ At the end it swaps the new dataset into place under the same name and mountpoin
 Requirements, on top of the usual ones:
 
 - `rsync` 3.1.3 or newer, with ACL and xattr support, on `PATH`. The Nix package appends one to `PATH` for you; with pip or uv, install it from your distribution.
-- Nothing from the list below. Check before you start: `zfs get dedup,reservation,refreservation,origin DATASET`, `zpool get dedup_table_size,dedupratio,checkpoint,bcloneused,bclonesaved POOL`, and `zfs list -r DATASET` for children.
+- Nothing from the list below. Check before you start: `zfs get dedup,reservation,refreservation,origin DATASET`, `zpool get dedup_table_size,dedupratio,checkpoint,bcloneused,bclonesaved,altroot POOL`, and `zfs list -r DATASET` for children.
 
 **Not supported.**
 `file-move` relies on every deleted file freeing its space, so it checks for what would stop that before it creates or deletes anything:
@@ -177,6 +177,7 @@ Requirements, on top of the usual ones:
 - **Reservations.** A `reservation` or `refreservation` on the dataset, or a `reservation` on a parent that does not also hold the stage. Refused on every run, with the command that clears it; set it again after the swap.
 - **Clones.** A dataset that is a clone: its origin keeps the space of deleted files. Refused on every run; `zfs promote` it first.
 - **Pool checkpoints.** A checkpoint keeps deleted space allocated. Refused on every run; `zpool checkpoint -d POOL` first.
+- **A pool imported with an altroot.** After `zpool import -R`, `zfs get` adds the altroot to every mountpoint, so the swap would store it in the new dataset's mountpoint. Refused on every run; import the pool without `-R` first.
 - **A move whose worst case does not fit.** Before it deletes the first file, `file-move` needs free space above `--min-free` for the largest batch (or the largest file, if bigger: moving the others first frees only what their copies take), plus the pool's block-cloned savings `bclonesaved` (a copy of a cloned file takes its full size), plus, with `compression` now `off`, what old compressed data grows by when copied (`logicalreferenced` minus `referenced`). Refused otherwise; checked once per move.
 - **Child datasets and volumes.** Refused: for a parent with children, use the [tree commands](#moving-a-big-tree), and `file-move` for a big child on its own; for a volume, `seed` and `cutover`.
 - **Per-user, per-group and per-project quotas and project IDs.** A documented limit, not checked: `userquota@`, `groupquota@` and `projectquota@` (and their `objquota@` forms) are not in `zfs get all`, and rsync doesn't copy a file's project ID, so they are not carried over (`seed` and `cutover` keep both). Note them before the move with `zfs userspace`, `zfs groupspace`, `zfs projectspace` and `zfs project -r`, and set them again on the new dataset after the swap.

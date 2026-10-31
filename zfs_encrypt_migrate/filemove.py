@@ -214,6 +214,12 @@ def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
     refuse_cross_pool(settings, dataset, "file-move")
     refuse_nested(settings, dataset)
     source = _refuse_source(zfs, dataset)
+    # zfs get mountpoint includes the altroot, so the swap's fix-up would store it in the mountpoint.
+    pool = pool_of(dataset)
+    altroot = zfs.pool_get("altroot", pool)
+    if altroot != "-":
+        msg = f"pool {pool} is imported with altroot={altroot}; file-move needs a normal import"
+        raise MigrationError(msg)
     _refuse_pinned_space(zfs, settings, dataset)
     stage = settings.stage
     staged = f"{stage}/{leaf_of(dataset)}"

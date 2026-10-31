@@ -137,6 +137,12 @@ def test_preflight_refuses_unmounted(filemove_env: FileMoveEnv, settings: Settin
     refused(filemove_env, settings, f"{DATASET} is not mounted")
 
 
+def test_preflight_refuses_an_altroot_import(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """With an altroot, zfs get mountpoint includes it, so the swap's fix-up would store it in the mountpoint."""
+    filemove_env.sim.pool_props["tank", "altroot"] = "/mnt"
+    refused(filemove_env, settings, "pool tank is imported with altroot=/mnt; file-move needs a normal import")
+
+
 def test_preflight_refuses_reserved_name(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Preflight refuses reserved name."""
     reserved = filemove_env.src / SCRATCH
