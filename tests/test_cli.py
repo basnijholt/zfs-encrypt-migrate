@@ -504,11 +504,13 @@ def test_tree_commands_are_in_their_own_help_panel() -> None:
 
 def test_file_move_help_lists_options() -> None:
     """The help names the batch size, its env var and the delete confirmation."""
-    result = runner.invoke(cli.app, ["file-move", "--help"], terminal_width=200)
+    result = runner.invoke(cli.app, ["file-move", "--help"], env={"COLUMNS": "200"})
+    listing = runner.invoke(cli.app, ["--help"])
 
     assert result.exit_code == 0
-    for text in ("--batch-size", "--delete-source", "Target size of each batch", "File-Move Commands"):
+    for text in ("--batch-size", "--delete-source", "Target size of each batch"):
         assert text in result.output
+    assert "File-Move Commands" in listing.output
 
 
 def test_file_move_without_delete_source_exits_1(sim: ZfsSim) -> None:
