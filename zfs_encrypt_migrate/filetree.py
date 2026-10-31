@@ -200,6 +200,22 @@ def delete(src: Path, groups: Sequence[Group]) -> int:
     return count
 
 
+def temp_dir(dst: Path) -> Path:
+    """Return the directory rsync writes each file into before it renames the file into place."""
+    return dst / SCRATCH / "tmp"
+
+
+def remove_partials(dst: Path) -> None:
+    """Remove the partial files an rsync stopped by a power loss or SIGKILL left behind.
+
+    They would hold their space for the rest of the move. Only the temp directory goes: the pristine
+    directory copy beside it is needed until the swap.
+    """
+    temp = temp_dir(dst)
+    if temp.is_dir():
+        shutil.rmtree(temp)
+
+
 def remove_scratch(dst: Path) -> None:
     """Remove whatever is left of the scratch directory; restore the root's times from the pristine copy.
 

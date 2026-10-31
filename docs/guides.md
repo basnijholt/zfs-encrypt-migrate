@@ -204,6 +204,7 @@ When no files are left, it swaps the new dataset into place, and prints what to 
 **3. Stopping and continuing.**
 A stop before the swap is safe to continue from: rerun the same command.
 Files already copied are verified again and deleted without copying twice, and need no new free space.
+After a power loss or `kill -9`, the rerun first removes the partial files rsync left in the encrypted dataset's `.zfs-encrypt-migrate/tmp`.
 A failure or Ctrl-C stops rsync, unmounts the encrypted dataset and unloads its key, and the hint tells you the files are split between the two datasets: do not destroy either.
 When the error is followed by `file-move aborted.`, the swap had begun: run the commands it prints first, rather than rerunning straight away (see [recovery hints](usage.md#recovery-hints)).
 

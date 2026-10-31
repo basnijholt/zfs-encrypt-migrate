@@ -22,7 +22,17 @@ from .constants import (
     STAGING_MOUNT_ROOT,
 )
 from .errors import Interrupted, MigrationError
-from .filetree import delete, group_by_inode, plan_batches, remove_scratch, scan, verify, write_file_list
+from .filetree import (
+    delete,
+    group_by_inode,
+    plan_batches,
+    remove_partials,
+    remove_scratch,
+    scan,
+    temp_dir,
+    verify,
+    write_file_list,
+)
 from .migrate import (
     ENCRYPTION,
     FINAL_SNAPSHOT,
@@ -197,7 +207,7 @@ def _rsync(zfs: Zfs, args: list[str]) -> None:
 
 def rsync_files(zfs: Zfs, src: Path, dst: Path, file_list: Path) -> None:
     """Copy the NUL-separated list of files, keeping hardlinks, ACLs, xattrs and sparseness."""
-    temp = dst / SCRATCH / "tmp"
+    temp = temp_dir(dst)
     temp.mkdir(parents=True, exist_ok=True)
     _rsync(
         zfs,
@@ -303,6 +313,8 @@ def move_files(  # noqa: PLR0917
     """Move every file into the copy in verified batches; delete a batch only after its copy is verified and synced."""
     pool = pool_of(settings.stage)
     scratch = dst / SCRATCH
+    # Before any space check, since they hold space; the run lock keeps every other run out of scratch.
+    remove_partials(dst)
     batch_number = 0
     while entries := scan(src):
         # Created only when files remain: a rerun after finish removed scratch must not change the copy's root.

@@ -595,6 +595,25 @@ def test_refuses_when_space_never_frees(filemove_env: FileMoveEnv, settings: Set
     assert len(slept) == SPACE_ATTEMPTS - 1
 
 
+def test_move_removes_partial_files_before_the_space_check(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """Temp files of an rsync killed by a power loss or SIGKILL are removed first; the pristine copy stays."""
+    env = filemove_env
+    dst = tmp_path / "dst"
+    temp = dst / SCRATCH / "tmp"
+    temp.mkdir(parents=True)
+    (temp / ".a.txt.Xy12Zq").write_bytes(b"partial")
+    (dst / SCRATCH / "dirs" / "docs").mkdir(parents=True)
+    env.sim.avail = 0
+    with pytest.raises(MigrationError, match="not enough free space"):
+        move(env, settings, dst, 10**9, recorder()[1])
+    assert not temp.exists() or list(temp.iterdir()) == []
+    assert (dst / SCRATCH / "dirs" / "docs").is_dir()
+
+
 @needs_rsync
 def test_copies_left_by_a_stop_need_no_space(
     filemove_env: FileMoveEnv,
