@@ -596,6 +596,34 @@ def test_refuses_when_space_never_frees(filemove_env: FileMoveEnv, settings: Set
 
 
 @needs_rsync
+def test_copies_left_by_a_stop_need_no_space(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A batch whose copies a stopped run left behind waits only for the space of the files not copied yet.
+
+    Budgeting the whole batch again would keep a run near the floor from ever reaching verify and delete.
+    """
+    env = filemove_env
+    size = 4096
+    # A fixed size per file: a fresh file's allocation changes once the pool writes it out.
+    monkeypatch.setattr(filemove, "scan", lambda root: [replace(item, allocated=size) for item in filetree.scan(root)])
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    groups = filetree.group_by_inode(filetree.scan(env.src), env.src)
+    filetree.write_file_list(tmp_path / "list", [g for g in groups if g.first != "docs/deep/c.txt"])
+    rsync_files(env.zfs, env.src, dst, tmp_path / "list")
+    # Room for c.txt, the one file not copied yet, but not for the whole batch of three.
+    env.sim.avail = settings.min_free + size
+    slept, sleep = recorder()
+    move(env, settings, dst, 10**9, sleep)
+    assert source_files(env) == []
+    assert slept == []
+
+
+@needs_rsync
 def test_rsync_failure_deletes_nothing(filemove_env: FileMoveEnv, settings: Settings, tmp_path: Path) -> None:
     """Rsync failure deletes nothing."""
     env = filemove_env

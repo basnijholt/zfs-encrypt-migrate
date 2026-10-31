@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import os
 import shlex
 import sys
 import time
@@ -312,7 +313,9 @@ def move_files(  # noqa: PLR0917
             # Checked before every batch: a snapshot that appears mid-run would pin the deleted files.
             _refuse_snapshots(zfs, dataset)
             moved = sum(group.allocated for group in batch)
-            wait_for_space(zfs, settings, moved, sleep)
+            # A stop between copy and delete leaves copies that need no new space; rsync skips them.
+            missing = sum(group.allocated for group in batch if not os.path.lexists(dst / group.first))
+            wait_for_space(zfs, settings, missing, sleep)
             write_file_list(scratch / "files", batch)
             rsync_files(zfs, src, dst, scratch / "files")
             verified, _changed = verify(src, dst, batch)
