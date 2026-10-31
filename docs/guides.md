@@ -243,6 +243,7 @@ If a hard-linked file has fewer names in the dataset than its link count says, t
 - **Old plaintext blocks stay on disk until overwritten.** Deleting files frees their blocks; it doesn't wipe them.
 - **A nearly full pool is slow.** ZFS allocates slowly when little is free; use a smaller `--batch-size`.
 - **`sharenfs`, `sharesmb`, `reservation` and `refreservation` are set only after the swap,** so a stopped run never leaves them on the encrypted dataset's private mountpoint.
+- **Per-user, per-group and per-project quotas and project IDs are not carried over.** `userquota@`, `groupquota@` and `projectquota@` (and their `objquota@` forms) are not in `zfs get all`, and rsync doesn't copy a file's project ID; `seed` and `cutover` keep both because they send the dataset. Note them before the move with `zfs userspace`, `zfs groupspace`, `zfs projectspace` and `zfs project -r`, and set them again on the new dataset after the swap.
 
 ## Rebuilding a Whole Pool Encrypted
 

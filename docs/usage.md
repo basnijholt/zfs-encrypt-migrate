@@ -316,6 +316,8 @@ file-move done; once verified, free the old copy with: zfs destroy -r STAGE/old/
 The verification of a name compares type, mode, owner and group; for regular files size and mtime; for symlinks the target; for device nodes `st_rdev`; and requires all copies of a hard-linked file to share one inode.
 A source file whose `ctime` changed since the scan is skipped for that pass, and a destination mismatch fails the run with nothing of the batch deleted.
 
+Not carried over: per-user, per-group and per-project quotas (`userquota@`, `groupquota@`, `projectquota@` and their `objquota@` forms) and the project IDs of files. `zfs get all` does not list those quotas and rsync does not copy project IDs; `seed` and `cutover` keep both, since they send the dataset. Note them before the move (`zfs userspace`, `zfs groupspace`, `zfs projectspace`, `zfs project -r`) and set them again on the swapped dataset.
+
 On a failure or interrupt, rsync is stopped, the staged dataset is unmounted and its key unloaded, and before the swap the hint is `file-move stopped; the files are split between DATASET and STAGE/LEAF; do not destroy either.` followed by `Rerun the same command to continue.`
 From the swap on, the [recovery hints](#recovery-hints) of `cutover` apply, followed by the commands that finish the property fix-ups; follow them rather than rerunning.
 A stop between unmounting the dataset and mounting it again in step 3 or step 8 adds `remount it with: zfs mount DATASET`.
@@ -342,7 +344,7 @@ From the final unmount of step 8 on, the hints remount with `zfs mount -a` inste
 | `run file-move once from a terminal so it can check the passphrase` | Run it from a terminal (tmux), or pass `--final-keylocation file:///absolute/path`. |
 | `the key for STAGE/LEAF did not load from LOCATION; nothing was deleted` | Fix the key or location; the first mistyped passphrase deletes nothing. |
 | `DATASET has snapshots, which keep deleted files allocated: ...` | Disable snapshot tools for the dataset, then destroy the snapshots it lists (`zfs destroy SNAPSHOT`). |
-| `PATH has N hard links but only M were found` | A name of that file lives outside the dataset, or the dataset changed during the scan. Stop the writers and rerun. |
+| `PATH has N hard links but only M were found` | The dataset changed during the scan: a writer added or removed a link. Stop the writers and rerun. |
 | `not enough free space on POOL for the next batch (SIZE) above the floor SIZE` | Free space or lower `--batch-size`, then rerun. |
 | `N files kept changing during the move; stop the writers and rerun` | Stop whatever writes to the dataset. |
 | `N files appeared in DATASET during the swap; stop the writers and rerun` | Stop the writers and rerun. |

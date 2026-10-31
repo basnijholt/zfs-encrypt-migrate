@@ -77,7 +77,7 @@ def scan(root: Path) -> list[Entry]:
 
 
 def group_by_inode(entries: Iterable[Entry], root: Path) -> list[Group]:
-    """Join the names of each inode; refuse when a hard link lives outside ``root``."""
+    """Join the names of each inode; refuse when fewer names were found than the link count (a writer changed links)."""
     by_ino: dict[int, list[Entry]] = {}
     for item in entries:
         by_ino.setdefault(item.ino, []).append(item)
