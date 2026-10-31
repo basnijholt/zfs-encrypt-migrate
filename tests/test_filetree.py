@@ -10,7 +10,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from zfs_encrypt_migrate import filetree
 from zfs_encrypt_migrate.constants import SCRATCH
 from zfs_encrypt_migrate.errors import MigrationError
 from zfs_encrypt_migrate.filetree import (
@@ -106,7 +105,7 @@ def test_scan_refuses_foreign_device(tmp_path: Path, monkeypatch: pytest.MonkeyP
             return os.stat_result(values)
         return st
 
-    monkeypatch.setattr(filetree.os, "lstat", fake)
+    monkeypatch.setattr(os, "lstat", fake)
     with pytest.raises(MigrationError) as exc:
         scan(tmp_path)
     assert exc.value.message == f"{tmp_path / 'mnt'} is another filesystem mounted inside {tmp_path}"
@@ -247,7 +246,7 @@ def test_verify_owner_mismatch_raises(tmp_path: Path, monkeypatch: pytest.Monkey
         return st
 
     groups = scanned(src)
-    monkeypatch.setattr(filetree.os, "lstat", fake)
+    monkeypatch.setattr(os, "lstat", fake)
     with pytest.raises(MigrationError) as exc:
         verify(src, dst, groups)
     assert exc.value.message == "f differs from its copy (uid)"
@@ -269,7 +268,7 @@ def test_verify_group_mismatch_raises(tmp_path: Path, monkeypatch: pytest.Monkey
         return st
 
     groups = scanned(src)
-    monkeypatch.setattr(filetree.os, "lstat", fake)
+    monkeypatch.setattr(os, "lstat", fake)
     with pytest.raises(MigrationError) as exc:
         verify(src, dst, groups)
     assert exc.value.message == "f differs from its copy (gid)"
@@ -318,7 +317,7 @@ def test_verify_device_mismatch_raises(tmp_path: Path, monkeypatch: pytest.Monke
 
     (dst / "dev").write_text("x")
     groups = scanned(src)
-    monkeypatch.setattr(filetree.os, "lstat", fake)
+    monkeypatch.setattr(os, "lstat", fake)
     with pytest.raises(MigrationError) as exc:
         verify(src, dst, groups)
     assert exc.value.message == "dev differs from its copy (rdev)"

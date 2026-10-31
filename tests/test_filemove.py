@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from zfs_encrypt_migrate import filemove
+from zfs_encrypt_migrate import filemove, filetree
 from zfs_encrypt_migrate.constants import MARK_DIRS, MARK_KEY, MARK_SOURCE, SCRATCH, SPACE_ATTEMPTS, SPACE_DELAY_SECONDS
 from zfs_encrypt_migrate.errors import Interrupted, MigrationError, ZfsError
 from zfs_encrypt_migrate.filemove import (
@@ -412,7 +412,7 @@ def recorder() -> tuple[list[float], Callable[[float], None]]:
     return slept, slept.append
 
 
-def tamper_after_rsync(env: FileMoveEnv, action: Callable[[int], None]) -> None:
+def tamper_after_rsync(env: FileMoveEnv, action: Callable[[int], object]) -> None:
     """Run ``action(rsync_count)`` right after every real rsync."""
     inner = env.runner.responder
     count = 0
@@ -522,7 +522,7 @@ def test_snapshot_appearing_mid_run_stops_before_next_batch(
     env = filemove_env
     dst = tmp_path / "dst"
     dst.mkdir()
-    real_delete = filemove.delete
+    real_delete = filetree.delete
 
     def delete_then_snapshot(src: Path, groups: Sequence[Group]) -> int:
         count = real_delete(src, groups)
