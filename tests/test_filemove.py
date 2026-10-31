@@ -1045,7 +1045,9 @@ def fixed_sizes(root: Path) -> list[filetree.Entry]:
 
 ADMISSION = [
     # (case, batch size, pool properties, source properties, largest batch or file, cloned, lost compression)
-    ("batch", 20_000, {}, {}, 20_000, 0, 0),
+    ("batch", 10_000, {}, {}, 10_000, 0, 0),
+    # A batch size above all the data: the largest batch is all of it.
+    ("small", 10**9, {}, {}, 11_000, 0, 0),
     ("file", 1, {}, {}, 9000, 0, 0),
     ("cloned", 1, {"bclonesaved": "3000"}, {}, 9000, 3000, 0),
     ("uncompressed", 1, {}, {"compression": "off", "logicalreferenced": "50000", "referenced": "48000"}, 9000, 0, 2000),
@@ -1075,7 +1077,8 @@ def test_admission_needs_room_for_the_worst_case(  # noqa: PLR0917
 ) -> None:
     """Before the move deletes anything, free space must cover its worst case, or it could stall half-moved.
 
-    The largest batch or file (deleting others frees only what their copies take), block-cloned data (a copy
+    The largest batch, never more than the files to copy, or the largest file (deleting others frees only what
+    their copies take), block-cloned data (a copy
     of a clone takes its full size) and, with compression now off, what the old compressed data grows by.
     """
     env = filemove_env
@@ -1117,8 +1120,31 @@ def test_admission_reads_no_block_cloning_as_none(filemove_env: FileMoveEnv, set
 
     zfs, _ = make(env.sim, no_such_property)
     env.sim.avail = settings.min_free + 9000
-    admit(zfs, settings, DATASET, filetree.group_by_inode(fixed_sizes(env.src), env.src), 1)
+    admit(zfs, settings, DATASET, filetree.group_by_inode(fixed_sizes(env.src), env.src), 1, dst=env.mount_root)
     assert env.sim.props[STAGED, MARK_ADMITTED] == "yes"
+
+
+@pytest.mark.parametrize("spare", [0, -1])
+def test_admission_counts_only_files_without_a_copy(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    spare: int,
+) -> None:
+    """A batch never copies more than the files without a copy yet, so a bigger batch size needs no more room."""
+    env = filemove_env
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    (dst / "a.txt").write_text("a")
+    groups = filetree.group_by_inode(fixed_sizes(env.src), env.src)
+    # b.txt (9000) and c.txt (1000) are left to copy.
+    env.sim.avail = settings.min_free + 10_000 + spare
+    if spare >= 0:
+        admit(env.zfs, settings, DATASET, groups, 10**9, dst=dst)
+        assert env.sim.props[STAGED, MARK_ADMITTED] == "yes"
+        return
+    with pytest.raises(MigrationError, match=r"largest batch or file 9\.8K,"):
+        admit(env.zfs, settings, DATASET, groups, 10**9, dst=dst)
 
 
 @needs_rsync
