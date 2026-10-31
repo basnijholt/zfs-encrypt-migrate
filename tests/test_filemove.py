@@ -2,31 +2,36 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import replace
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
 from zfs_encrypt_migrate import filemove
-from zfs_encrypt_migrate.constants import MARK_DIRS, MARK_KEY, MARK_SOURCE, SCRATCH
+from zfs_encrypt_migrate.constants import MARK_DIRS, MARK_KEY, MARK_SOURCE, SCRATCH, SPACE_ATTEMPTS, SPACE_DELAY_SECONDS
 from zfs_encrypt_migrate.errors import MigrationError
 from zfs_encrypt_migrate.filemove import (
     check_passphrase,
     copy_tree,
+    move_files,
     open_staged,
     preflight_file_move,
     probe_writers,
     run_lock,
+    wait_for_space,
 )
 from zfs_encrypt_migrate.migrate import AbortGuard
 
-from .conftest import STAGE, FileMoveEnv, needs_rsync
+from .conftest import STAGE, FileMoveEnv, fail, needs_rsync
 from .helpers import fail_on, make
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Callable, Sequence
 
     from zfs_encrypt_migrate.migrate import Settings
+    from zfs_encrypt_migrate.process import CommandResult
 
 DATASET = "tank/media"
 STAGED = f"{STAGE}/media"
@@ -303,3 +308,173 @@ def test_check_passphrase_skips_when_marked(filemove_env: FileMoveEnv, settings:
     check_passphrase(filemove_env.zfs, settings, STAGED)
     assert filemove_env.runner.attached == []
     assert not [call for call in filemove_env.runner.calls if "load-key" in call]
+
+
+# --- move loop ---
+
+
+def recorder() -> tuple[list[float], Callable[[float], None]]:
+    """Return the list of sleeps and a fake sleep that records them."""
+    slept: list[float] = []
+    return slept, slept.append
+
+
+def tamper_after_rsync(env: FileMoveEnv, action: Callable[[int], None]) -> None:
+    """Run ``action(rsync_count)`` right after every real rsync."""
+    inner = env.runner.responder
+    count = 0
+
+    def responder(args: Sequence[str]) -> CommandResult:
+        nonlocal count
+        result = inner(args)
+        if args[0] == "rsync":
+            count += 1
+            action(count)
+        return result
+
+    env.runner.responder = responder
+
+
+def move(env: FileMoveEnv, settings: Settings, dst: Path, batch_size: int, sleep: Callable[[float], None]) -> None:
+    """Run the move loop on the environment."""
+    move_files(env.zfs, settings, DATASET, env.src, dst, batch_size, sleep)
+
+
+def source_files(env: FileMoveEnv) -> list[str]:
+    """Names of the non-directory entries left in the source."""
+    return sorted(str(p.relative_to(env.src)) for p in env.src.rglob("*") if not p.is_dir() or p.is_symlink())
+
+
+@needs_rsync
+def test_moves_everything_in_batches(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Moves everything in batches."""
+    env = filemove_env
+    os.link(env.src / "a.txt", env.src / "docs" / "deep" / "a-link.txt")
+    (env.src / "link").symlink_to("a.txt")
+    (env.src / "big.bin").write_bytes(b"x" * 20000)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    _slept, sleep = recorder()
+    move(env, settings, dst, 1, sleep)
+    assert source_files(env) == []
+    assert (dst / "docs" / "b.txt").read_text() == "b"
+    assert (dst / "big.bin").stat().st_size == 20000  # noqa: PLR2004
+    assert (dst / "link").readlink() == Path("a.txt")
+    assert (dst / "a.txt").stat().st_ino == (dst / "docs" / "deep" / "a-link.txt").stat().st_ino
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("batch ")]
+    assert len(lines) == 5  # noqa: PLR2004
+    assert lines[0].startswith("batch 1: ")
+    assert lines[-1].endswith(" left")
+    assert lines[-1].startswith("batch 5: ")
+    assert ("zpool", "sync", "tank") in env.sim.ops()
+
+
+@needs_rsync
+def test_snapshot_appearing_mid_run_stops_before_next_batch(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """Snapshot appearing mid run stops before next batch."""
+    env = filemove_env
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    tamper_after_rsync(env, lambda n: env.sim.snapshot(f"{DATASET}@auto") if n == 1 else None)
+    with pytest.raises(MigrationError) as info:
+        move(env, settings, dst, 1, recorder()[1])
+    assert info.value.message == f"{DATASET} has snapshots, which keep deleted files allocated: {DATASET}@auto"
+    assert info.value.hints == (f"disable snapshot tools for {DATASET}, then remove them: zfs destroy {DATASET}@auto",)
+    moved = sorted(str(p.relative_to(dst)) for p in dst.rglob("*.txt"))
+    assert len(moved) == 1
+    assert len(source_files(env)) == 2  # noqa: PLR2004
+    assert not (env.src / moved[0]).exists()
+
+
+def test_waits_for_freed_space(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """Waits for freed space."""
+    env = filemove_env
+    env.sim.avail = 100
+    syncs = 0
+    inner = env.runner.responder
+
+    def responder(args: Sequence[str]) -> CommandResult:
+        nonlocal syncs
+        if args[0] == "zpool":
+            syncs += 1
+            if syncs == 2:  # noqa: PLR2004
+                env.sim.avail = 10**9
+        return inner(args)
+
+    env.runner.responder = responder
+    slept, sleep = recorder()
+    wait_for_space(env.zfs, settings, 5000, sleep)
+    assert slept == [SPACE_DELAY_SECONDS, SPACE_DELAY_SECONDS]
+    assert syncs == 2  # noqa: PLR2004
+
+
+def test_refuses_when_space_never_frees(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """Refuses when space never frees."""
+    env = filemove_env
+    env.sim.avail = 100
+    slept, sleep = recorder()
+    with pytest.raises(MigrationError) as info:
+        wait_for_space(env.zfs, settings, 5000, sleep)
+    assert info.value.message == ("not enough free space on tank for the next batch (4.9K) above the floor 1000B")
+    reads = [c for c in env.sim.log if c[1:2] == ("list",) and "avail" in c]
+    assert len(reads) == SPACE_ATTEMPTS
+    assert len(slept) == SPACE_ATTEMPTS - 1
+
+
+@needs_rsync
+def test_rsync_failure_deletes_nothing(filemove_env: FileMoveEnv, settings: Settings, tmp_path: Path) -> None:
+    """Rsync failure deletes nothing."""
+    env = filemove_env
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    before = source_files(env)
+    inner = env.runner.responder
+
+    def responder(args: Sequence[str]) -> CommandResult:
+        return fail("boom", 23) if args[0] == "rsync" else inner(args)
+
+    env.runner.responder = responder
+    with pytest.raises(MigrationError, match="failed: boom"):
+        move(env, settings, dst, 10**9, recorder()[1])
+    assert source_files(env) == before
+
+
+@needs_rsync
+def test_copy_mismatch_deletes_nothing(filemove_env: FileMoveEnv, settings: Settings, tmp_path: Path) -> None:
+    """Copy mismatch deletes nothing."""
+    env = filemove_env
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    before = source_files(env)
+    tamper_after_rsync(env, lambda _n: (dst / "docs" / "b.txt").write_text("corrupted"))
+    with pytest.raises(MigrationError, match="differs from its copy"):
+        move(env, settings, dst, 10**9, recorder()[1])
+    assert source_files(env) == before
+
+
+@needs_rsync
+def test_changing_file_is_skipped_then_refused(filemove_env: FileMoveEnv, settings: Settings, tmp_path: Path) -> None:
+    """Changing file is skipped then refused."""
+    env = filemove_env
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    counter = iter(range(2, 1000))
+
+    def touch(_n: int) -> None:
+        (env.src / "a.txt").write_text("a" * next(counter))
+
+    tamper_after_rsync(env, touch)
+    with pytest.raises(MigrationError) as info:
+        move(env, settings, dst, 10**9, recorder()[1])
+    assert info.value.message == "1 files kept changing during the move; stop the writers and rerun"
+    assert source_files(env) == ["a.txt"]
+    assert (dst / "docs" / "b.txt").read_text() == "b"

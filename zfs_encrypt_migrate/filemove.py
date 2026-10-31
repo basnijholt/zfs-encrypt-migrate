@@ -9,8 +9,9 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .constants import MARK_DIRS, MARK_KEY, MARK_SOURCE, SCRATCH
+from .constants import MARK_DIRS, MARK_KEY, MARK_SOURCE, SCRATCH, SPACE_ATTEMPTS, SPACE_DELAY_SECONDS
 from .errors import MigrationError
+from .filetree import delete, group_by_inode, plan_batches, scan, verify, write_file_list
 from .migrate import (
     ENCRYPTION,
     check_key_file,
@@ -18,13 +19,16 @@ from .migrate import (
     in_flight,
     leaf_of,
     load_stage_key,
+    pool_of,
     refuse_cross_pool,
     refuse_nested,
 )
+from .output import console
 from .props import create_props
+from .sizes import format_size
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from .migrate import AbortGuard, Settings
     from .zfs import Zfs
@@ -213,3 +217,63 @@ def check_passphrase(zfs: Zfs, settings: Settings, staged: str) -> None:
         msg = f"the key for {staged} did not load from {location}; nothing was deleted"
         raise MigrationError(msg)
     zfs.set_prop(staged, MARK_KEY, "yes")
+
+
+def wait_for_space(zfs: Zfs, settings: Settings, needed: int, sleep: Callable[[float], None]) -> None:
+    """Wait until the batch fits above the free-space floor; deleted space is freed asynchronously."""
+    pool = pool_of(settings.stage)
+    for attempt in range(SPACE_ATTEMPTS):
+        if zfs.pool_avail(pool) - needed >= settings.min_free:
+            return
+        if attempt < SPACE_ATTEMPTS - 1:
+            zfs.pool_sync(pool)
+            sleep(SPACE_DELAY_SECONDS)
+    msg = (
+        f"not enough free space on {pool} for the next batch ({format_size(needed)}) "
+        f"above the floor {format_size(settings.min_free)}"
+    )
+    raise MigrationError(msg)
+
+
+def _refuse_snapshots(zfs: Zfs, dataset: str) -> None:
+    snaps = zfs.snapshots(dataset)
+    if snaps:
+        msg = f"{dataset} has snapshots, which keep deleted files allocated: {', '.join(snaps)}"
+        hints = [f"disable snapshot tools for {dataset}, then remove them: zfs destroy {snap}" for snap in snaps]
+        raise MigrationError(msg, hints)
+
+
+def move_files(  # noqa: PLR0917
+    zfs: Zfs,
+    settings: Settings,
+    dataset: str,
+    src: Path,
+    dst: Path,
+    batch_size: int,
+    sleep: Callable[[float], None],
+) -> None:
+    """Move every file into the copy in verified batches; delete a batch only after its copy is verified and synced."""
+    pool = pool_of(settings.stage)
+    scratch = dst / SCRATCH
+    scratch.mkdir(parents=True, exist_ok=True)
+    batch_number = 0
+    while entries := scan(src):
+        left = sum(group.allocated for group in group_by_inode(entries, src))
+        deleted = 0
+        for batch in plan_batches(group_by_inode(entries, src), batch_size):
+            # Checked before every batch: a snapshot that appears mid-run would pin the deleted files.
+            _refuse_snapshots(zfs, dataset)
+            moved = sum(group.allocated for group in batch)
+            wait_for_space(zfs, settings, moved, sleep)
+            write_file_list(scratch / "files", batch)
+            rsync_files(zfs, src, dst, scratch / "files")
+            verified, _changed = verify(src, dst, batch)
+            zfs.pool_sync(pool)
+            deleted += delete(src, verified)
+            batch_number += 1
+            left -= moved
+            files = sum(len(group.entries) for group in batch)
+            console.print(f"batch {batch_number}: {files} files, {format_size(moved)} moved, {format_size(left)} left")
+        if deleted == 0:
+            msg = f"{len(entries)} files kept changing during the move; stop the writers and rerun"
+            raise MigrationError(msg)
