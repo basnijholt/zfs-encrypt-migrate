@@ -255,6 +255,16 @@ def test_props_parses_value_and_source() -> None:
     assert runner.calls == [("zfs", "get", "-H", "-p", "-o", "property,value,source", "all", "tank/a")]
 
 
+def test_props_keeps_a_tab_inside_a_value() -> None:
+    """A user property value may hold a tab; only the first and the last tab separate the columns."""
+    runner = FakeRunner(queue=[ok("user:note\ta\tb\tlocal\nuser:empty\t\tlocal\n")])
+
+    assert Zfs(runner).props("tank/a") == {
+        "user:note": Prop("a\tb", "local"),
+        "user:empty": Prop("", "local"),
+    }
+
+
 def test_snapshots_lists_own_snapshots() -> None:
     """Only the dataset's own snapshots are listed, by full name."""
     runner = FakeRunner(queue=[ok("tank/a@one\ntank/a@two\n")])

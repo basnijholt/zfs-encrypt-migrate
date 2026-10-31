@@ -88,8 +88,15 @@ class Zfs:
     def props(self, name: str) -> dict[str, Prop]:
         """Read every property, user properties included, with its source."""
         result = self._run(["zfs", "get", "-H", "-p", "-o", "property,value,source", "all", name])
-        rows = (line.split("\t") for line in result.stdout.splitlines() if line)
-        return {row[0]: Prop(row[1], row[2]) for row in rows}
+        props: dict[str, Prop] = {}
+        for line in result.stdout.splitlines():
+            if not line:
+                continue
+            # A user property's value may hold a tab; property names and sources never do.
+            prop, rest = line.split("\t", 1)
+            value, source = rest.rsplit("\t", 1)
+            props[prop] = Prop(value, source)
+        return props
 
     def snapshots(self, name: str) -> list[str]:
         """List the dataset's own snapshots by full name."""
