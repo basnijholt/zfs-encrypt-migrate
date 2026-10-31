@@ -5,7 +5,8 @@ from __future__ import annotations
 import os
 import shutil
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
@@ -15,7 +16,6 @@ from zfs_encrypt_migrate.process import CommandResult, SubprocessRunner
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
-    from pathlib import Path
 
     from zfs_encrypt_migrate.zfs import Zfs
 
@@ -97,6 +97,8 @@ class FileMoveEnv:
     src: Path
     mount_root: Path
     dataset: str = "tank/media"
+    # Directories a test made bind mounts of a dataset's directory: files there are on that dataset's device.
+    bound: dict[Path, str] = field(default_factory=dict)
 
     @property
     def staged(self) -> str:
@@ -139,8 +141,29 @@ def filemove_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FileMoveEnv
         ]
         return path.stat().st_dev if mounted and path.is_dir() else None
 
+    bound: dict[Path, str] = {}
+    devices: dict[str, int] = {}
+
+    def device_of(path: Path) -> int | None:
+        # On a host each mounted dataset is a filesystem of its own; here they share the test's. A file under a
+        # dataset's mountpoint, or under a directory bound from it, gets a device of that dataset's own.
+        if filetree.device_of(path) is None:
+            return None
+        target = Path(os.path.realpath(path))
+        roots = [
+            (Path(os.path.realpath(value)), name)
+            for (name, prop), value in sim.props.items()
+            if prop == "mountpoint" and value.startswith("/") and sim.props.get((name, "mounted")) == "yes"
+        ]
+        roots += [(Path(os.path.realpath(point)), name) for point, name in bound.items()]
+        found = [(len(root.parts), name) for root, name in roots if target.is_relative_to(root)]
+        if not found:
+            return filetree.device_of(path)
+        return devices.setdefault(max(found)[1], -1 - len(devices))
+
     monkeypatch.setattr(filemove, "mount_device", mount_device)
+    monkeypatch.setattr(filemove, "device_of", device_of)
     # What the kernel would list: each dataset the simulator has mounted, at its mountpoint.
     monkeypatch.setattr(filetree, "read_mountinfo", sim.mountinfo)
     zfs, runner = make(sim, responder)
-    return FileMoveEnv(sim, zfs, runner, src, tmp_path / "run")
+    return FileMoveEnv(sim, zfs, runner, src, tmp_path / "run", bound=bound)

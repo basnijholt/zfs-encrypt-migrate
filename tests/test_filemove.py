@@ -127,6 +127,42 @@ def test_preflight_refuses_a_final_key_file_inside_the_dataset(
     )
 
 
+@pytest.mark.parametrize("final", [False, True])
+def test_preflight_refuses_a_key_file_on_the_dataset_through_a_bind_mount(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    final: bool,  # noqa: FBT001
+) -> None:
+    """A path outside the mountpoint can still reach a file of the dataset: its device gives it away."""
+    env = filemove_env
+    bound = tmp_path / "keys"
+    bound.mkdir()
+    env.bound[bound] = DATASET
+    key = private_key(bound / "a.key")
+    changed = replace(settings, final_keylocation=f"file://{key}") if final else replace(settings, key_file=key)
+    label = "final key file" if final else "key file"
+    refused(
+        env,
+        changed,
+        f"{label} {key} is inside {DATASET}, which file-move empties; keep the key outside the dataset",
+    )
+
+
+def test_preflight_checks_only_the_path_of_a_final_key_file_not_there_yet(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """A final key file that does not exist yet has no device; its path is outside the dataset."""
+    env = filemove_env
+    bound = tmp_path / "keys"
+    bound.mkdir()
+    env.bound[bound] = DATASET
+    changed = replace(settings, final_keylocation=f"file://{bound / 'later.key'}")
+    assert preflight_file_move(env.zfs, changed, DATASET) == env.src
+
+
 def test_preflight_allows_key_files_beside_the_dataset(
     filemove_env: FileMoveEnv,
     settings: Settings,

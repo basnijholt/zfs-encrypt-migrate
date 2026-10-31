@@ -247,7 +247,7 @@ Then:
 
 **What the tool checks.**
 Before the first file moves, it refuses a dataset that is read-only, not mounted, has a mountpoint of `none` or `legacy`, or has an entry named `.zfs-encrypt-migrate` at its root, and it refuses while another migration is in flight under the stage or another `file-move` runs.
-It refuses a key file inside the dataset, symlinks followed, both `--key-file` and the file of `--final-keylocation file://...`: a batch would move it into the dataset that needs it to unlock.
+It refuses a key file inside the dataset, symlinks followed, or reached through a bind mount of one of its directories (the file is on the dataset's device), both `--key-file` and the file of `--final-keylocation file://...`: a batch would move it into the dataset that needs it to unlock.
 It works only on a path that `/proc/self/mountinfo` lists as the dataset's own mount point, checked before it reads anything there, for the dataset and for the encrypted copy: a mountpoint ending in a space, which `zfs get` strips, would otherwise point it at another directory.
 It also refuses everything in the **Not supported** list above that it can detect, since the move would otherwise stall half-way.
 Before each batch it checks that the encrypted dataset is still mounted at its private mountpoint, and it accepts only copies that are on that dataset: after an unmount (`zfs umount -a`, say) the mountpoint is a bare directory, and copies there would vanish.

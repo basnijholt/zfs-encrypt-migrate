@@ -220,6 +220,14 @@ def mount_device(path: Path) -> int | None:
     return st.st_dev if st.st_dev != path.parent.stat().st_dev else None
 
 
+def device_of(path: Path) -> int | None:
+    """Return the device of the file at ``path``, following symlinks; None when it does not exist."""
+    try:
+        return path.stat().st_dev
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+
+
 MOUNTINFO = Path("/proc/self/mountinfo")
 # mountinfo writes a space, tab, newline or backslash in a field as a backslash and three octal digits.
 _ESCAPE = re.compile(rb"\\([0-7]{3})")

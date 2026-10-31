@@ -17,6 +17,7 @@ from zfs_encrypt_migrate.filetree import (
     Entry,
     Group,
     delete,
+    device_of,
     group_by_inode,
     mount_device,
     mounted_at,
@@ -253,6 +254,20 @@ def test_mount_device_needs_a_mount_point(tmp_path: Path) -> None:
     proc = Path("/proc")
     if os.path.ismount(proc):
         assert mount_device(proc) == proc.stat().st_dev
+
+
+def test_device_of_follows_symlinks_and_is_none_when_missing(tmp_path: Path) -> None:
+    """A symlink gives its target's device; a missing file, or one under a file, has none."""
+    (tmp_path / "key").write_text("k")
+    (tmp_path / "link").symlink_to(tmp_path / "key")
+    (tmp_path / "dangling").symlink_to(tmp_path / "missing")
+    assert device_of(tmp_path / "link") == (tmp_path / "key").stat().st_dev
+    assert device_of(tmp_path / "missing") is None
+    assert device_of(tmp_path / "dangling") is None
+    assert device_of(tmp_path / "key" / "below") is None
+    proc = Path("/proc")
+    if os.path.ismount(proc):
+        assert device_of(proc / "self" / "mountinfo") != (tmp_path / "key").stat().st_dev
 
 
 def mountinfo(monkeypatch: pytest.MonkeyPatch, *lines: str) -> None:

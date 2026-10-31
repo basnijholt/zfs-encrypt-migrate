@@ -25,6 +25,7 @@ from .constants import (
 from .errors import Interrupted, MigrationError, ZfsError
 from .filetree import (
     delete,
+    device_of,
     group_by_inode,
     mount_device,
     mounted_at,
@@ -132,9 +133,12 @@ def _refuse_keys_inside(settings: Settings, dataset: str, source: Path) -> None:
     if scheme == "file":
         keys.append(("final key file", Path(path)))
     root = source.resolve()
+    device = device_of(source)
     for label, key in keys:
-        # Symlinks are followed: the file a batch deletes is the target.
-        if key.resolve().is_relative_to(root):
+        # Symlinks are followed: the file a batch deletes is the target. The device also catches a path outside
+        # the mountpoint that reaches the dataset, through a bind mount; a file not there yet has none.
+        on_device = device is not None and device_of(key) == device
+        if key.resolve().is_relative_to(root) or on_device:
             msg = f"{label} {key} is inside {dataset}, which file-move empties; keep the key outside the dataset"
             raise MigrationError(msg)
 
