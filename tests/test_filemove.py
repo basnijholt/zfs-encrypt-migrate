@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -1445,6 +1446,46 @@ def test_rerun_moving_late_files_leaves_no_scratch(
     assert not (dst / SCRATCH).exists()
     assert dir_times(dst) == times
     assert env.sim.props[DATASET, "encryption"] == "aes-256-gcm"
+
+
+@needs_rsync
+def test_stop_while_scratch_is_removed_keeps_dir_times(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop part-way through removing scratch leaves no partial pristine copy for the rerun to restore from.
+
+    The rerun keeps the times the first finish restored, the root's included.
+    """
+    env = filemove_env
+    times = dir_times(env.src)
+    scratch = staged_dir(env) / SCRATCH
+    real_rmtree = shutil.rmtree
+    stopped = False
+
+    def stop_part_way(path: str | os.PathLike[str], *args: object, **kwargs: object) -> None:
+        nonlocal stopped
+        if not stopped and Path(path).name != "tmp" and Path(path).is_relative_to(scratch):
+            stopped = True
+            pristine = next(child for child in scratch.iterdir() if child.name.startswith("dirs"))
+            real_rmtree(pristine / "docs")
+            raise KeyboardInterrupt
+        real_rmtree(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(shutil, "rmtree", stop_part_way)
+    with pytest.raises(Interrupted):
+        run_file_move(env, settings, tmp_path)
+    assert stopped
+    monkeypatch.setattr(shutil, "rmtree", real_rmtree)
+
+    # What the hints say: mount the source again, rename enc-final aside.
+    env.sim.prop(DATASET, "mounted", "yes")
+    rename_final_aside(env)
+    run_file_move(env, settings, tmp_path)
+    assert dir_times(staged_dir(env)) == times
+    assert not scratch.exists()
 
 
 @needs_rsync

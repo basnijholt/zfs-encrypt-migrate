@@ -369,8 +369,19 @@ def test_remove_scratch_restores_root_mtime(tmp_path: Path) -> None:
     """Remove scratch restores root mtime."""
     scratch = tmp_path / SCRATCH
     (scratch / "tmp").mkdir(parents=True)
-    (scratch / "dirs").write_text("x")
+    (scratch / "dirs" / "docs").mkdir(parents=True)
     os.utime(scratch / "dirs", ns=(1_000_000_000, 2_000_000_000))
+    remove_scratch(tmp_path)
+    assert not scratch.exists()
+    st = os.lstat(tmp_path)
+    assert (st.st_atime_ns, st.st_mtime_ns) == (1_000_000_000, 2_000_000_000)
+
+
+def test_remove_scratch_after_a_stop_past_the_rename(tmp_path: Path) -> None:
+    """A rerun after a stop part-way through the removal still restores the root's times, from the file."""
+    scratch = tmp_path / SCRATCH
+    (scratch / "dirs.removing" / "tv").mkdir(parents=True)
+    (scratch / "root-times").write_text("1000000000 2000000000\n")
     remove_scratch(tmp_path)
     assert not scratch.exists()
     st = os.lstat(tmp_path)

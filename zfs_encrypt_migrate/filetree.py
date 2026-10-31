@@ -231,18 +231,31 @@ def remove_partials(dst: Path) -> None:
 
 
 def remove_scratch(dst: Path) -> None:
-    """Remove whatever is left of the scratch directory; restore the root's times from the pristine copy.
+    """Remove the scratch directory and give the root back the pristine copy's times.
 
-    A run stopped part-way through an earlier removal leaves only part of scratch behind; without the
-    pristine copy there are no original times to restore.
+    A stop part-way must leave neither a partial pristine copy, from which a rerun would restore some
+    directories and not others, nor a root whose original times are lost. So the pristine root's times go
+    into a file first, one rename then hides the pristine copy from any rerun, and the file is removed only
+    right before the times are restored. A rerun finishes whatever is left.
     """
     scratch = dst / SCRATCH
     if not os.path.lexists(scratch):
         return
-    try:
-        st: os.stat_result | None = os.lstat(scratch / "dirs")
-    except FileNotFoundError:
-        st = None
-    shutil.rmtree(scratch)
-    if st is not None:
-        os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
+    pristine = scratch / "dirs"
+    times = scratch / "root-times"
+    if pristine.is_dir():
+        st = os.lstat(pristine)
+        times.write_text(f"{st.st_atime_ns} {st.st_mtime_ns}\n")
+        pristine.rename(scratch / "dirs.removing")
+    saved = [int(part) for part in times.read_text().split()] if times.is_file() else None
+    for child in scratch.iterdir():
+        if child == times:
+            continue
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+    times.unlink(missing_ok=True)
+    scratch.rmdir()
+    if saved is not None:
+        os.utime(dst, ns=(saved[0], saved[1]))
