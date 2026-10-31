@@ -125,6 +125,13 @@ def test_write_command_failure_raises() -> None:
         Zfs(FakeRunner(queue=[fail("nope\n")])).mount("tank/a")
 
 
+def test_mount_passes_temporary_options() -> None:
+    """Mount options go comma-joined after -o, for the duration of this mount only."""
+    runner = FakeRunner()
+    Zfs(runner).mount("tank/a", ["noatime", "ro"])
+    assert runner.calls == [("zfs", "mount", "-o", "noatime,ro", "tank/a")]
+
+
 def test_unmount_reports_busy_without_force() -> None:
     """A busy dataset returns False; no -f is ever used; other errors raise."""
     runner = FakeRunner(queue=[ok(), fail("cannot unmount 'tank/a': pool or dataset is busy\n"), fail("weird\n")])

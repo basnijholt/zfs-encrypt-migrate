@@ -197,7 +197,18 @@ def delete(src: Path, groups: Sequence[Group]) -> int:
 
 
 def remove_scratch(dst: Path) -> None:
-    """Remove the scratch directory and restore the root's times that the removal changes."""
-    st = os.lstat(dst / SCRATCH / "dirs")
-    shutil.rmtree(dst / SCRATCH)
-    os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))
+    """Remove whatever is left of the scratch directory; restore the root's times from the pristine copy.
+
+    A run stopped part-way through an earlier removal leaves only part of scratch behind; without the
+    pristine copy there are no original times to restore.
+    """
+    scratch = dst / SCRATCH
+    if not os.path.lexists(scratch):
+        return
+    try:
+        st: os.stat_result | None = os.lstat(scratch / "dirs")
+    except FileNotFoundError:
+        st = None
+    shutil.rmtree(scratch)
+    if st is not None:
+        os.utime(dst, ns=(st.st_atime_ns, st.st_mtime_ns))

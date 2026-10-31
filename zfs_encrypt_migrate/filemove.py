@@ -126,7 +126,8 @@ def probe_writers(zfs: Zfs, dataset: str) -> None:
         msg = f"cannot unmount {dataset}; a writer is probably still running"
         raise MigrationError(msg)
     try:
-        zfs.mount(dataset)
+        # Reads after enc-final must not update atimes: written@ would count them as writes.
+        zfs.mount(dataset, ["noatime"])
     except MigrationError as exc:
         raise MigrationError(exc.message, [f"remount it with: zfs mount {dataset}"]) from exc
 
@@ -135,7 +136,6 @@ def open_staged(zfs: Zfs, settings: Settings, dataset: str, mount_root: Path, gu
     """Create the encrypted staged dataset on the first run; load its key and mount it. Return its path."""
     leaf = leaf_of(dataset)
     staged = f"{settings.stage}/{leaf}"
-    private = str(mount_root / leaf)
     if not zfs.exists(staged):
         ensure_container(zfs, settings.stage)
         ensure_container(zfs, f"{settings.stage}/old")
@@ -146,14 +146,10 @@ def open_staged(zfs: Zfs, settings: Settings, dataset: str, mount_root: Path, gu
             "keylocation": f"file://{settings.key_file}",
             # Mounted only at a private path, never over the source's own mountpoint.
             "canmount": "noauto",
-            "mountpoint": private,
+            "mountpoint": str(mount_root / leaf),
             MARK_SOURCE: dataset,
         }
         zfs.create(staged, props)
-    elif zfs.get("mountpoint", staged) != private:
-        # A swap stopped after its fix-ups leaves the source's mountpoint here; mounted there, the copy
-        # would hide the source and the move loop would delete files from the copy itself.
-        zfs.set_prop(staged, "mountpoint", private)
     load_stage_key(zfs, staged)
     if zfs.get("mounted", staged) != "yes":
         zfs.mount(staged)
@@ -277,7 +273,7 @@ def move_files(  # noqa: PLR0917
     scratch = dst / SCRATCH
     batch_number = 0
     while entries := scan(src):
-        # Created only when there is work: a rerun after the swap removed it must leave the copy's times alone.
+        # Created only when files remain: a rerun after finish removed scratch must not change the copy's root.
         scratch.mkdir(parents=True, exist_ok=True)
         left = sum(group.allocated for group in group_by_inode(entries, src))
         deleted = 0
@@ -300,18 +296,6 @@ def move_files(  # noqa: PLR0917
             raise MigrationError(msg)
 
 
-def _restore_dirs(zfs: Zfs, src: Path, dst: Path) -> None:
-    """Give the copy's directories the attributes the source had before any file moved, then drop scratch."""
-    pristine = dst / SCRATCH / "dirs"
-    # Gone once an earlier run restored the attributes; another live pass would overwrite them.
-    if not pristine.is_dir():
-        return
-    # The live pass creates directories added since the start; the pristine pass restores their original times.
-    rsync_dirs(zfs, src, dst)
-    rsync_dirs(zfs, pristine, dst)
-    remove_scratch(dst)
-
-
 def finish(  # noqa: PLR0917
     zfs: Zfs,
     settings: Settings,
@@ -330,7 +314,11 @@ def finish(  # noqa: PLR0917
     if entries:
         msg = f"{len(entries)} files appeared in {dataset} during the swap; stop the writers and rerun"
         raise MigrationError(msg)
-    _restore_dirs(zfs, src, dst)
+    # The live pass creates directories added since the start; the pristine pass restores their original times.
+    rsync_dirs(zfs, src, dst)
+    pristine = dst / SCRATCH / "dirs"
+    if pristine.is_dir():
+        rsync_dirs(zfs, pristine, dst)
     # From here the copy holds everything, so the swap's own recovery hints replace the split-data note.
     guard.notes = []
     guard.source = dataset
@@ -344,28 +332,32 @@ def finish(  # noqa: PLR0917
         msg = f"{dataset} was written after the final scan"
         hints = ["rename the stale snapshot aside, then rerun file-move:", *(f"  {command}" for command in commands)]
         raise MigrationError(msg, hints)
+    # Removed only now: every refusal above leaves the pristine copy for the rerun.
+    remove_scratch(dst)
     if not zfs.unmount(staged):
         msg = f"cannot unmount {staged}; something still uses {dst}"
         raise MigrationError(msg)
     guard.mounted = [name for name in guard.mounted if name != staged]
-    # Read before the swap, which sets canmount=noauto on the source.
+    # Read before the swap, which sets canmount=noauto on the source. The final dataset gets the
+    # source's mountpoint, so the source's effective one says whether it will mount.
     fix = fixups(zfs.props(dataset))
-    for prop, value in fix.set.items():
-        zfs.set_prop(staged, prop, value)
-    for prop in fix.inherit:
-        zfs.inherit(staged, prop)
-    ensure_container(zfs, f"{settings.stage}/old")
-    # canmount=noauto on the staged dataset keeps the swap from mounting it before the markers are gone.
-    swap_into_place(zfs, settings, dataset, staged, guard)
-    markers = (MARK_SOURCE, MARK_DIRS, MARK_KEY)
     mount = fix.canmount == "on" and zfs.get("mountpoint", dataset) not in NO_MOUNTPOINT
+    markers = (MARK_SOURCE, MARK_DIRS, MARK_KEY)
+    # Hinted before the swap: each acts on <dataset> and is idempotent, so it is right whatever step failed.
     guard.cleanup += [
-        *(f"  zfs inherit {marker} {dataset}" for marker in markers),
+        *(f"  zfs set {prop}={value} {dataset}" for prop, value in fix.set.items()),
+        *(f"  zfs inherit {prop} {dataset}" for prop in (*fix.inherit, *markers)),
         f"  zfs set canmount={fix.canmount} {dataset}",
         *([f"  zfs mount {dataset}"] if mount else []),
     ]
-    for marker in markers:
-        zfs.inherit(dataset, marker)
+    ensure_container(zfs, f"{settings.stage}/old")
+    # canmount=noauto on the staged dataset keeps the swap from mounting it; the fix-ups wait until it is
+    # in place, so a stopped swap never leaves the copy with the source's mountpoint.
+    swap_into_place(zfs, settings, dataset, staged, guard)
+    for prop, value in fix.set.items():
+        zfs.set_prop(dataset, prop, value)
+    for prop in (*fix.inherit, *markers):
+        zfs.inherit(dataset, prop)
     zfs.set_prop(dataset, "canmount", fix.canmount)
     if mount:
         zfs.mount(dataset)
@@ -402,6 +394,10 @@ def file_move(
                 "Rerun the same command to continue.",
             ]
             dst = open_staged(zfs, settings, dataset, mount_root, guard)
+            # Copying into or over the source would verify each file against itself and delete it.
+            if dst.is_relative_to(src) or src.is_relative_to(dst):
+                msg = f"{staged} is mounted at {dst}, which overlaps {dataset} at {src}"
+                raise MigrationError(msg)
             copy_tree(zfs, staged, src, dst)
             check_passphrase(zfs, settings, staged)
             move_files(zfs, settings, dataset, src, dst, batch_size, sleep)

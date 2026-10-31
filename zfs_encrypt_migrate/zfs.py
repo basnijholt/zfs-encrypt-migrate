@@ -149,9 +149,9 @@ class Zfs:
         options = [arg for key, value in props.items() for arg in ("-o", f"{key}={value}")]
         self._run(["zfs", "create", *options, name])
 
-    def mount(self, name: str) -> None:
-        """Mount a dataset."""
-        self._run(["zfs", "mount", name])
+    def mount(self, name: str, options: Sequence[str] = ()) -> None:
+        """Mount a dataset, with temporary mount options for this mount only."""
+        self._run(["zfs", "mount", *(["-o", ",".join(options)] if options else []), name])
 
     def unmount(self, name: str) -> bool:
         """Unmount a dataset; return False when it is busy. Never forces."""

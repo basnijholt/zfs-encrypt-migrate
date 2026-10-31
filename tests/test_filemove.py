@@ -170,13 +170,13 @@ def test_probe_writers_busy_refuses(filemove_env: FileMoveEnv) -> None:
     with pytest.raises(MigrationError) as info:
         probe_writers(filemove_env.zfs, DATASET)
     assert info.value.message == f"cannot unmount {DATASET}; a writer is probably still running"
-    assert ("zfs", "mount", DATASET) not in filemove_env.sim.ops()
+    assert [op for op in filemove_env.sim.ops() if op[1] == "mount"] == []
 
 
-def test_probe_writers_remounts(filemove_env: FileMoveEnv) -> None:
-    """Probe writers remounts."""
+def test_probe_writers_remounts_without_atime(filemove_env: FileMoveEnv) -> None:
+    """The remount skips atime updates, so reading the source after enc-final never writes to it."""
     probe_writers(filemove_env.zfs, DATASET)
-    assert filemove_env.sim.ops() == [("zfs", "unmount", DATASET), ("zfs", "mount", DATASET)]
+    assert filemove_env.sim.ops() == [("zfs", "unmount", DATASET), ("zfs", "mount", "-o", "noatime", DATASET)]
 
 
 def test_probe_writers_failed_mount_hints(filemove_env: FileMoveEnv) -> None:
@@ -599,21 +599,22 @@ def test_file_move_end_to_end(filemove_env: FileMoveEnv, settings: Settings, tmp
     assert sim.props[DATASET, "keystatus"] == "available"
     assert [prop for name, prop in sim.props if name == DATASET and prop.startswith("zfs-encrypt-migrate:")] == []
     # Pinned for the copy, inherited again like on the source.
-    assert ("zfs", "inherit", "compression", STAGED) in sim.ops()
     assert (DATASET, "compression") not in sim.props
     assert_in_order(
         sim.ops(),
         [
+            ("zfs", "mount", "-o", "noatime", DATASET),
             ("zfs", "snapshot", f"{DATASET}@enc-final"),
             ("zfs", "unmount", DATASET),
             ("zpool", "sync", "tank"),
             written_read(DATASET),
             ("zfs", "unmount", STAGED),
-            ("zfs", "set", f"mountpoint={env.src}", STAGED),
             ("zfs", "set", "canmount=noauto", DATASET),
             ("zfs", "rename", "-u", DATASET, f"{STAGE}/old/media"),
             ("zfs", "rename", "-u", STAGED, DATASET),
             ("zfs", "set", f"keylocation={FINAL}", DATASET),
+            ("zfs", "set", f"mountpoint={env.src}", DATASET),
+            ("zfs", "inherit", "compression", DATASET),
             ("zfs", "inherit", MARK_SOURCE, DATASET),
             ("zfs", "inherit", MARK_DIRS, DATASET),
             ("zfs", "inherit", MARK_KEY, DATASET),
@@ -693,6 +694,8 @@ def test_finish_refuses_written_after_scan(filemove_env: FileMoveEnv, settings: 
     assert not [op for op in env.sim.ops() if op[1] == "rename"]
     assert env.sim.props[STAGED, "mounted"] == "no"
     assert env.sim.props[STAGED, "keystatus"] == "unavailable"
+    # Kept for the rerun, which restores the directory times again.
+    assert (dst / SCRATCH / "dirs").is_dir()
 
 
 @needs_rsync
@@ -707,6 +710,16 @@ def test_finish_refuses_busy_staged(filemove_env: FileMoveEnv, settings: Setting
     assert info.value.message == f"cannot unmount {STAGED}; something still uses {dst}"
     assert info.value.hints[0] == f"could not unmount {STAGED}; run: zfs unmount {STAGED} && zfs unload-key -r {STAGED}"
     assert not [op for op in env.sim.ops() if op[1] in {"rename", "inherit"} or op[2].startswith("mountpoint=")]
+
+
+def test_post_swap_fixups_never_touch_staged(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """Fix-ups act on the swapped dataset only, so a stopped swap never leaves the copy with the source's mountpoint."""
+    env = filemove_env
+    guard = AbortGuard(env.zfs, settings, STAGED, source=None, leaf=None, label="file-move")
+    dst = moved(env, settings, guard)
+    env.sim.log.clear()
+    finish(env.zfs, settings, DATASET, env.src, dst, guard)
+    assert [op for op in env.sim.ops() if op[-1] == STAGED and op[1] in {"set", "inherit"}] == []
 
 
 @needs_rsync
@@ -798,11 +811,18 @@ def test_failure_after_swap_prints_canmount_and_mount(
     zfs, _ = make(env.sim, fail_final_mount)
     with pytest.raises(MigrationError) as info:
         run_file_move(env, settings, tmp_path, zfs=zfs)
-    assert info.value.hints == (
+    assert info.value.hints == swapped_hints(env)
+    assert env.sim.props[DATASET, "keystatus"] == "available"
+
+
+def swapped_hints(env: FileMoveEnv) -> tuple[str, ...]:
+    """Hints of a failure once the renames are done: finish keylocation, fix-ups, markers, canmount, mount."""
+    return (
         "file-move aborted.",
         "the swap completed; only the final steps failed. Finish with:",
         f"  zfs set keylocation={FINAL} {DATASET}",
         "  zfs mount -a",
+        f"  zfs set mountpoint={env.src} {DATASET}",
         f"  zfs inherit {MARK_SOURCE} {DATASET}",
         f"  zfs inherit {MARK_DIRS} {DATASET}",
         f"  zfs inherit {MARK_KEY} {DATASET}",
@@ -812,61 +832,78 @@ def test_failure_after_swap_prints_canmount_and_mount(
 
 
 @needs_rsync
-def test_rerun_after_busy_source_keeps_restored_dir_times(
+def test_failure_inside_swap_hints_post_swap_commands(
     filemove_env: FileMoveEnv,
     settings: Settings,
     tmp_path: Path,
 ) -> None:
-    """A rerun after the directory times were restored neither redoes nor breaks the restore."""
+    """The post-swap commands are hinted before the swap runs, so a failure inside it still gives them."""
+    env = filemove_env
+
+    def fail_keylocation(args: Sequence[str]) -> CommandResult | None:
+        if tuple(args) == ("zfs", "set", f"keylocation={FINAL}", DATASET):
+            return fail("injected\n")
+        return real_rsync(args)
+
+    zfs, _ = make(env.sim, fail_keylocation)
+    with pytest.raises(MigrationError, match="injected") as info:
+        run_file_move(env, settings, tmp_path, zfs=zfs)
+    assert info.value.hints == swapped_hints(env)
+
+
+@needs_rsync
+def test_rerun_moving_late_files_leaves_no_scratch(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """A file written during a refused swap is moved by the rerun; no scratch is left and the times are original."""
     env = filemove_env
     times = dir_times(env.src)
 
-    def busy_after_final_snapshot(args: Sequence[str]) -> None:
-        if args[1] == "snapshot":
+    def late_writer(args: Sequence[str]) -> CommandResult | None:
+        result = real_rsync(args)
+        if args[0] == "rsync" and args[-2].endswith(f"{SCRATCH}/dirs/"):
+            (env.src / "docs" / "late.txt").write_text("late")
             env.sim.busy.add(DATASET)
+        return result
 
-    zfs, _ = make(env.sim, real_rsync, busy_after_final_snapshot)
+    zfs, _ = make(env.sim, late_writer)
     with pytest.raises(MigrationError) as info:
         run_file_move(env, settings, tmp_path, zfs=zfs)
     assert info.value.message == f"cannot unmount {DATASET}; a writer is probably still running"
     assert info.value.hints == ("file-move aborted.", f"{DATASET} may be unmounted; remount with: zfs mount -a")
-    assert not (staged_dir(env) / SCRATCH).exists()
 
     env.sim.busy.clear()
-    rename_final_aside(env)
+    del env.sim.snapshots[f"{DATASET}@enc-final"]
     run_file_move(env, settings, tmp_path)
-    assert dir_times(staged_dir(env)) == times
-    assert not (staged_dir(env) / SCRATCH).exists()
+    dst = staged_dir(env)
+    assert source_files(env) == []
+    assert (dst / "docs" / "late.txt").read_text() == "late"
+    assert not (dst / SCRATCH).exists()
+    assert dir_times(dst) == times
     assert env.sim.props[DATASET, "encryption"] == "aes-256-gcm"
 
 
 @needs_rsync
-def test_rerun_after_failed_swap_mounts_staged_privately(
+@pytest.mark.parametrize("where", ["equal", "inside", "contains"])
+def test_refuses_staged_mounted_over_source(
     filemove_env: FileMoveEnv,
     settings: Settings,
     tmp_path: Path,
+    where: str,
 ) -> None:
-    """The fix-ups give the staged dataset the source's mountpoint; a rerun mounts it at its own path again."""
+    """A staged mount that overlaps the source stops the run before any file is copied or deleted."""
     env = filemove_env
-    before = contents(env.src)
-
-    def fail_swap(args: Sequence[str]) -> CommandResult | None:
-        if tuple(args) == ("zfs", "set", "canmount=noauto", DATASET):
-            return fail("injected\n")
-        return real_rsync(args)
-
-    zfs, _ = make(env.sim, fail_swap)
-    with pytest.raises(MigrationError, match="injected"):
-        run_file_move(env, settings, tmp_path, zfs=zfs)
-    assert env.sim.props[STAGED, "mountpoint"] == str(env.src)
-
-    env.sim.prop(DATASET, "mounted", "yes")
-    rename_final_aside(env)
-    env.sim.log.clear()
-    run_file_move(env, settings, tmp_path)
-    assert_in_order(
-        env.sim.ops(),
-        [("zfs", "set", f"mountpoint={staged_dir(env)}", STAGED), ("zfs", "mount", STAGED)],
-    )
-    assert contents(staged_dir(env)) == before
-    assert env.sim.props[DATASET, "mountpoint"] == str(env.src)
+    mountpoint = {"equal": env.src, "inside": env.src / "sub", "contains": env.src.parent}[where]
+    env.sim.datasets.add(STAGED)
+    env.sim.prop(STAGED, MARK_SOURCE, DATASET)
+    env.sim.prop(STAGED, "mountpoint", str(mountpoint))
+    before = source_files(env)
+    with pytest.raises(MigrationError) as info:
+        run_file_move(env, settings, tmp_path)
+    assert info.value.message == f"{STAGED} is mounted at {mountpoint}, which overlaps {DATASET} at {env.src}"
+    assert info.value.hints == SPLIT_NOTES
+    assert source_files(env) == before
+    assert not [call for call in env.runner.calls if call[0] == "rsync"]
+    assert env.sim.ops()[-2:] == [("zfs", "unmount", STAGED), ("zfs", "unload-key", "-r", STAGED)]

@@ -356,6 +356,16 @@ def test_remove_scratch_restores_root_mtime(tmp_path: Path) -> None:
     assert (st.st_atime_ns, st.st_mtime_ns) == (1_000_000_000, 2_000_000_000)
 
 
+def test_remove_scratch_tolerates_partial_state(tmp_path: Path) -> None:
+    """Whatever is left of scratch is removed; the root keeps its times only from a pristine copy."""
+    (tmp_path / SCRATCH / "tmp").mkdir(parents=True)
+    (tmp_path / SCRATCH / "files").write_text("x")
+    remove_scratch(tmp_path)
+    assert not (tmp_path / SCRATCH).exists()
+    remove_scratch(tmp_path)
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_delete_skips_group_replaced_after_verify(tmp_path: Path) -> None:
     """A name replaced by a new inode after verify is kept, with its whole group."""
     src, dst = make_pair(tmp_path)
