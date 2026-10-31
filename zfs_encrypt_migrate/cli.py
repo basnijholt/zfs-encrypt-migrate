@@ -11,6 +11,7 @@ import typer
 
 from .audit import find_unencrypted
 from .errors import Interrupted, MigrationError
+from .filemove import file_move
 from .migrate import INTERRUPT_SIGNALS, Settings, catchup, cutover, seed
 from .output import console, print_error
 from .process import CommandRunner, SubprocessRunner
@@ -47,6 +48,14 @@ def _validate_size(value: str) -> str:
         parse_size(value)
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
+    return value
+
+
+def _validate_batch_size(value: str) -> str:
+    _validate_size(value)
+    if parse_size(value) == 0:
+        msg = "batch size must be above 0"
+        raise typer.BadParameter(msg)
     return value
 
 
@@ -276,6 +285,44 @@ def tree_move_command(
     """Copy one child subtree under the staged parent; the source stays until you destroy it."""
     _run_migration(
         lambda zfs, settings, parent: tree_move(zfs, settings, parent, child),
+        Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation),
+        dataset,
+    )
+
+
+@app.command("file-move", rich_help_panel="File-Move Commands")
+def file_move_command(
+    dataset: DatasetArgument,
+    *,
+    stage: StageOption,
+    key_file: KeyFileOption = Path("/run/zfs-encrypt-migrate.key"),
+    min_free: MinFreeOption = "1T",
+    keyformat: KeyformatOption = Keyformat.passphrase,
+    final_keylocation: FinalKeylocationOption = "prompt",
+    batch_size: Annotated[
+        str,
+        typer.Option(
+            "--batch-size",
+            envvar="ZFS_ENCRYPT_MIGRATE_BATCH_SIZE",
+            help="Target size of each batch of files, e.g. 100G",
+            callback=_validate_batch_size,
+            metavar="SIZE",
+        ),
+    ] = "100G",
+    delete_source: Annotated[
+        bool,
+        typer.Option(help="Confirm that each source file is deleted once its encrypted copy is verified"),
+    ] = False,
+) -> None:
+    """Move a dataset's files in verified batches into an encrypted dataset, then swap it into place."""
+    _run_migration(
+        lambda zfs, settings, name: file_move(
+            zfs,
+            settings,
+            name,
+            batch_size=parse_size(batch_size),
+            delete_source=delete_source,
+        ),
         Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation),
         dataset,
     )
