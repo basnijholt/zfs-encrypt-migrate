@@ -264,6 +264,7 @@ If a hard-linked file has fewer names in the dataset than its link count says, t
 - **Verification is rsync's transfer checksum plus metadata.** Contents are not read back and compared.
 - **Old plaintext blocks stay on disk until overwritten.** Deleting files frees their blocks; it doesn't wipe them.
 - **A nearly full pool is slow.** ZFS allocates slowly when little is free; use a smaller `--batch-size`.
+- **Tiny files may each grow to one 4K sector.** An unencrypted dataset can store a file of a few bytes inside its block pointer; an encrypted one can't, so the copy takes a whole sector. The space math counts at least 4K per file.
 - **`sharenfs`, `sharesmb`, `reservation` and `refreservation` are set only after the swap,** so a stopped run never leaves them on the encrypted dataset's private mountpoint.
 
 ## Rebuilding a Whole Pool Encrypted

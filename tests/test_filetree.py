@@ -84,7 +84,26 @@ def test_scan_records_inode_and_allocation(tmp_path: Path) -> None:
     (found,) = scan(tmp_path)
     st = os.lstat(tmp_path / "f")
     assert (found.ino, found.nlink, found.ctime_ns) == (st.st_ino, 1, st.st_ctime_ns)
-    assert found.allocated == st.st_blocks * 512
+    # A fresh file's blocks may not be written out yet; it counts as at least one 4K sector.
+    assert found.allocated == max(st.st_blocks * 512, 4096)
+
+
+def test_scan_counts_each_non_empty_file_as_at_least_one_sector(tmp_path: Path) -> None:
+    """An encrypted dataset cannot embed a tiny file in its block pointer, so its copy takes a whole 4K sector."""
+    (tmp_path / "tiny").write_bytes(b"x")
+    with (tmp_path / "sparse").open("wb") as handle:
+        handle.truncate(100)
+    (tmp_path / "empty").touch()
+    (tmp_path / "link").symlink_to("tiny")
+    assert os.lstat(tmp_path / "sparse").st_blocks * 512 < 4096  # noqa: PLR2004
+    allocated = {item.name: item.allocated for item in scan(tmp_path)}
+    assert allocated == {
+        "tiny": 4096,
+        "sparse": 4096,
+        # Only regular files with data: an empty file has no block to write, a symlink keeps its own count.
+        "empty": os.lstat(tmp_path / "empty").st_blocks * 512,
+        "link": os.lstat(tmp_path / "link").st_blocks * 512,
+    }
 
 
 def test_scan_odd_names(tmp_path: Path) -> None:
@@ -129,7 +148,7 @@ def test_group_allocated_counts_inode_once(tmp_path: Path) -> None:
     (tmp_path / "a").write_bytes(b"x" * 10000)
     os.link(tmp_path / "a", tmp_path / "b")
     (g,) = scanned(tmp_path)
-    assert g.allocated == os.lstat(tmp_path / "a").st_blocks * 512
+    assert g.allocated == max(os.lstat(tmp_path / "a").st_blocks * 512, 4096)
 
 
 def test_group_by_inode_refuses_missing_link(tmp_path: Path) -> None:

@@ -17,6 +17,8 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
 _BLOCK = 512
+# An encrypted dataset cannot embed a tiny file's data in its block pointer, so the copy takes a whole sector.
+_MIN_FILE = 4096
 
 
 @dataclass(frozen=True)
@@ -73,7 +75,10 @@ def scan(root: Path) -> list[Entry]:
                 st = child.stat(follow_symlinks=False)
             except FileNotFoundError:
                 continue
-            entries.append(Entry(name, st.st_ino, st.st_nlink, st.st_ctime_ns, st.st_blocks * _BLOCK))
+            allocated = st.st_blocks * _BLOCK
+            if stat.S_ISREG(st.st_mode) and st.st_size > 0:
+                allocated = max(allocated, _MIN_FILE)
+            entries.append(Entry(name, st.st_ino, st.st_nlink, st.st_ctime_ns, allocated))
     return entries
 
 

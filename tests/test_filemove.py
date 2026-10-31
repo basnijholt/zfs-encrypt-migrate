@@ -1196,6 +1196,24 @@ def test_admission_reads_no_block_cloning_as_none(filemove_env: FileMoveEnv, set
 
 
 @pytest.mark.parametrize("spare", [0, -1])
+def test_admission_counts_each_tiny_file_as_a_sector(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    spare: int,
+) -> None:
+    """The three one-byte files may take a 4K sector each once encrypted, so all the data counts as 12K."""
+    env = filemove_env
+    groups = filetree.group_by_inode(filetree.scan(env.src), env.src)
+    env.sim.avail = settings.min_free + 3 * 4096 + spare
+    if spare >= 0:
+        admit(env.zfs, settings, DATASET, groups, 10**9, dst=env.mount_root)
+        assert env.sim.props[STAGED, MARK_ADMITTED] == "yes"
+        return
+    with pytest.raises(MigrationError, match=r"largest batch or file 12\.0K,"):
+        admit(env.zfs, settings, DATASET, groups, 10**9, dst=env.mount_root)
+
+
+@pytest.mark.parametrize("spare", [0, -1])
 def test_admission_counts_only_files_without_a_copy(
     filemove_env: FileMoveEnv,
     settings: Settings,
