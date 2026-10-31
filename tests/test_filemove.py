@@ -11,7 +11,7 @@ import pytest
 
 from zfs_encrypt_migrate import filemove
 from zfs_encrypt_migrate.constants import MARK_DIRS, MARK_KEY, MARK_SOURCE, SCRATCH, SPACE_ATTEMPTS, SPACE_DELAY_SECONDS
-from zfs_encrypt_migrate.errors import Interrupted, MigrationError
+from zfs_encrypt_migrate.errors import Interrupted, MigrationError, ZfsError
 from zfs_encrypt_migrate.filemove import (
     check_passphrase,
     copy_tree,
@@ -33,6 +33,7 @@ from .helpers import fail_on, make
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
+    from zfs_encrypt_migrate.filetree import Group
     from zfs_encrypt_migrate.migrate import Settings
     from zfs_encrypt_migrate.process import CommandResult
     from zfs_encrypt_migrate.zfs import Zfs
@@ -179,12 +180,47 @@ def test_probe_writers_remounts_without_atime(filemove_env: FileMoveEnv) -> None
     assert filemove_env.sim.ops() == [("zfs", "unmount", DATASET), ("zfs", "mount", "-o", "noatime", DATASET)]
 
 
+REMOUNT_HINT = f"remount it with: zfs mount {DATASET}"
+
+
 def test_probe_writers_failed_mount_hints(filemove_env: FileMoveEnv) -> None:
-    """Probe writers failed mount hints."""
+    """A failed remount keeps its zfs error and says how to remount."""
     zfs, _ = make(filemove_env.sim, fail_on("zfs", "mount"))
+    with pytest.raises(ZfsError) as info:
+        probe_writers(zfs, DATASET)
+    assert info.value.message == f"zfs mount -o noatime {DATASET} failed: injected"
+    assert info.value.hints == (REMOUNT_HINT,)
+
+
+def test_probe_writers_interrupt_before_remount_hints(filemove_env: FileMoveEnv) -> None:
+    """Ctrl-C between the unmount and the remount stays an interrupt and says how to remount."""
+
+    def interrupt_mount(args: Sequence[str]) -> CommandResult | None:
+        if tuple(args[:2]) == ("zfs", "mount"):
+            raise KeyboardInterrupt
+        return None
+
+    zfs, _ = make(filemove_env.sim, interrupt_mount)
+    with pytest.raises(Interrupted) as info:
+        probe_writers(zfs, DATASET)
+    assert info.value.message == "interrupted"
+    assert info.value.hints == (REMOUNT_HINT,)
+
+
+def test_probe_writers_unexpected_error_before_remount_hints(filemove_env: FileMoveEnv) -> None:
+    """Any other failure between the unmount and the remount also says how to remount."""
+
+    def broken_read(args: Sequence[str]) -> CommandResult | None:
+        if tuple(args[:2]) == ("zfs", "get"):
+            msg = "boom"
+            raise OSError(msg)
+        return None
+
+    zfs, _ = make(filemove_env.sim, broken_read)
     with pytest.raises(MigrationError) as info:
         probe_writers(zfs, DATASET)
-    assert f"remount it with: zfs mount {DATASET}" in info.value.hints
+    assert info.value.message == "OSError: boom"
+    assert info.value.hints == (REMOUNT_HINT,)
 
 
 def guard_for(env: FileMoveEnv, settings: Settings) -> AbortGuard:
@@ -396,25 +432,57 @@ def test_moves_names_rsync_reads_as_comments(filemove_env: FileMoveEnv, settings
     assert (dst / ";y").stat().st_ino == (dst / "#dir" / "y-link").stat().st_ino
 
 
+SNAPSHOT_REFUSAL = f"{DATASET} has snapshots, which keep deleted files allocated: {DATASET}@auto"
+SNAPSHOT_HINTS = (f"disable snapshot tools for {DATASET}, then remove them: zfs destroy {DATASET}@auto",)
+
+
 @needs_rsync
 def test_snapshot_appearing_mid_run_stops_before_next_batch(
     filemove_env: FileMoveEnv,
     settings: Settings,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Snapshot appearing mid run stops before next batch."""
+    """A snapshot taken after a batch was deleted stops the run before the next batch copies; the batch stays moved."""
     env = filemove_env
     dst = tmp_path / "dst"
     dst.mkdir()
-    tamper_after_rsync(env, lambda n: env.sim.snapshot(f"{DATASET}@auto") if n == 1 else None)
+    real_delete = filemove.delete
+
+    def delete_then_snapshot(src: Path, groups: Sequence[Group]) -> int:
+        count = real_delete(src, groups)
+        env.sim.snapshot(f"{DATASET}@auto")
+        return count
+
+    monkeypatch.setattr(filemove, "delete", delete_then_snapshot)
     with pytest.raises(MigrationError) as info:
         move(env, settings, dst, 1, recorder()[1])
-    assert info.value.message == f"{DATASET} has snapshots, which keep deleted files allocated: {DATASET}@auto"
-    assert info.value.hints == (f"disable snapshot tools for {DATASET}, then remove them: zfs destroy {DATASET}@auto",)
+    assert info.value.message == SNAPSHOT_REFUSAL
+    assert info.value.hints == SNAPSHOT_HINTS
     moved = sorted(str(p.relative_to(dst)) for p in dst.rglob("*.txt"))
     assert len(moved) == 1
     assert len(source_files(env)) == 2  # noqa: PLR2004
     assert not (env.src / moved[0]).exists()
+
+
+@needs_rsync
+def test_snapshot_taken_during_copy_keeps_the_batch(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """A snapshot taken while a batch copies stops the run before that batch is deleted."""
+    env = filemove_env
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    before = source_files(env)
+    tamper_after_rsync(env, lambda n: env.sim.snapshot(f"{DATASET}@auto") if n == 1 else None)
+    with pytest.raises(MigrationError) as info:
+        move(env, settings, dst, 1, recorder()[1])
+    assert info.value.message == SNAPSHOT_REFUSAL
+    assert info.value.hints == SNAPSHOT_HINTS
+    assert source_files(env) == before
+    assert len(list(dst.rglob("*.txt"))) == 1
 
 
 def test_waits_for_freed_space(filemove_env: FileMoveEnv, settings: Settings) -> None:
@@ -674,13 +742,35 @@ def test_finish_refuses_stale_enc_final(filemove_env: FileMoveEnv, settings: Set
     assert env.sim.ops() == []
 
 
+FREE_THEN_SNAPSHOT = [
+    ("zfs", "unmount", DATASET),
+    ("zfs", "mount", "-o", "noatime", DATASET),
+    ("zpool", "sync", "tank"),
+    ("zfs", "snapshot", f"{DATASET}@enc-final"),
+]
+
+
+def test_finish_refuses_busy_source_before_enc_final(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """A writer that holds the source at the end stops the swap before enc-final is taken."""
+    env = filemove_env
+    env.sim.busy.add(DATASET)
+    with pytest.raises(MigrationError) as info:
+        finish(env.zfs, settings, DATASET, env.src, tmp_path / "dst", guard_for(env, settings))
+    assert info.value.message == f"cannot unmount {DATASET}; a writer is probably still running"
+    assert env.sim.ops() == [("zfs", "unmount", DATASET)]
+
+
 def test_finish_refuses_files_appearing(filemove_env: FileMoveEnv, settings: Settings, tmp_path: Path) -> None:
     """Files found after the final snapshot stop the swap before anything else changes."""
     env = filemove_env
     with pytest.raises(MigrationError) as info:
         finish(env.zfs, settings, DATASET, env.src, tmp_path / "dst", guard_for(env, settings))
     assert info.value.message == f"3 files appeared in {DATASET} during the swap; stop the writers and rerun"
-    assert env.sim.ops() == [("zfs", "snapshot", f"{DATASET}@enc-final")]
+    assert env.sim.ops() == FREE_THEN_SNAPSHOT
     assert not [call for call in env.runner.calls if call[0] == "rsync"]
 
 
@@ -730,6 +820,21 @@ def test_finish_refuses_busy_staged(filemove_env: FileMoveEnv, settings: Setting
     assert not [op for op in env.sim.ops() if op[1] in {"rename", "inherit"} or op[2].startswith("mountpoint=")]
 
 
+@needs_rsync
+def test_finish_frees_last_deletes_before_enc_final(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """Unmount, noatime remount and sync come before enc-final.
+
+    The unmount waits for the last batch's deletes to be freed, so they never count in written@enc-final.
+    """
+    env = filemove_env
+    guard = AbortGuard(env.zfs, settings, STAGED, source=None, leaf=None, label="file-move")
+    dst = moved(env, settings, guard)
+    env.sim.log.clear()
+    finish(env.zfs, settings, DATASET, env.src, dst, guard)
+    assert env.sim.ops()[:4] == FREE_THEN_SNAPSHOT
+
+
+@needs_rsync
 def test_post_swap_fixups_never_touch_staged(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Fix-ups act on the swapped dataset only, so a stopped swap never leaves the copy with the source's mountpoint."""
     env = filemove_env
@@ -867,6 +972,25 @@ def test_failure_inside_swap_hints_post_swap_commands(
     with pytest.raises(MigrationError, match="injected") as info:
         run_file_move(env, settings, tmp_path, zfs=zfs)
     assert info.value.hints == swapped_hints(env)
+
+
+@needs_rsync
+def test_post_swap_hints_quote_values(filemove_env: FileMoveEnv, settings: Settings, tmp_path: Path) -> None:
+    """A property value with a space stays one argument in the printed zfs set command."""
+    env = filemove_env
+    spaced = tmp_path / "my media"
+    env.src.rename(spaced)
+    env.sim.prop(DATASET, "mountpoint", str(spaced))
+
+    def fail_keylocation(args: Sequence[str]) -> CommandResult | None:
+        if tuple(args) == ("zfs", "set", f"keylocation={FINAL}", DATASET):
+            return fail("injected\n")
+        return real_rsync(args)
+
+    zfs, _ = make(env.sim, fail_keylocation)
+    with pytest.raises(MigrationError, match="injected") as info:
+        run_file_move(env, settings, tmp_path, zfs=zfs)
+    assert f"  zfs set 'mountpoint={spaced}' {DATASET}" in info.value.hints
 
 
 @needs_rsync

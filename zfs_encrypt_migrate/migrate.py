@@ -29,7 +29,8 @@ INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 def signals_ignored() -> Iterator[None]:
     """Ignore the interrupt signals so a second one cannot skip the cleanup inside.
 
-    Children inherit the ignore on purpose: the same keypress or hangup that reaches us reaches them.
+    Children started inside inherit the ignore. Those started with ``run`` sit in their own process group,
+    so a keypress or hangup never reaches them directly; they get only the signals the CLI sends them.
     """
     if threading.current_thread() is not threading.main_thread():
         yield

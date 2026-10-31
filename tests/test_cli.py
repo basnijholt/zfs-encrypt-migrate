@@ -12,6 +12,7 @@ from typer.testing import CliRunner
 
 from zfs_encrypt_migrate import cli
 from zfs_encrypt_migrate.constants import COMMAND_STARTUP_ERROR_RETURNCODE
+from zfs_encrypt_migrate.filemove import probe_writers
 from zfs_encrypt_migrate.process import SubprocessRunner
 
 from .conftest import FakeRunner, fail, ok
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from zfs_encrypt_migrate.process import CommandResult
+    from zfs_encrypt_migrate.zfs import Zfs
 
 runner = CliRunner()
 
@@ -563,3 +565,27 @@ def test_file_move_rejects_bad_dataset_name(sim: ZfsSim) -> None:
 
     assert result.exit_code == 2  # noqa: PLR2004
     assert sim.runner.calls == []  # type: ignore[attr-defined]
+
+
+def test_file_move_interrupt_in_writer_probe_exits_130_with_remount_hint(
+    sim: ZfsSim,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ctrl-C between the writer probe's unmount and remount exits 130 and says how to remount."""
+
+    def interrupt_mount(args: Sequence[str]) -> CommandResult:
+        if tuple(args[:2]) == ("zfs", "mount"):
+            raise KeyboardInterrupt
+        return sim.answer(args)
+
+    def probe_only(zfs: Zfs, _settings: object, dataset: str, **_options: object) -> list[str]:
+        probe_writers(zfs, dataset)
+        return []
+
+    sim.runner.responder = interrupt_mount  # type: ignore[attr-defined]
+    monkeypatch.setattr(cli, "file_move", probe_only)
+
+    result = runner.invoke(cli.app, ["file-move", "tank/data", "--delete-source"])
+
+    assert result.exit_code == 130  # noqa: PLR2004
+    assert "remount it with: zfs mount tank/data" in result.output

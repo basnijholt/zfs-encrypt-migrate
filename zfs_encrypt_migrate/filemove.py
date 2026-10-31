@@ -20,7 +20,7 @@ from .constants import (
     SPACE_DELAY_SECONDS,
     STAGING_MOUNT_ROOT,
 )
-from .errors import MigrationError
+from .errors import Interrupted, MigrationError
 from .filetree import delete, group_by_inode, plan_batches, remove_scratch, scan, verify, write_file_list
 from .migrate import (
     ENCRYPTION,
@@ -121,7 +121,7 @@ def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
 
 
 def probe_writers(zfs: Zfs, dataset: str) -> dict[str, Prop]:
-    """Unmount and remount the source: a busy dataset means a writer is still running.
+    """Unmount the source and mount it again with noatime: a busy dataset means a writer is still running.
 
     Return the source's properties, read while it is unmounted: once mounted with noatime, zfs reports
     atime as a temporary value and hides the dataset's own.
@@ -129,12 +129,22 @@ def probe_writers(zfs: Zfs, dataset: str) -> dict[str, Prop]:
     if not zfs.unmount(dataset):
         msg = f"cannot unmount {dataset}; a writer is probably still running"
         raise MigrationError(msg)
+    # Anything that stops the run here leaves the source unmounted, so every way out gives the remount
+    # command; an interrupt stays an interrupt, so the CLI still exits 130.
+    hint = f"remount it with: zfs mount {dataset}"
     try:
         props = zfs.props(dataset)
         # Reads after enc-final must not update atimes: written@ would count them as writes.
         zfs.mount(dataset, ["noatime"])
     except MigrationError as exc:
-        raise MigrationError(exc.message, [f"remount it with: zfs mount {dataset}"]) from exc
+        exc.hints = (*exc.hints, hint)
+        raise
+    except KeyboardInterrupt as exc:
+        msg = "interrupted"
+        raise Interrupted(msg, [hint]) from exc
+    except Exception as exc:
+        msg = f"{type(exc).__name__}: {exc}"
+        raise MigrationError(msg, [hint]) from exc
     return props
 
 
@@ -299,6 +309,8 @@ def move_files(  # noqa: PLR0917
             rsync_files(zfs, src, dst, scratch / "files")
             verified, _changed = verify(src, dst, batch)
             zfs.pool_sync(pool)
+            # And again right before deleting: a snapshot taken while the batch copied would pin it.
+            _refuse_snapshots(zfs, dataset)
             deleted += delete(src, verified)
             batch_number += 1
             left -= moved
@@ -321,6 +333,10 @@ def finish(  # noqa: PLR0917
     leaf = leaf_of(dataset)
     staged = f"{settings.stage}/{leaf}"
     refuse_stale(zfs, FINAL_SNAPSHOT, [dataset], recursive=False)
+    # Unmounting finishes what the last batch's deletes left pending and the sync commits it, so it does not
+    # count in written@enc-final; a busy source means a writer came back.
+    probe_writers(zfs, dataset)
+    zfs.pool_sync(pool_of(dataset))
     # Taken before the last scan, so written@ catches a writer between that scan and the unmount.
     zfs.snapshot(f"{dataset}@{FINAL_SNAPSHOT}", recursive=False)
     entries = scan(src)
@@ -360,7 +376,8 @@ def finish(  # noqa: PLR0917
     markers = (MARK_SOURCE, MARK_DIRS, MARK_KEY)
     # Hinted before the swap: each acts on <dataset> and is idempotent, so it is right whatever step failed.
     guard.cleanup += [
-        *(f"  zfs set {prop}={value} {dataset}" for prop, value in fix.set.items()),
+        # mountpoint, sharenfs and sharesmb values can hold spaces.
+        *(f"  zfs set {shlex.quote(f'{prop}={value}')} {dataset}" for prop, value in fix.set.items()),
         *(f"  zfs inherit {prop} {dataset}" for prop in (*fix.inherit, *markers)),
         f"  zfs set canmount={fix.canmount} {dataset}",
         *([f"  zfs mount {dataset}"] if mount else []),
