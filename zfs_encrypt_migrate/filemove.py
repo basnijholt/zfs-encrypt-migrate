@@ -111,6 +111,20 @@ def _refuse_source(zfs: Zfs, dataset: str) -> Path:
     return Path(mountpoint)
 
 
+def _refuse_keys_inside(settings: Settings, dataset: str, source: Path) -> None:
+    """Refuse a key file inside the source: a batch would move it into the dataset that needs it to unlock."""
+    keys = [("key file", settings.key_file)]
+    scheme, _, path = settings.final_keylocation.partition("://")
+    if scheme == "file":
+        keys.append(("final key file", Path(path)))
+    root = source.resolve()
+    for label, key in keys:
+        # Symlinks are followed: the file a batch deletes is the target.
+        if key.resolve().is_relative_to(root):
+            msg = f"{label} {key} is inside {dataset}, which file-move empties; keep the key outside the dataset"
+            raise MigrationError(msg)
+
+
 def _refuse_pinned_space(zfs: Zfs, settings: Settings, dataset: str) -> None:
     """Refuse when deleting the source's files would not free their space: the move would stall half-way."""
     parts = dataset.split("/")
@@ -214,6 +228,7 @@ def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
     refuse_cross_pool(settings, dataset, "file-move")
     refuse_nested(settings, dataset)
     source = _refuse_source(zfs, dataset)
+    _refuse_keys_inside(settings, dataset, source)
     # zfs get mountpoint includes the altroot, so the swap's fix-up would store it in the mountpoint.
     pool = pool_of(dataset)
     altroot = zfs.pool_get("altroot", pool)

@@ -76,6 +76,69 @@ def test_preflight_refuses_bad_key_file(filemove_env: FileMoveEnv, settings: Set
     refused(filemove_env, settings, f"key file {key_file} must have mode 600")
 
 
+def private_key(path: Path) -> Path:
+    """Write a key file with mode 600 at ``path``."""
+    path.write_text("secret")
+    path.chmod(0o600)
+    return path
+
+
+def test_preflight_refuses_a_key_file_inside_the_dataset(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """A batch would move the key file into the dataset that needs it to unlock, and delete the original."""
+    key = private_key(filemove_env.src / "docs" / "a.key")
+    refused(
+        filemove_env,
+        replace(settings, key_file=key),
+        f"key file {key} is inside {DATASET}, which file-move empties; keep the key outside the dataset",
+    )
+
+
+def test_preflight_refuses_a_key_file_linked_into_the_dataset(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """A symlink from outside counts by its target: that is the file a batch deletes."""
+    link = tmp_path / "link.key"
+    link.symlink_to(private_key(filemove_env.src / "a.key"))
+    refused(
+        filemove_env,
+        replace(settings, key_file=link),
+        f"key file {link} is inside {DATASET}, which file-move empties; keep the key outside the dataset",
+    )
+
+
+@pytest.mark.parametrize("linked", [False, True])
+def test_preflight_refuses_a_final_key_file_inside_the_dataset(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    linked: bool,  # noqa: FBT001
+) -> None:
+    """The final keylocation must outlive the move too: the swapped dataset cannot unlock from inside itself."""
+    path = private_key(filemove_env.src / "final.key")
+    if linked:
+        path = tmp_path / "final-link.key"
+        path.symlink_to(filemove_env.src / "final.key")
+    refused(
+        filemove_env,
+        replace(settings, final_keylocation=f"file://{path}"),
+        f"final key file {path} is inside {DATASET}, which file-move empties; keep the key outside the dataset",
+    )
+
+
+def test_preflight_allows_key_files_beside_the_dataset(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """A key next to the mountpoint, even one whose name starts like it, is outside the dataset."""
+    beside = private_key(tmp_path / "src.key")
+    final = f"file://{private_key(tmp_path / 'srcfinal.key')}"
+    changed = replace(settings, key_file=beside, final_keylocation=final)
+    assert preflight_file_move(filemove_env.zfs, changed, DATASET) == filemove_env.src
+
+
 def test_preflight_refuses_pool_root(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Preflight refuses pool root."""
     refused(filemove_env, settings, "tank is a pool root; file-move is not supported", "tank")
