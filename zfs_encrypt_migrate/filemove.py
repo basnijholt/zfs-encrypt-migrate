@@ -55,8 +55,9 @@ from .props import create_props, fixups
 from .sizes import format_size
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping
+    from collections.abc import Callable, Iterator, Mapping, Sequence
 
+    from .filetree import Group
     from .migrate import AbortGuard, Settings
     from .zfs import Prop, Zfs
 
@@ -416,6 +417,25 @@ def _refuse_snapshots(zfs: Zfs, dataset: str) -> None:
         raise MigrationError(msg, hints)
 
 
+def _refuse_too_big(zfs: Zfs, settings: Settings, src: Path, dst: Path, groups: Sequence[Group]) -> None:
+    """Refuse, before the run deletes anything, a file without a copy that is bigger than the free space.
+
+    Moving the other files first frees only what their copies take, so it would never fit, and the run would
+    stop half-moved.
+    """
+    missing = [group for group in groups if not os.path.lexists(dst / group.first)]
+    if not missing:
+        return
+    largest = max(missing, key=lambda group: group.allocated)
+    budget = zfs.pool_avail(pool_of(settings.stage)) - settings.min_free
+    if largest.allocated > budget:
+        msg = (
+            f"{src / largest.first} ({format_size(largest.allocated)}) is larger than the free space above the "
+            f"floor ({format_size(max(budget, 0))}); free space first"
+        )
+        raise MigrationError(msg)
+
+
 def _refuse_unmounted(zfs: Zfs, staged: str, dst: Path, device: int) -> None:
     """Refuse unless the staged dataset is still the filesystem mounted at ``dst``.
 
@@ -448,10 +468,15 @@ def move_files(  # noqa: PLR0917
     # Before any space check, since they hold space; the run lock keeps every other run out of scratch.
     remove_partials(dst)
     batch_number = 0
+    first_pass = True
     while entries := scan(src):
-        left = sum(group.allocated for group in group_by_inode(entries, src))
+        groups = group_by_inode(entries, src)
+        if first_pass:
+            _refuse_too_big(zfs, settings, src, dst, groups)
+            first_pass = False
+        left = sum(group.allocated for group in groups)
         deleted = 0
-        for batch in plan_batches(group_by_inode(entries, src), batch_size):
+        for batch in plan_batches(groups, batch_size):
             # Before anything is written into dst: it may have become a bare directory since the last batch.
             _refuse_unmounted(zfs, staged, dst, device)
             # Created only when files remain: a rerun after finish removed scratch must not change the copy's root.

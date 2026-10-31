@@ -943,10 +943,61 @@ def test_move_removes_partial_files_before_the_space_check(
     (temp / ".a.txt.Xy12Zq").write_bytes(b"partial")
     (dst / SCRATCH / "dirs" / "docs").mkdir(parents=True)
     env.sim.avail = 0
-    with pytest.raises(MigrationError, match="not enough free space"):
+    # The first space check: no file without a copy fits.
+    with pytest.raises(MigrationError, match="is larger than the free space above the floor"):
         move(env, settings, dst, 10**9, recorder()[1])
     assert not temp.exists() or list(temp.iterdir()) == []
     assert (dst / SCRATCH / "dirs" / "docs").is_dir()
+
+
+SIZES = {"a.txt": 1000, "docs/b.txt": 9000, "docs/deep/c.txt": 1000}
+
+
+def fixed_sizes(root: Path) -> list[filetree.Entry]:
+    """Scan with the allocations of SIZES: a fresh file's own allocation changes once the pool writes it out."""
+    return [replace(item, allocated=SIZES[item.name]) for item in filetree.scan(root)]
+
+
+def test_file_bigger_than_the_free_space_stops_the_run_before_any_delete(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Moving the other files first frees only what their copies take, so such a file would stall a half-moved run."""
+    env = filemove_env
+    monkeypatch.setattr(filemove, "scan", fixed_sizes)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    env.sim.avail = settings.min_free + 5000
+    before = source_files(env)
+    with pytest.raises(MigrationError) as info:
+        move(env, settings, dst, 1, recorder()[1])
+    assert info.value.message == (
+        f"{env.src / 'docs' / 'b.txt'} (8.8K) is larger than the free space above the floor (4.9K); free space first"
+    )
+    assert source_files(env) == before
+    assert not [call for call in env.runner.calls if call[0] == "rsync"]
+
+
+@needs_rsync
+def test_big_file_with_a_copy_already_does_not_stop_the_run(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only files without a copy count: the big one a stopped run already copied needs no new space."""
+    env = filemove_env
+    monkeypatch.setattr(filemove, "scan", fixed_sizes)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    groups = filetree.group_by_inode(filetree.scan(env.src), env.src)
+    filetree.write_file_list(tmp_path / "list", [g for g in groups if g.first == "docs/b.txt"])
+    rsync_files(env.zfs, env.src, dst, tmp_path / "list")
+    env.sim.avail = settings.min_free + 5000
+    move(env, settings, dst, 1, recorder()[1])
+    assert source_files(env) == []
 
 
 @needs_rsync
