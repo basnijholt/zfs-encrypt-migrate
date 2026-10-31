@@ -1,0 +1,215 @@
+"""Encrypt a dataset bigger than the pool's free space by moving its files into an encrypted copy."""
+
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import shlex
+import sys
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+from .constants import MARK_DIRS, MARK_KEY, MARK_SOURCE, SCRATCH
+from .errors import MigrationError
+from .migrate import (
+    ENCRYPTION,
+    check_key_file,
+    ensure_container,
+    in_flight,
+    leaf_of,
+    load_stage_key,
+    refuse_cross_pool,
+    refuse_nested,
+)
+from .props import create_props
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from .migrate import AbortGuard, Settings
+    from .zfs import Zfs
+
+NO_MOUNTPOINT = {"none", "legacy"}
+
+
+@contextlib.contextmanager
+def run_lock(path: Path) -> Iterator[None]:
+    """Hold an exclusive non-blocking lock so two file-moves never run at once."""
+    with path.open("a") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            msg = f"another file-move is running (lock {path})"
+            raise MigrationError(msg) from None
+        yield
+
+
+def _refuse_source(zfs: Zfs, dataset: str) -> Path:
+    """Refuse a source dataset file-move cannot handle; return its mountpoint."""
+    if not zfs.exists(dataset):
+        msg = f"dataset {dataset} does not exist"
+        raise MigrationError(msg)
+    if zfs.get("type", dataset) == "volume":
+        msg = f"{dataset} is a volume; file-move moves the files of a filesystem"
+        raise MigrationError(msg)
+    if zfs.children(dataset):
+        msg = f"{dataset} has child datasets; use the tree commands, or file-move each child"
+        raise MigrationError(msg)
+    if zfs.get("encryption", dataset) != "off":
+        msg = f"{dataset} is already encrypted"
+        raise MigrationError(msg)
+    if zfs.get("readonly", dataset) == "on":
+        msg = f"{dataset} is read-only; file-move must delete its files"
+        raise MigrationError(msg)
+    mountpoint = zfs.get("mountpoint", dataset)
+    if mountpoint in NO_MOUNTPOINT:
+        msg = f"{dataset} has mountpoint {mountpoint}; file-move needs a mounted path"
+        raise MigrationError(msg)
+    if zfs.get("mounted", dataset) != "yes":
+        msg = f"{dataset} is not mounted"
+        raise MigrationError(msg)
+    reserved = Path(mountpoint) / SCRATCH
+    # The staged copy keeps its scratch files under this name, so the source must not use it.
+    if reserved.exists():
+        msg = f"{reserved} exists; file-move needs that name for its own files"
+        raise MigrationError(msg)
+    return Path(mountpoint)
+
+
+def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
+    """Refuse unless the run can start or resume; return the source mountpoint. Writes nothing."""
+    check_key_file(settings)
+    if "/" not in dataset:
+        msg = f"{dataset} is a pool root; file-move is not supported"
+        raise MigrationError(msg)
+    refuse_cross_pool(settings, dataset, "file-move")
+    refuse_nested(settings, dataset)
+    source = _refuse_source(zfs, dataset)
+    stage = settings.stage
+    staged = f"{stage}/{leaf_of(dataset)}"
+    staged_exists = zfs.exists(staged)
+    if staged_exists and zfs.get(MARK_SOURCE, staged) != dataset:
+        msg = f"{staged} exists and is not a file-move of {dataset}"
+        raise MigrationError(msg)
+    if [name for name in in_flight(zfs, settings) if name != staged]:
+        msg = f"a migration is already in flight under {stage}"
+        raise MigrationError(msg)
+    old = f"{stage}/old/{leaf_of(dataset)}"
+    if not staged_exists and zfs.exists(old):
+        msg = f"{old} already exists"
+        raise MigrationError(msg)
+    return source
+
+
+def probe_writers(zfs: Zfs, dataset: str) -> None:
+    """Unmount and remount the source: a busy dataset means a writer is still running."""
+    if not zfs.unmount(dataset):
+        msg = f"cannot unmount {dataset}; a writer is probably still running"
+        raise MigrationError(msg)
+    try:
+        zfs.mount(dataset)
+    except MigrationError as exc:
+        raise MigrationError(exc.message, [f"remount it with: zfs mount {dataset}"]) from exc
+
+
+def open_staged(zfs: Zfs, settings: Settings, dataset: str, mount_root: Path, guard: AbortGuard) -> Path:
+    """Create the encrypted staged dataset on the first run; load its key and mount it. Return its path."""
+    leaf = leaf_of(dataset)
+    staged = f"{settings.stage}/{leaf}"
+    if not zfs.exists(staged):
+        ensure_container(zfs, settings.stage)
+        ensure_container(zfs, f"{settings.stage}/old")
+        props = {
+            **create_props(zfs.props(dataset)),
+            "encryption": ENCRYPTION,
+            "keyformat": settings.keyformat,
+            "keylocation": f"file://{settings.key_file}",
+            # Mounted only at a private path, never over the source's own mountpoint.
+            "canmount": "noauto",
+            "mountpoint": str(mount_root / leaf),
+            MARK_SOURCE: dataset,
+        }
+        zfs.create(staged, props)
+    load_stage_key(zfs, staged)
+    if zfs.get("mounted", staged) != "yes":
+        zfs.mount(staged)
+    guard.mounted.append(staged)
+    return Path(zfs.get("mountpoint", staged))
+
+
+def _rsync(zfs: Zfs, args: list[str]) -> None:
+    result = zfs.runner.run(args)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or f"exit {result.returncode}"
+        msg = f"{shlex.join(args)} failed: {detail}"
+        raise MigrationError(msg)
+
+
+def rsync_files(zfs: Zfs, src: Path, dst: Path, file_list: Path) -> None:
+    """Copy the NUL-separated list of files, keeping hardlinks, ACLs, xattrs and sparseness."""
+    temp = dst / SCRATCH / "tmp"
+    temp.mkdir(parents=True, exist_ok=True)
+    _rsync(
+        zfs,
+        [
+            "rsync",
+            "-aHAXS",
+            "--numeric-ids",
+            "--from0",
+            f"--files-from={file_list}",
+            f"--temp-dir={temp}",
+            f"{src}/",
+            f"{dst}/",
+        ],
+    )
+
+
+def rsync_dirs(zfs: Zfs, src: Path, dst: Path) -> None:
+    """Copy only the directory tree with its metadata."""
+    _rsync(
+        zfs,
+        [
+            "rsync",
+            "-aAX",
+            "--numeric-ids",
+            "--exclude=/.zfs",
+            "--include=*/",
+            "--exclude=*",
+            f"{src}/",
+            f"{dst}/",
+        ],
+    )
+
+
+def copy_tree(zfs: Zfs, staged: str, src: Path, dst: Path) -> None:
+    """Copy the directories twice, the second time into scratch so later batches can restore their mtimes."""
+    if zfs.get(MARK_DIRS, staged) == "copied":
+        return
+    rsync_dirs(zfs, src, dst)
+    shadow = dst / SCRATCH / "dirs"
+    shadow.mkdir(parents=True, exist_ok=True)
+    rsync_dirs(zfs, src, shadow)
+    zfs.set_prop(staged, MARK_DIRS, "copied")
+
+
+def stdin_is_terminal() -> bool:
+    """Return whether a person can type a passphrase."""
+    return sys.stdin.isatty()
+
+
+def check_passphrase(zfs: Zfs, settings: Settings, staged: str) -> None:
+    """Prove the final key unlocks the staged dataset before any file is deleted."""
+    if zfs.get(MARK_KEY, staged) == "yes":
+        return
+    location = settings.final_keylocation
+    if location == "prompt":
+        if not stdin_is_terminal():
+            msg = "run file-move once from a terminal so it can check the passphrase"
+            raise MigrationError(msg)
+        loaded = zfs.check_key(staged, "prompt", attached=True)
+    else:
+        loaded = zfs.check_key(staged, location, attached=False)
+    if not loaded:
+        msg = f"the key for {staged} did not load from {location}; nothing was deleted"
+        raise MigrationError(msg)
+    zfs.set_prop(staged, MARK_KEY, "yes")

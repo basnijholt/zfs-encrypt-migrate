@@ -2,17 +2,24 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 from collections import deque
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import pytest
 
 from zfs_encrypt_migrate.migrate import Settings
-from zfs_encrypt_migrate.process import CommandResult
+from zfs_encrypt_migrate.process import CommandResult, SubprocessRunner
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
     from pathlib import Path
+
+    from zfs_encrypt_migrate.zfs import Zfs
+
+    from .zfs_sim import ZfsSim
 
 STAGE = "tank/stage"
 OK = CommandResult(returncode=0, stdout="", stderr="")
@@ -75,3 +82,50 @@ def key_file(tmp_path: Path) -> Path:
 def settings(key_file: Path) -> Settings:
     """Build settings with a tiny free-space floor."""
     return Settings(stage=STAGE, key_file=key_file, min_free=1000, keyformat="passphrase", final_keylocation="prompt")
+
+
+needs_rsync = pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync not installed")
+
+
+@dataclass
+class FileMoveEnv:
+    """A simulated tank/media mounted at ``src`` with sample files, a stage, and a private mount root."""
+
+    sim: ZfsSim
+    zfs: Zfs
+    runner: FakeRunner
+    src: Path
+    mount_root: Path
+    dataset: str = "tank/media"
+
+    @property
+    def staged(self) -> str:
+        """Name of the staged dataset."""
+        return f"{STAGE}/media"
+
+
+@pytest.fixture
+def filemove_env(tmp_path: Path) -> FileMoveEnv:
+    """Build the file-move environment; rsync commands run for real, zfs commands go to the sim."""
+    # Imported here: helpers and zfs_sim import this module.
+    from .helpers import make  # noqa: PLC0415
+    from .zfs_sim import ZfsSim  # noqa: PLC0415
+
+    src = tmp_path / "src"
+    (src / "docs" / "deep").mkdir(parents=True)
+    (src / "empty").mkdir()
+    (src / "a.txt").write_text("a")
+    (src / "docs" / "b.txt").write_text("b")
+    (src / "docs" / "deep" / "c.txt").write_text("c")
+    for index, directory in enumerate((src / "docs" / "deep", src / "docs", src / "empty", src)):
+        os.utime(directory, (1_000_000_000 + index, 1_000_000_000 + index))
+    sim = ZfsSim(["tank", "tank/media", STAGE])
+    sim.prop("tank/media", "mountpoint", str(src))
+    sim.prop("tank/media", "mounted", "yes")
+    real = SubprocessRunner()
+
+    def responder(args: Sequence[str]) -> CommandResult | None:
+        return real.run(args) if args[0] == "rsync" else None
+
+    zfs, runner = make(sim, responder)
+    return FileMoveEnv(sim, zfs, runner, src, tmp_path / "run")

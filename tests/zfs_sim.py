@@ -78,7 +78,11 @@ class ZfsSim:
 
     def _get_all(self, name: str) -> str:
         """Answer ``zfs get -H -p -o property,value,source all``: local, inherited, then default properties."""
-        rows = {prop: (value, "local") for (n, prop), value in self.props.items() if n == name}
+        # Read-only properties have no source, as in real zfs.
+        readonly = {"mounted", "keystatus", "encryptionroot"}
+        rows = {
+            prop: (value, "-" if prop in readonly else "local") for (n, prop), value in self.props.items() if n == name
+        }
         for (n, prop), (value, origin) in self.inherited.items():
             if n == name and prop not in rows:
                 rows[prop] = (value, f"inherited from {origin}")
