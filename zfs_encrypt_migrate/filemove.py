@@ -99,8 +99,9 @@ def _refuse_source(zfs: Zfs, dataset: str) -> Path:
         msg = f"{dataset} is not mounted"
         raise MigrationError(msg)
     reserved = Path(mountpoint) / SCRATCH
-    # The staged copy keeps its scratch files under this name, so the source must not use it.
-    if reserved.exists():
+    # The staged copy keeps its scratch files under this name, so the source must not use it, not even as a
+    # dangling symlink.
+    if os.path.lexists(reserved):
         msg = f"{reserved} exists; file-move needs that name for its own files"
         raise MigrationError(msg)
     return Path(mountpoint)

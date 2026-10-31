@@ -133,6 +133,13 @@ def test_preflight_refuses_reserved_name(filemove_env: FileMoveEnv, settings: Se
     refused(filemove_env, settings, f"{reserved} exists; file-move needs that name for its own files")
 
 
+def test_preflight_refuses_reserved_name_as_dangling_symlink(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """A symlink by that name counts even when its target is missing: its copy would collide with scratch."""
+    reserved = filemove_env.src / SCRATCH
+    reserved.symlink_to("nowhere")
+    refused(filemove_env, settings, f"{reserved} exists; file-move needs that name for its own files")
+
+
 @pytest.mark.parametrize("prop", ["reservation", "refreservation"])
 def test_preflight_refuses_reserved_space(filemove_env: FileMoveEnv, settings: Settings, prop: str) -> None:
     """A reservation keeps the space of deleted files reserved for the source, so no batch would ever fit."""
