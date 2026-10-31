@@ -6,14 +6,26 @@ import contextlib
 import fcntl
 import shlex
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .constants import MARK_DIRS, MARK_KEY, MARK_SOURCE, SCRATCH, SPACE_ATTEMPTS, SPACE_DELAY_SECONDS
+from .constants import (
+    LOCK_FILE,
+    MARK_DIRS,
+    MARK_KEY,
+    MARK_SOURCE,
+    SCRATCH,
+    SPACE_ATTEMPTS,
+    SPACE_DELAY_SECONDS,
+    STAGING_MOUNT_ROOT,
+)
 from .errors import MigrationError
-from .filetree import delete, group_by_inode, plan_batches, scan, verify, write_file_list
+from .filetree import delete, group_by_inode, plan_batches, remove_scratch, scan, verify, write_file_list
 from .migrate import (
     ENCRYPTION,
+    FINAL_SNAPSHOT,
+    abort_guard,
     check_key_file,
     ensure_container,
     in_flight,
@@ -22,9 +34,12 @@ from .migrate import (
     pool_of,
     refuse_cross_pool,
     refuse_nested,
+    refuse_stale,
+    rename_aside_commands,
+    swap_into_place,
 )
 from .output import console
-from .props import create_props
+from .props import create_props, fixups
 from .sizes import format_size
 
 if TYPE_CHECKING:
@@ -120,6 +135,7 @@ def open_staged(zfs: Zfs, settings: Settings, dataset: str, mount_root: Path, gu
     """Create the encrypted staged dataset on the first run; load its key and mount it. Return its path."""
     leaf = leaf_of(dataset)
     staged = f"{settings.stage}/{leaf}"
+    private = str(mount_root / leaf)
     if not zfs.exists(staged):
         ensure_container(zfs, settings.stage)
         ensure_container(zfs, f"{settings.stage}/old")
@@ -130,10 +146,14 @@ def open_staged(zfs: Zfs, settings: Settings, dataset: str, mount_root: Path, gu
             "keylocation": f"file://{settings.key_file}",
             # Mounted only at a private path, never over the source's own mountpoint.
             "canmount": "noauto",
-            "mountpoint": str(mount_root / leaf),
+            "mountpoint": private,
             MARK_SOURCE: dataset,
         }
         zfs.create(staged, props)
+    elif zfs.get("mountpoint", staged) != private:
+        # A swap stopped after its fix-ups leaves the source's mountpoint here; mounted there, the copy
+        # would hide the source and the move loop would delete files from the copy itself.
+        zfs.set_prop(staged, "mountpoint", private)
     load_stage_key(zfs, staged)
     if zfs.get("mounted", staged) != "yes":
         zfs.mount(staged)
@@ -255,9 +275,10 @@ def move_files(  # noqa: PLR0917
     """Move every file into the copy in verified batches; delete a batch only after its copy is verified and synced."""
     pool = pool_of(settings.stage)
     scratch = dst / SCRATCH
-    scratch.mkdir(parents=True, exist_ok=True)
     batch_number = 0
     while entries := scan(src):
+        # Created only when there is work: a rerun after the swap removed it must leave the copy's times alone.
+        scratch.mkdir(parents=True, exist_ok=True)
         left = sum(group.allocated for group in group_by_inode(entries, src))
         deleted = 0
         for batch in plan_batches(group_by_inode(entries, src), batch_size):
@@ -277,3 +298,111 @@ def move_files(  # noqa: PLR0917
         if deleted == 0:
             msg = f"{len(entries)} files kept changing during the move; stop the writers and rerun"
             raise MigrationError(msg)
+
+
+def _restore_dirs(zfs: Zfs, src: Path, dst: Path) -> None:
+    """Give the copy's directories the attributes the source had before any file moved, then drop scratch."""
+    pristine = dst / SCRATCH / "dirs"
+    # Gone once an earlier run restored the attributes; another live pass would overwrite them.
+    if not pristine.is_dir():
+        return
+    # The live pass creates directories added since the start; the pristine pass restores their original times.
+    rsync_dirs(zfs, src, dst)
+    rsync_dirs(zfs, pristine, dst)
+    remove_scratch(dst)
+
+
+def finish(  # noqa: PLR0917
+    zfs: Zfs,
+    settings: Settings,
+    dataset: str,
+    src: Path,
+    dst: Path,
+    guard: AbortGuard,
+) -> list[str]:
+    """Swap the copy into place once the source holds only directories; return the hints for the operator."""
+    leaf = leaf_of(dataset)
+    staged = f"{settings.stage}/{leaf}"
+    refuse_stale(zfs, FINAL_SNAPSHOT, [dataset], recursive=False)
+    # Taken before the last scan, so written@ catches a writer between that scan and the unmount.
+    zfs.snapshot(f"{dataset}@{FINAL_SNAPSHOT}", recursive=False)
+    entries = scan(src)
+    if entries:
+        msg = f"{len(entries)} files appeared in {dataset} during the swap; stop the writers and rerun"
+        raise MigrationError(msg)
+    _restore_dirs(zfs, src, dst)
+    # From here the copy holds everything, so the swap's own recovery hints replace the split-data note.
+    guard.notes = []
+    guard.source = dataset
+    guard.leaf = leaf
+    if not zfs.unmount(dataset):
+        msg = f"cannot unmount {dataset}; a writer is probably still running"
+        raise MigrationError(msg)
+    zfs.pool_sync(pool_of(dataset))
+    if zfs.get(f"written@{FINAL_SNAPSHOT}", dataset) != "0":
+        commands = rename_aside_commands(zfs, FINAL_SNAPSHOT, [dataset], recursive=False)
+        msg = f"{dataset} was written after the final scan"
+        hints = ["rename the stale snapshot aside, then rerun file-move:", *(f"  {command}" for command in commands)]
+        raise MigrationError(msg, hints)
+    if not zfs.unmount(staged):
+        msg = f"cannot unmount {staged}; something still uses {dst}"
+        raise MigrationError(msg)
+    guard.mounted = [name for name in guard.mounted if name != staged]
+    # Read before the swap, which sets canmount=noauto on the source.
+    fix = fixups(zfs.props(dataset))
+    for prop, value in fix.set.items():
+        zfs.set_prop(staged, prop, value)
+    for prop in fix.inherit:
+        zfs.inherit(staged, prop)
+    ensure_container(zfs, f"{settings.stage}/old")
+    # canmount=noauto on the staged dataset keeps the swap from mounting it before the markers are gone.
+    swap_into_place(zfs, settings, dataset, staged, guard)
+    markers = (MARK_SOURCE, MARK_DIRS, MARK_KEY)
+    mount = fix.canmount == "on" and zfs.get("mountpoint", dataset) not in NO_MOUNTPOINT
+    guard.cleanup += [
+        *(f"  zfs inherit {marker} {dataset}" for marker in markers),
+        f"  zfs set canmount={fix.canmount} {dataset}",
+        *([f"  zfs mount {dataset}"] if mount else []),
+    ]
+    for marker in markers:
+        zfs.inherit(dataset, marker)
+    zfs.set_prop(dataset, "canmount", fix.canmount)
+    if mount:
+        zfs.mount(dataset)
+    return [
+        f"verify the key with: zfs load-key -n {dataset}",
+        "remount NFS clients: the new dataset has new file handles",
+        f"re-enable snapshot tools for {dataset}; replication restarts with a full send",
+        f"file-move done; once verified, free the old copy with: zfs destroy -r {settings.stage}/old/{leaf}",
+    ]
+
+
+def file_move(
+    zfs: Zfs,
+    settings: Settings,
+    dataset: str,
+    *,
+    batch_size: int,
+    delete_source: bool,
+    mount_root: Path = STAGING_MOUNT_ROOT,
+    lock_path: Path = LOCK_FILE,
+    sleep: Callable[[float], None] = time.sleep,
+) -> list[str]:
+    """Move the files of ``dataset`` into an encrypted copy, then swap it into place. Rerun to continue."""
+    if not delete_source:
+        msg = "file-move deletes each source file once its encrypted copy is verified; pass --delete-source to confirm"
+        raise MigrationError(msg)
+    staged = f"{settings.stage}/{leaf_of(dataset)}"
+    with run_lock(lock_path):
+        src = preflight_file_move(zfs, settings, dataset)
+        probe_writers(zfs, dataset)
+        with abort_guard(zfs, settings, staged, label="file-move") as guard:
+            guard.notes = [
+                f"file-move stopped; the files are split between {dataset} and {staged}; do not destroy either.",
+                "Rerun the same command to continue.",
+            ]
+            dst = open_staged(zfs, settings, dataset, mount_root, guard)
+            copy_tree(zfs, staged, src, dst)
+            check_passphrase(zfs, settings, staged)
+            move_files(zfs, settings, dataset, src, dst, batch_size, sleep)
+            return finish(zfs, settings, dataset, src, dst, guard)
