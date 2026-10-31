@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import contextlib
 import os
+import signal
 import subprocess
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import IO, TYPE_CHECKING, Protocol
 
@@ -17,6 +19,7 @@ if TYPE_CHECKING:
 # Bound the wait for a terminated child so a process stuck in an uninterruptible
 # kernel sleep cannot hang the cleanup path.
 _TERMINATE_WAIT_SECONDS = 5.0
+_GROUP_POLL_SECONDS = 0.05
 
 
 def _child_env() -> dict[str, str]:
@@ -69,6 +72,22 @@ def _terminate(*processes: subprocess.Popen[bytes]) -> None:
             process.wait()
 
 
+def _stop_group(process: subprocess.Popen[str]) -> None:
+    """Stop a child that leads its own process group, and everything it forked; wait until all are gone."""
+    for number in (signal.SIGTERM, signal.SIGKILL):
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(process.pid, number)
+        deadline = time.monotonic() + _TERMINATE_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            # Reaps the leader: until then it counts as a member of its group.
+            process.poll()
+            try:
+                os.killpg(process.pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(_GROUP_POLL_SECONDS)
+
+
 class SubprocessRunner:
     """Run commands through subprocess."""
 
@@ -77,18 +96,27 @@ class SubprocessRunner:
         # UTF-8 with replacement: a root tool must degrade gracefully on
         # non-UTF-8 child output, never traceback.
         try:
-            result = subprocess.run(
+            process = subprocess.Popen(
                 list(args),
                 stdin=subprocess.DEVNULL,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 encoding="utf-8",
                 errors="replace",
-                check=False,
                 env=_child_env(),
+                # Its own group, so an interrupt stops what it forked too: rsync forks a receiver that
+                # keeps files open on the copy, and the copy cannot be unmounted until that is gone.
+                process_group=0,
             )
         except OSError as exc:
             return _startup_failure(exc)
-        return CommandResult(returncode=result.returncode, stdout=result.stdout, stderr=result.stderr)
+        try:
+            stdout, stderr = process.communicate()
+        except BaseException:
+            # Includes KeyboardInterrupt: never leave the command or its helpers running.
+            _stop_group(process)
+            raise
+        return CommandResult(returncode=process.returncode, stdout=stdout, stderr=stderr)
 
     def run_attached(self, args: Sequence[str]) -> int:
         """Run a command on the caller's terminal, e.g. for a passphrase prompt, and return its exit code."""

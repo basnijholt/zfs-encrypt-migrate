@@ -106,6 +106,26 @@ def test_pipeline_terminates_both_children_on_keyboard_interrupt(tmp_path: Path)
             os.kill(pid, 0)
 
 
+def test_run_stops_everything_the_command_forked_on_keyboard_interrupt(tmp_path: Path) -> None:
+    """Ctrl-C stops the command and the processes it forked before the interrupt propagates.
+
+    rsync forks a receiver that keeps files open on the copy; the abort guard can only unmount the copy
+    once that receiver is gone too.
+    """
+    pid_file = tmp_path / "forked.pid"
+    command = ["sh", "-c", f"sleep 60 & echo $! > {pid_file}; wait"]
+    timer = threading.Timer(1.0, os.kill, (os.getpid(), signal.SIGINT))
+    timer.start()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            SubprocessRunner().run(command)
+    finally:
+        timer.cancel()
+
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(pid_file.read_text()), 0)
+
+
 def test_children_see_c_locale() -> None:
     """Both run and pipeline force LC_ALL=C so zfs messages stay English."""
     script = ["sh", "-c", 'printf %s "$LC_ALL"']
