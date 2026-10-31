@@ -43,10 +43,10 @@ from .props import create_props, fixups
 from .sizes import format_size
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Mapping
 
     from .migrate import AbortGuard, Settings
-    from .zfs import Zfs
+    from .zfs import Prop, Zfs
 
 NO_MOUNTPOINT = {"none", "legacy"}
 
@@ -120,19 +120,32 @@ def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
     return source
 
 
-def probe_writers(zfs: Zfs, dataset: str) -> None:
-    """Unmount and remount the source: a busy dataset means a writer is still running."""
+def probe_writers(zfs: Zfs, dataset: str) -> dict[str, Prop]:
+    """Unmount and remount the source: a busy dataset means a writer is still running.
+
+    Return the source's properties, read while it is unmounted: once mounted with noatime, zfs reports
+    atime as a temporary value and hides the dataset's own.
+    """
     if not zfs.unmount(dataset):
         msg = f"cannot unmount {dataset}; a writer is probably still running"
         raise MigrationError(msg)
     try:
+        props = zfs.props(dataset)
         # Reads after enc-final must not update atimes: written@ would count them as writes.
         zfs.mount(dataset, ["noatime"])
     except MigrationError as exc:
         raise MigrationError(exc.message, [f"remount it with: zfs mount {dataset}"]) from exc
+    return props
 
 
-def open_staged(zfs: Zfs, settings: Settings, dataset: str, mount_root: Path, guard: AbortGuard) -> Path:
+def open_staged(  # noqa: PLR0917
+    zfs: Zfs,
+    settings: Settings,
+    dataset: str,
+    source_props: Mapping[str, Prop],
+    mount_root: Path,
+    guard: AbortGuard,
+) -> Path:
     """Create the encrypted staged dataset on the first run; load its key and mount it. Return its path."""
     leaf = leaf_of(dataset)
     staged = f"{settings.stage}/{leaf}"
@@ -140,7 +153,7 @@ def open_staged(zfs: Zfs, settings: Settings, dataset: str, mount_root: Path, gu
         ensure_container(zfs, settings.stage)
         ensure_container(zfs, f"{settings.stage}/old")
         props = {
-            **create_props(zfs.props(dataset)),
+            **create_props(source_props),
             "encryption": ENCRYPTION,
             "keyformat": settings.keyformat,
             "keylocation": f"file://{settings.key_file}",
@@ -387,13 +400,13 @@ def file_move(
     staged = f"{settings.stage}/{leaf_of(dataset)}"
     with run_lock(lock_path):
         src = preflight_file_move(zfs, settings, dataset)
-        probe_writers(zfs, dataset)
+        source_props = probe_writers(zfs, dataset)
         with abort_guard(zfs, settings, staged, label="file-move") as guard:
             guard.notes = [
                 f"file-move stopped; the files are split between {dataset} and {staged}; do not destroy either.",
                 "Rerun the same command to continue.",
             ]
-            dst = open_staged(zfs, settings, dataset, mount_root, guard)
+            dst = open_staged(zfs, settings, dataset, source_props, mount_root, guard)
             # Copying into or over the source would verify each file against itself and delete it.
             if dst.is_relative_to(src) or src.is_relative_to(dst):
                 msg = f"{staged} is mounted at {dst}, which overlaps {dataset} at {src}"

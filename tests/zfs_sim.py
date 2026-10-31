@@ -48,6 +48,8 @@ class ZfsSim:
         self.inherited: dict[tuple[str, str], tuple[str, str]] = {}
         self.avail = avail
         self.busy: set[str] = set()
+        # Datasets mounted with "zfs mount -o noatime"; until unmounted, zfs reports atime=off as temporary.
+        self.noatime: set[str] = set()
         self.volumes: set[str] = set()
         self.roots: list[str] = []
         self.log: list[tuple[str, ...]] = []
@@ -88,6 +90,9 @@ class ZfsSim:
                 rows[prop] = (value, f"inherited from {origin}")
         for prop, value in DEFAULTS.items():
             rows.setdefault(prop, (value, "default"))
+        # Real zfs hides the dataset's own atime behind a differing temporary mount option.
+        if name in self.noatime and rows.get("atime", ("on", "default"))[0] != "off":
+            rows["atime"] = ("off", "temporary")
         return "".join(f"{prop}\t{value}\t{source}\n" for prop, (value, source) in rows.items())
 
     def ops(self) -> list[tuple[str, ...]]:
@@ -144,12 +149,9 @@ class ZfsSim:
             if args[-1] in self.busy:
                 return fail(f"cannot unmount '{args[-1]}': pool or dataset is busy\n")
             self.prop(args[-1], "mounted", "no")
+            self.noatime.discard(args[-1])
         elif verb == "mount":
-            self.prop(args[-1], "mounted", "yes")
-            # Only an explicitly set mountpoint: the DEFAULTS one is a placeholder, never a real path.
-            mountpoint = self.props.get((args[-1], "mountpoint"), "")
-            if mountpoint.startswith("/"):
-                Path(mountpoint).mkdir(parents=True, exist_ok=True)
+            self._mount(args)
         elif verb == "load-key":
             if "-n" in args:
                 return ok()
@@ -179,6 +181,15 @@ class ZfsSim:
                 for name, guid in self.snapshots.items()
             }
         return ok()
+
+    def _mount(self, args: Sequence[str]) -> None:
+        self.prop(args[-1], "mounted", "yes")
+        if "noatime" in args:
+            self.noatime.add(args[-1])
+        # Only an explicitly set mountpoint: the DEFAULTS one is a placeholder, never a real path.
+        mountpoint = self.props.get((args[-1], "mountpoint"), "")
+        if mountpoint.startswith("/"):
+            Path(mountpoint).mkdir(parents=True, exist_ok=True)
 
     def _create(self, args: Sequence[str]) -> None:
         self.datasets.add(args[-1])

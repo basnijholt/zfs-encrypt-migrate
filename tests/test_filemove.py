@@ -197,7 +197,7 @@ def test_open_staged_creates_with_planned_props(filemove_env: FileMoveEnv, setti
     env = filemove_env
     env.sim.prop(DATASET, "compression", "zstd")
     guard = guard_for(env, settings)
-    path = open_staged(env.zfs, settings, DATASET, env.mount_root, guard)
+    path = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
     create = next(call for call in env.sim.log if call[1] == "create" and call[-1] == STAGED)
     options = {create[i + 1] for i, arg in enumerate(create) if arg == "-o"}
     assert {
@@ -216,17 +216,17 @@ def test_open_staged_creates_with_planned_props(filemove_env: FileMoveEnv, setti
 def test_open_staged_reuses_mounted_staged(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Open staged reuses mounted staged."""
     env = filemove_env
-    open_staged(env.zfs, settings, DATASET, env.mount_root, guard_for(env, settings))
+    open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard_for(env, settings))
     env.sim.log.clear()
     guard = guard_for(env, settings)
-    open_staged(env.zfs, settings, DATASET, env.mount_root, guard)
+    open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
     assert env.sim.ops() == []
     assert guard.mounted == [STAGED]
 
     env.sim.prop(STAGED, "keystatus", "unavailable")
     env.sim.prop(STAGED, "mounted", "no")
     env.sim.log.clear()
-    open_staged(env.zfs, settings, DATASET, env.mount_root, guard_for(env, settings))
+    open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard_for(env, settings))
     assert env.sim.ops() == [("zfs", "load-key", STAGED), ("zfs", "mount", STAGED)]
 
 
@@ -235,7 +235,7 @@ def test_copy_tree_copies_dirs_twice_and_marks(filemove_env: FileMoveEnv, settin
     """Copy tree copies dirs twice and marks."""
     env = filemove_env
     guard = guard_for(env, settings)
-    dst = open_staged(env.zfs, settings, DATASET, env.mount_root, guard)
+    dst = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
     copy_tree(env.zfs, STAGED, env.src, dst)
     for root in (dst, dst / SCRATCH / "dirs"):
         for rel in ("docs", "docs/deep", "empty"):
@@ -668,7 +668,7 @@ def test_finish_refuses_files_appearing(filemove_env: FileMoveEnv, settings: Set
 
 def moved(env: FileMoveEnv, settings: Settings, guard: AbortGuard) -> Path:
     """Open the staged dataset, copy the tree and move every file; return the staged path."""
-    dst = open_staged(env.zfs, settings, DATASET, env.mount_root, guard)
+    dst = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
     copy_tree(env.zfs, STAGED, env.src, dst)
     move(env, settings, dst, 10**9, recorder()[1])
     return dst
@@ -883,6 +883,23 @@ def test_rerun_moving_late_files_leaves_no_scratch(
     assert not (dst / SCRATCH).exists()
     assert dir_times(dst) == times
     assert env.sim.props[DATASET, "encryption"] == "aes-256-gcm"
+
+
+@needs_rsync
+def test_staged_gets_the_atime_the_noatime_remount_hides(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """The writer probe remounts the source with noatime, which zfs then reports as atime=off (temporary).
+
+    The staged dataset must still be created with the source's own atime, read while the source was unmounted.
+    """
+    env = filemove_env
+    env.sim.prop(DATASET, "atime", "on")
+    run_file_move(env, settings, tmp_path)
+    create = next(call for call in env.sim.log if call[1] == "create" and call[-1] == STAGED)
+    assert "atime=on" in create
 
 
 @needs_rsync
