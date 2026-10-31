@@ -778,11 +778,19 @@ def tamper_after_rsync(env: FileMoveEnv, action: Callable[[int], object]) -> Non
     env.runner.responder = responder
 
 
-def move(env: FileMoveEnv, settings: Settings, dst: Path, batch_size: int, sleep: Callable[[float], None]) -> None:
+def move(  # noqa: PLR0917
+    env: FileMoveEnv,
+    settings: Settings,
+    dst: Path,
+    batch_size: int,
+    sleep: Callable[[float], None],
+    guard: AbortGuard | None = None,
+) -> None:
     """Run the move loop on the environment, with the staged dataset mounted at ``dst``."""
     env.sim.prop(STAGED, "mountpoint", str(dst))
     env.sim.prop(STAGED, "mounted", "yes")
-    move_files(env.zfs, settings, DATASET, env.src, dst, batch_size, sleep, device=dst.stat().st_dev)
+    guard = guard or guard_for(env, settings)
+    move_files(env.zfs, settings, DATASET, env.src, dst, batch_size, sleep, device=dst.stat().st_dev, guard=guard)
 
 
 def source_files(env: FileMoveEnv) -> list[str]:
@@ -1562,6 +1570,76 @@ def test_interrupt_during_rsync_cleans_up_and_rerun_completes(
 
 
 @needs_rsync
+def test_admission_refusal_says_nothing_was_deleted(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """A refused admission deleted nothing: no split note, and how to give up instead."""
+    env = filemove_env
+    env.sim.avail = settings.min_free
+    before = source_files(env)
+    with pytest.raises(MigrationError) as info:
+        run_file_move(env, settings, tmp_path)
+    assert "does not cover the worst case of this move" in info.value.message
+    assert info.value.hints == (f"nothing was deleted; to give up, remove the staged dataset: zfs destroy -r {STAGED}",)
+    assert source_files(env) == before
+    assert env.sim.props[STAGED, "mounted"] == "no"
+    assert env.sim.props[STAGED, "keystatus"] == "unavailable"
+
+
+@needs_rsync
+def test_failure_before_the_first_delete_has_no_split_note(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """A first run that stops before it deletes anything leaves every file in the source."""
+    env = filemove_env
+    before = source_files(env)
+    zfs, _ = make(env.sim, fail_file_rsync)
+    with pytest.raises(MigrationError) as info:
+        run_file_move(env, settings, tmp_path, zfs=zfs)
+    assert "failed: boom" in info.value.message
+    assert info.value.hints == ()
+    assert source_files(env) == before
+
+
+def fail_file_rsync(args: Sequence[str]) -> CommandResult | None:
+    """Fail every rsync of a batch of files; copy the directory tree for real."""
+    if args[0] == "rsync" and "-aHAXS" in args:
+        return fail("boom", 23)
+    return real_rsync(args)
+
+
+@needs_rsync
+def test_rerun_of_a_split_move_gives_the_split_note_before_deleting(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """Files an earlier run deleted are only in the staged dataset, so a rerun warns from its start."""
+    env = filemove_env
+    real_delete = filetree.delete
+
+    def delete_then_interrupt(src: Path, groups: Sequence[Group]) -> int:
+        real_delete(src, groups)
+        raise KeyboardInterrupt
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(filemove, "delete", delete_then_interrupt)
+        with pytest.raises(Interrupted):
+            run_file_move(env, settings, tmp_path)
+    assert len(source_files(env)) == 2  # noqa: PLR2004
+
+    zfs, _ = make(env.sim, fail_file_rsync)
+    with pytest.raises(MigrationError) as info:
+        run_file_move(env, settings, tmp_path, zfs=zfs)
+    assert "failed: boom" in info.value.message
+    assert info.value.hints == SPLIT_NOTES
+
+
+@needs_rsync
 def test_rerun_after_interrupt_mid_delete_keeps_links(
     filemove_env: FileMoveEnv,
     settings: Settings,
@@ -1581,8 +1659,10 @@ def test_rerun_after_interrupt_mid_delete_keeps_links(
 
     # filetree.delete unlinks through os.unlink (Path.unlink calls it).
     monkeypatch.setattr(os, "unlink", interrupt_between_names)
-    with pytest.raises(Interrupted):
+    with pytest.raises(Interrupted) as info:
         run_file_move(env, settings, tmp_path, batch_size=10**9)
+    # A stop in the middle of the first delete already splits the files.
+    assert info.value.hints == SPLIT_NOTES
     # Only os.unlink: undo() would also drop the fixture's mount stand-in.
     monkeypatch.setattr(os, "unlink", unlink)
     dst = staged_dir(env)
@@ -1822,7 +1902,8 @@ def test_refuses_staged_mounted_over_source(
     with pytest.raises(MigrationError) as info:
         run_file_move(env, settings, tmp_path)
     assert info.value.message == f"{STAGED} is mounted at {mountpoint}, which overlaps {DATASET} at {env.src}"
-    assert info.value.hints == SPLIT_NOTES
+    # Nothing was deleted, so the files are not split.
+    assert info.value.hints == ()
     assert source_files(env) == before
     assert not [call for call in env.runner.calls if call[0] == "rsync"]
     assert env.sim.ops()[-2:] == [("zfs", "unmount", STAGED), ("zfs", "unload-key", "-r", STAGED)]

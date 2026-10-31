@@ -316,7 +316,9 @@ file-move done; once verified, free the old copy with: zfs destroy -r STAGE/old/
 The verification of a name compares type, mode, owner and group; for regular files size and mtime; for symlinks the target; for device nodes `st_rdev`; and requires all copies of a hard-linked file to share one inode.
 A source file whose `ctime` changed since the scan is skipped for that pass, and a destination mismatch fails the run with nothing of the batch deleted.
 
-On a failure or interrupt, rsync is stopped, the staged dataset is unmounted and its key unloaded, and before the swap the hint is `file-move stopped; the files are split between DATASET and STAGE/LEAF; do not destroy either.` followed by `Rerun the same command to continue.`
+On a failure or interrupt, rsync is stopped and the staged dataset is unmounted and its key unloaded.
+Once files have been deleted, by this run or an earlier run of the same move, and until the swap, the hint is `file-move stopped; the files are split between DATASET and STAGE/LEAF; do not destroy either.` followed by `Rerun the same command to continue.`
+Before the first delete every file is still in DATASET, and that note is not printed.
 From the swap on, the [recovery hints](#recovery-hints) of `cutover` apply, followed by the commands that finish the property fix-ups; follow them rather than rerunning.
 A stop between unmounting the dataset and mounting it again in step 3 or step 8 adds `remount it with: zfs mount DATASET`.
 From the final unmount of step 8 on, the hints remount with `zfs mount -a` instead.
@@ -350,7 +352,7 @@ From the final unmount of step 8 on, the hints remount with `zfs mount -a` inste
 | `the key for STAGE/LEAF did not load from LOCATION; nothing was deleted` | Fix the key or location; the first mistyped passphrase deletes nothing. |
 | `DATASET has snapshots, which keep deleted files allocated: ...` | Disable snapshot tools for the dataset, then destroy the snapshots it lists (`zfs destroy SNAPSHOT`). |
 | `PATH has N hard links but only M were found` | The dataset changed during the scan: a writer added or removed a link. Stop the writers and rerun. |
-| `free space on POOL above the floor (SIZE) does not cover the worst case of this move (SIZE: largest batch or file SIZE, block-cloned data SIZE, lost compression SIZE)` | Nothing was deleted. Free space on the pool, lower `--batch-size` if the largest batch is the biggest term, or remove clones you no longer need (`zpool get bcloneused,bclonesaved POOL`), then rerun. |
+| `free space on POOL above the floor (SIZE) does not cover the worst case of this move (SIZE: largest batch or file SIZE, block-cloned data SIZE, lost compression SIZE)` | Nothing was deleted, as the hint says: `nothing was deleted; to give up, remove the staged dataset: zfs destroy -r STAGE/LEAF`. Free space on the pool, lower `--batch-size` if the largest batch is the biggest term, or remove clones you no longer need (`zpool get bcloneused,bclonesaved POOL`), then rerun. Or give up with that `zfs destroy -r`. |
 | `not enough free space on POOL for the next batch (SIZE) above the floor SIZE` | Free space or lower `--batch-size`, then rerun. |
 | `STAGE/LEAF is no longer mounted at PATH; nothing of this batch was deleted` | Something unmounted the staged dataset or mounted over it during the run (for example `zfs umount -a`). Rerun: it mounts the dataset again and continues. |
 | `STAGE/LEAF is not mounted at PATH` | `zfs mount` succeeded but nothing is mounted at the staged dataset's mountpoint; check `zfs get mountpoint,mounted STAGE/LEAF` and `findmnt PATH`. |

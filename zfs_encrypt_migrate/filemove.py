@@ -484,7 +484,8 @@ def admit(
             f"this move ({format_size(need)}: largest batch or file {format_size(largest)}, block-cloned data "
             f"{format_size(saved)}, lost compression {format_size(loss)})"
         )
-        raise MigrationError(msg)
+        hint = f"nothing was deleted; to give up, remove the staged dataset: zfs destroy -r {staged}"
+        raise MigrationError(msg, [hint])
     zfs.set_prop(staged, MARK_ADMITTED, "yes")
 
 
@@ -499,6 +500,14 @@ def _refuse_unmounted(zfs: Zfs, staged: str, dst: Path, device: int) -> None:
         raise MigrationError(msg)
 
 
+def split_notes(dataset: str, staged: str) -> list[str]:
+    """Return the guard's notes for a stop once files were deleted: they are split between the two datasets."""
+    return [
+        f"file-move stopped; the files are split between {dataset} and {staged}; do not destroy either.",
+        "Rerun the same command to continue.",
+    ]
+
+
 def move_files(  # noqa: PLR0917
     zfs: Zfs,
     settings: Settings,
@@ -509,10 +518,12 @@ def move_files(  # noqa: PLR0917
     sleep: Callable[[float], None],
     *,
     device: int,
+    guard: AbortGuard,
 ) -> None:
     """Move every file into the copy in verified batches; delete a batch only after its copy is verified and synced.
 
-    ``device`` is the device of the staged dataset mounted at ``dst``; every copy must be on it.
+    ``device`` is the device of the staged dataset mounted at ``dst``; every copy must be on it. From the first
+    delete on, ``guard`` says the files are split.
     """
     pool = pool_of(settings.stage)
     staged = f"{settings.stage}/{leaf_of(dataset)}"
@@ -543,6 +554,9 @@ def move_files(  # noqa: PLR0917
             zfs.pool_sync(pool)
             # And again right before deleting: a snapshot taken while the batch copied would pin it.
             _refuse_snapshots(zfs, dataset)
+            if verified:
+                # Set before the first unlink, so a stop part-way through it already gives the note.
+                guard.notes = split_notes(dataset, staged)
             deleted += delete(src, verified)
             batch_number += 1
             left -= moved
@@ -653,10 +667,10 @@ def file_move(
         src = preflight_file_move(zfs, settings, dataset)
         source_props = probe_writers(zfs, dataset, src)
         with abort_guard(zfs, settings, staged, label="file-move") as guard:
-            guard.notes = [
-                f"file-move stopped; the files are split between {dataset} and {staged}; do not destroy either.",
-                "Rerun the same command to continue.",
-            ]
+            # Until the first delete every file is still in the source. Files only ever get deleted once the
+            # move is admitted, so an earlier run of an admitted move may have split them already.
+            if zfs.exists(staged) and zfs.get(MARK_ADMITTED, staged) == "yes":
+                guard.notes = split_notes(dataset, staged)
             dst, device = open_staged(zfs, settings, dataset, source_props, mount_root, guard)
             # Copying into or over the source would verify each file against itself and delete it.
             if dst.is_relative_to(src) or src.is_relative_to(dst):
@@ -664,5 +678,5 @@ def file_move(
                 raise MigrationError(msg)
             copy_tree(zfs, staged, src, dst, device)
             check_passphrase(zfs, settings, staged)
-            move_files(zfs, settings, dataset, src, dst, batch_size, sleep, device=device)
+            move_files(zfs, settings, dataset, src, dst, batch_size, sleep, device=device, guard=guard)
             return finish(zfs, settings, dataset, src, dst, guard)
