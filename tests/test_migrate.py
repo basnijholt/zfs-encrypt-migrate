@@ -10,6 +10,7 @@ import pytest
 
 from zfs_encrypt_migrate.errors import Interrupted, MigrationError
 from zfs_encrypt_migrate.migrate import (
+    AbortGuard,
     Settings,
     abort_guard,
     catchup,
@@ -1019,3 +1020,60 @@ def test_cleanup_ignores_signals_and_restores_handlers(sim: ZfsSim, settings: Se
         for number, handler in previous.items():
             signal.signal(number, handler)
     assert ("zfs", "unload-key", "-r", f"{STAGE}/data") in runner.calls
+
+
+def _fail_in_guard(guard: AbortGuard, mounted: list[str], notes: list[str]) -> None:
+    with guard:
+        guard.mounted += mounted
+        guard.notes += notes
+        msg = "boom"
+        raise MigrationError(msg)
+
+
+def _guard_failure(zfs: Zfs, settings: Settings, mounted: list[str], notes: list[str] | None = None) -> MigrationError:
+    guard = abort_guard(zfs, settings, f"{STAGE}/data")
+    with pytest.raises(MigrationError) as raised:
+        _fail_in_guard(guard, mounted, notes or [])
+    return raised.value
+
+
+def test_guard_unmounts_mounted_before_unload(sim: ZfsSim, settings: Settings) -> None:
+    """Mounted datasets are unmounted last first, then the key is unloaded."""
+    staged_ready(sim)
+    child = f"{STAGE}/data/child"
+    sim.prop(f"{STAGE}/data", "keystatus", "available")
+    sim.prop(f"{STAGE}/data", "mounted", "yes")
+    sim.prop(child, "mounted", "yes")
+    zfs, _ = make(sim)
+
+    error = _guard_failure(zfs, settings, [f"{STAGE}/data", child])
+
+    ops = sim.ops()
+    assert ops.index(("zfs", "unmount", child)) < ops.index(("zfs", "unmount", f"{STAGE}/data"))
+    assert ops.index(("zfs", "unmount", f"{STAGE}/data")) < ops.index(("zfs", "unload-key", "-r", f"{STAGE}/data"))
+    assert error.hints == ()
+
+
+def test_guard_busy_unmount_keeps_key_and_hints(sim: ZfsSim, settings: Settings) -> None:
+    """A busy unmount leaves the key loaded and says how to finish."""
+    staged_ready(sim)
+    staged = f"{STAGE}/data"
+    sim.prop(staged, "keystatus", "available")
+    sim.busy.add(staged)
+    zfs, _ = make(sim)
+
+    error = _guard_failure(zfs, settings, [staged])
+
+    assert f"could not unmount {staged}; run: zfs unmount {staged} && zfs unload-key -r {staged}" in error.hints
+    assert not [op for op in sim.ops() if op[1] == "unload-key"]
+    assert sim.props[staged, "keystatus"] == "available"
+
+
+def test_guard_notes_are_printed_without_source(sim: ZfsSim, settings: Settings) -> None:
+    """Notes are appended to the hints even when no source is known."""
+    staged_ready(sim)
+    zfs, _ = make(sim)
+
+    error = _guard_failure(zfs, settings, [], ["files are split; rerun"])
+
+    assert error.hints == ("files are split; rerun",)
