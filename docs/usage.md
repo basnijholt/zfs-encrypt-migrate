@@ -482,7 +482,7 @@ And its limits:
 - **NFS clients see stale file handles after a swap.** The path is now served by a different dataset; remount it on the clients.
 - **Children moved with `tree-move` get no old copy to fall back on.** Once you destroy a moved source child, the encrypted copy is the only one; only the parent lands in `<stage>/old`. Check the passphrase you stored first, with the `zfs load-key -n -L prompt STAGE/LEAF` line that `tree-move` prints.
 - **A dataset whose last component is `old` can't be migrated.** Its staged copy would be `<stage>/old`, where the old copies live.
-- **On NixOS, keep the stage out of boot-time key loading.** With the default `boot.zfs.requestEncryptionCredentials = true`, a reboot while a staged copy exists makes the pool import fail with `Key load error`. Before the first `seed`, set it to `false` or to a list without the stage, and keep it that way until the stage is empty; see [NixOS boot prompts](guides.md#nixos-boot-prompts).
+- **On NixOS, keep the stage out of boot-time key loading.** With the default `boot.zfs.requestEncryptionCredentials = true`, a reboot while a staged copy exists makes the pool import fail with `Key load error`. Before the first `seed` or `file-move`, set it to `false` or to a list without the stage, and keep it that way until the stage is empty; see [NixOS boot prompts](guides.md#nixos-boot-prompts).
 - **Volumes move with their parent filesystem.** `cutover` refuses a volume on its own (a volume directly under the pool root needs the pool rebuild), and since a volume can't be unmounted, the tool can't tell that it's in use: stop whatever uses it first.
 - **It needs `zfs rename -u`.** It is tested on OpenZFS 2.4.
 
