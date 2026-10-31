@@ -328,9 +328,11 @@ def finish(  # noqa: PLR0917
         msg = f"{len(entries)} files appeared in {dataset} during the swap; stop the writers and rerun"
         raise MigrationError(msg)
     # The live pass creates directories added since the start; the pristine pass restores their original times.
-    rsync_dirs(zfs, src, dst)
+    # Without the pristine copy, an earlier finish already ran both and removed it; the live directories now
+    # carry the times the deletes changed, so copying them again would lose the restored ones.
     pristine = dst / SCRATCH / "dirs"
     if pristine.is_dir():
+        rsync_dirs(zfs, src, dst)
         rsync_dirs(zfs, pristine, dst)
     # From here the copy holds everything, so the swap's own recovery hints replace the split-data note.
     guard.notes = []

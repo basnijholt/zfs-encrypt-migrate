@@ -904,6 +904,41 @@ def test_rerun_moving_late_files_leaves_no_scratch(
 
 
 @needs_rsync
+def test_rerun_after_scratch_removed_keeps_dir_times(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+) -> None:
+    """A stop after the pristine copy is removed, then a rerun, keeps the original directory times.
+
+    By then the live directories carry the times the deletes changed, so the rerun must not copy them again.
+    """
+    env = filemove_env
+    times = dir_times(env.src)
+
+    def busy_staged(args: Sequence[str]) -> CommandResult | None:
+        if tuple(args) == ("zfs", "unmount", STAGED):
+            return fail(f"cannot unmount '{STAGED}': pool or dataset is busy\n")
+        return real_rsync(args)
+
+    zfs, _ = make(env.sim, busy_staged)
+    with pytest.raises(MigrationError) as info:
+        run_file_move(env, settings, tmp_path, zfs=zfs)
+    dst = staged_dir(env)
+    assert info.value.message == f"cannot unmount {STAGED}; something still uses {dst}"
+    assert not (dst / SCRATCH).exists()
+
+    # What the hints say: unmount the copy and unload its key, mount the source again, rename enc-final aside.
+    env.sim.prop(STAGED, "mounted", "no")
+    env.sim.prop(STAGED, "keystatus", "unavailable")
+    env.sim.prop(DATASET, "mounted", "yes")
+    rename_final_aside(env)
+    run_file_move(env, settings, tmp_path)
+    assert dir_times(dst) == times
+    assert env.sim.props[DATASET, "encryption"] == "aes-256-gcm"
+
+
+@needs_rsync
 def test_staged_gets_the_atime_the_noatime_remount_hides(
     filemove_env: FileMoveEnv,
     settings: Settings,
