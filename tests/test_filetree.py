@@ -1,0 +1,356 @@
+"""Tests for the filesystem layer of file-move."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import stat
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from zfs_encrypt_migrate import filetree
+from zfs_encrypt_migrate.constants import SCRATCH
+from zfs_encrypt_migrate.errors import MigrationError
+from zfs_encrypt_migrate.filetree import (
+    Entry,
+    Group,
+    delete,
+    group_by_inode,
+    plan_batches,
+    remove_scratch,
+    scan,
+    verify,
+    write_file_list,
+)
+
+BAD_NAME = os.fsdecode(b"bad\xff")
+
+
+def entry(name: str, ino: int = 1, nlink: int = 1, allocated: int = 0) -> Entry:
+    """Entry."""
+    return Entry(name=name, ino=ino, nlink=nlink, ctime_ns=0, allocated=allocated)
+
+
+def group(name: str, allocated: int) -> Group:
+    """Group."""
+    return Group((entry(name, allocated=allocated),))
+
+
+def make_pair(tmp_path: Path) -> tuple[Path, Path]:
+    """Make pair."""
+    src, dst = tmp_path / "src", tmp_path / "dst"
+    src.mkdir()
+    dst.mkdir()
+    return src, dst
+
+
+def copy_tree(src: Path, dst: Path, names: list[str]) -> None:
+    """Copy tree."""
+    for name in names:
+        target = dst / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if (src / name).is_symlink():
+            target.symlink_to((src / name).readlink())
+        else:
+            shutil.copy2(src / name, target)
+
+
+def scanned(src: Path) -> list[Group]:
+    """Return the scanned groups of a tree."""
+    return group_by_inode(scan(src), src)
+
+
+def test_scan_lists_non_directories_and_skips_root_zfs(tmp_path: Path) -> None:
+    """Scan lists non directories and skips root zfs."""
+    (tmp_path / "file").write_text("x")
+    (tmp_path / "link").symlink_to("file")
+    os.mkfifo(tmp_path / "fifo")
+    (tmp_path / "empty").mkdir()
+    (tmp_path / ".zfs").mkdir()
+    (tmp_path / ".zfs" / "x").write_text("x")
+    (tmp_path / "sub" / ".zfs").mkdir(parents=True)
+    (tmp_path / "sub" / ".zfs" / "x").write_text("x")
+    names = sorted(e.name for e in scan(tmp_path))
+    assert names == ["fifo", "file", "link", str(Path("sub", ".zfs", "x"))]
+
+
+def test_scan_records_inode_and_allocation(tmp_path: Path) -> None:
+    """Scan records inode and allocation."""
+    (tmp_path / "f").write_bytes(b"x" * 10000)
+    (found,) = scan(tmp_path)
+    st = os.lstat(tmp_path / "f")
+    assert (found.ino, found.nlink, found.ctime_ns) == (st.st_ino, 1, st.st_ctime_ns)
+    assert found.allocated == st.st_blocks * 512
+
+
+def test_scan_odd_names(tmp_path: Path) -> None:
+    """Scan odd names."""
+    odd = ["a b", "new\nline", "-dash", BAD_NAME]
+    for name in odd:
+        (tmp_path / name).write_text("x")
+    assert sorted(e.name for e in scan(tmp_path)) == sorted(odd)
+
+
+def test_scan_refuses_foreign_device(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Scan refuses foreign device."""
+    (tmp_path / "mnt").mkdir()
+    real = os.lstat
+
+    def fake(path: str | os.PathLike[str], *args: object, **kwargs: object) -> os.stat_result:
+        st = real(path, *args, **kwargs)  # type: ignore[arg-type]
+        if Path(path).name == "mnt":
+            values = list(st)
+            values[stat.ST_DEV] = st.st_dev + 1
+            return os.stat_result(values)
+        return st
+
+    monkeypatch.setattr(filetree.os, "lstat", fake)
+    with pytest.raises(MigrationError) as exc:
+        scan(tmp_path)
+    assert exc.value.message == f"{tmp_path / 'mnt'} is another filesystem mounted inside {tmp_path}"
+
+
+def test_group_by_inode_joins_hardlinks(tmp_path: Path) -> None:
+    """Group by inode joins hardlinks."""
+    (tmp_path / "b").write_text("x")
+    os.link(tmp_path / "b", tmp_path / "a")
+    (tmp_path / "c").write_text("y")
+    groups = scanned(tmp_path)
+    assert [g.first for g in groups] == ["a", "c"]
+    assert [e.name for e in groups[0].entries] == ["a", "b"]
+
+
+def test_group_allocated_counts_inode_once(tmp_path: Path) -> None:
+    """Group allocated counts inode once."""
+    (tmp_path / "a").write_bytes(b"x" * 10000)
+    os.link(tmp_path / "a", tmp_path / "b")
+    (g,) = scanned(tmp_path)
+    assert g.allocated == os.lstat(tmp_path / "a").st_blocks * 512
+
+
+def test_group_by_inode_refuses_missing_link(tmp_path: Path) -> None:
+    """Group by inode refuses missing link."""
+    root = tmp_path / "root"
+    root.mkdir()
+    (tmp_path / "outside").write_text("x")
+    os.link(tmp_path / "outside", root / "inside")
+    with pytest.raises(MigrationError) as exc:
+        group_by_inode(scan(root), root)
+    assert exc.value.message == f"{root / 'inside'} has 2 hard links but only 1 were found under {root}"
+
+
+def test_plan_batches_respects_size() -> None:
+    """Plan batches respects size."""
+    groups = [group("a", 4), group("b", 4), group("c", 4), group("d", 1)]
+    batches = plan_batches(groups, 8)
+    assert [[g.first for g in b] for b in batches] == [["a", "b"], ["c", "d"]]
+
+
+def test_plan_batches_big_group_alone() -> None:
+    """Plan batches big group alone."""
+    groups = [group("a", 1), group("big", 50), group("b", 1)]
+    batches = plan_batches(groups, 8)
+    assert [[g.first for g in b] for b in batches] == [["a"], ["big"], ["b"]]
+    assert plan_batches([], 8) == []
+
+
+def test_write_file_list_nul_separated(tmp_path: Path) -> None:
+    """Write file list nul separated."""
+    names = ["new\nline", BAD_NAME, "plain"]
+    groups = [Group((entry(n),)) for n in names]
+    out = tmp_path / "list"
+    write_file_list(out, groups)
+    raw = out.read_bytes()
+    assert raw.endswith(b"\0")
+    assert [os.fsdecode(p) for p in raw.split(b"\0")[:-1]] == names
+
+
+def test_verify_ok_after_copy(tmp_path: Path) -> None:
+    """Verify ok after copy."""
+    src, dst = make_pair(tmp_path)
+    (src / "d").mkdir()
+    (src / "d" / "f").write_text("hello")
+    os.link(src / "d" / "f", src / "h")
+    (src / "s").symlink_to("d/f")
+    os.mkfifo(src / "fifo")
+    groups = scanned(src)
+    copy_tree(src, dst, ["d/f", "s"])
+    os.mkfifo(dst / "fifo")
+    (dst / "fifo").chmod(stat.S_IMODE(os.lstat(src / "fifo").st_mode))
+    os.link(dst / "d" / "f", dst / "h")
+    verified, changed = verify(src, dst, groups)
+    assert verified == groups
+    assert changed == []
+
+
+def test_verify_changed_source_is_skipped(tmp_path: Path) -> None:
+    """Verify changed source is skipped."""
+    src, dst = make_pair(tmp_path)
+    (src / "f").write_text("x")
+    (src / "g").write_text("y")
+    groups = scanned(src)
+    copy_tree(src, dst, ["f", "g"])
+    os.utime(src / "f", ns=(1, 2))
+    (src / "g").unlink()
+    verified, changed = verify(src, dst, groups)
+    assert verified == []
+    assert [g.first for g in changed] == ["f", "g"]
+
+
+def verify_message(src: Path, dst: Path) -> str:
+    """Verify message."""
+    with pytest.raises(MigrationError) as exc:
+        verify(src, dst, scanned(src))
+    return exc.value.message
+
+
+def test_verify_missing_copy_raises(tmp_path: Path) -> None:
+    """Verify missing copy raises."""
+    src, dst = make_pair(tmp_path)
+    (src / "f").write_text("x")
+    assert verify_message(src, dst) == "f is missing from the copy"
+
+
+def test_verify_type_mismatch_raises(tmp_path: Path) -> None:
+    """Verify type mismatch raises."""
+    src, dst = make_pair(tmp_path)
+    (src / "f").write_text("x")
+    (dst / "f").mkdir()
+    assert verify_message(src, dst) == "f differs from its copy (type)"
+
+
+def test_verify_mode_mismatch_raises(tmp_path: Path) -> None:
+    """Verify mode mismatch raises."""
+    src, dst = make_pair(tmp_path)
+    (src / "f").write_text("x")
+    copy_tree(src, dst, ["f"])
+    (dst / "f").chmod(0o600)
+    (src / "f").chmod(0o644)
+    assert verify_message(src, dst) == "f differs from its copy (mode)"
+
+
+def test_verify_owner_mismatch_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify owner mismatch raises."""
+    src, dst = make_pair(tmp_path)
+    (src / "f").write_text("x")
+    copy_tree(src, dst, ["f"])
+    real = os.lstat
+
+    def fake(path: str | os.PathLike[str], *args: object, **kwargs: object) -> os.stat_result:
+        st = real(path, *args, **kwargs)  # type: ignore[arg-type]
+        if Path(path) == dst / "f":
+            values = list(st)
+            values[stat.ST_UID] = st.st_uid + 1
+            return os.stat_result(values)
+        return st
+
+    groups = scanned(src)
+    monkeypatch.setattr(filetree.os, "lstat", fake)
+    with pytest.raises(MigrationError) as exc:
+        verify(src, dst, groups)
+    assert exc.value.message == "f differs from its copy (uid)"
+
+
+def test_verify_group_mismatch_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify group mismatch raises."""
+    src, dst = make_pair(tmp_path)
+    (src / "f").write_text("x")
+    copy_tree(src, dst, ["f"])
+    real = os.lstat
+
+    def fake(path: str | os.PathLike[str], *args: object, **kwargs: object) -> os.stat_result:
+        st = real(path, *args, **kwargs)  # type: ignore[arg-type]
+        if Path(path) == dst / "f":
+            values = list(st)
+            values[stat.ST_GID] = st.st_gid + 1
+            return os.stat_result(values)
+        return st
+
+    groups = scanned(src)
+    monkeypatch.setattr(filetree.os, "lstat", fake)
+    with pytest.raises(MigrationError) as exc:
+        verify(src, dst, groups)
+    assert exc.value.message == "f differs from its copy (gid)"
+
+
+def test_verify_size_mismatch_raises(tmp_path: Path) -> None:
+    """Verify size mismatch raises."""
+    src, dst = make_pair(tmp_path)
+    (src / "f").write_text("xx")
+    copy_tree(src, dst, ["f"])
+    st = os.lstat(src / "f")
+    (dst / "f").write_text("x")
+    os.utime(dst / "f", ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert verify_message(src, dst) == "f differs from its copy (size)"
+
+
+def test_verify_mtime_mismatch_raises(tmp_path: Path) -> None:
+    """Verify mtime mismatch raises."""
+    src, dst = make_pair(tmp_path)
+    (src / "f").write_text("x")
+    copy_tree(src, dst, ["f"])
+    os.utime(dst / "f", ns=(1, 1))
+    assert verify_message(src, dst) == "f differs from its copy (mtime)"
+
+
+def test_verify_symlink_target_mismatch_raises(tmp_path: Path) -> None:
+    """Verify symlink target mismatch raises."""
+    src, dst = make_pair(tmp_path)
+    (src / "s").symlink_to("a")
+    (dst / "s").symlink_to("b")
+    assert verify_message(src, dst) == "s differs from its copy (target)"
+
+
+def test_verify_device_mismatch_raises(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A device node whose st_rdev differs from its copy raises."""
+    src, dst = make_pair(tmp_path)
+    (src / "dev").write_text("x")
+    real = os.lstat
+
+    def fake(path: str | os.PathLike[str], *args: object, **kwargs: object) -> SimpleNamespace:
+        st = real(path, *args, **kwargs)  # type: ignore[arg-type]
+        fields = {n: getattr(st, n) for n in dir(st) if n.startswith("st_")}
+        fields["st_mode"] = stat.S_IFCHR | 0o600
+        fields["st_rdev"] = 5 if Path(path).parent == dst else 4
+        return SimpleNamespace(**fields)
+
+    (dst / "dev").write_text("x")
+    groups = scanned(src)
+    monkeypatch.setattr(filetree.os, "lstat", fake)
+    with pytest.raises(MigrationError) as exc:
+        verify(src, dst, groups)
+    assert exc.value.message == "dev differs from its copy (rdev)"
+
+
+def test_verify_broken_hardlink_raises(tmp_path: Path) -> None:
+    """Verify broken hardlink raises."""
+    src, dst = make_pair(tmp_path)
+    (src / "b").write_text("x")
+    os.link(src / "b", src / "a")
+    copy_tree(src, dst, ["a", "b"])
+    assert verify_message(src, dst) == "hard links of a were not kept in the copy"
+
+
+def test_delete_unlinks_and_ignores_missing(tmp_path: Path) -> None:
+    """Delete unlinks and ignores missing."""
+    (tmp_path / "a").write_text("x")
+    (tmp_path / "b").write_text("y")
+    os.link(tmp_path / "b", tmp_path / "c")
+    groups = scanned(tmp_path)
+    (tmp_path / "a").unlink()
+    assert delete(tmp_path, groups) == len(groups[1].entries)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_remove_scratch_restores_root_mtime(tmp_path: Path) -> None:
+    """Remove scratch restores root mtime."""
+    scratch = tmp_path / SCRATCH
+    (scratch / "tmp").mkdir(parents=True)
+    (scratch / "dirs").write_text("x")
+    os.utime(scratch / "dirs", ns=(1_000_000_000, 2_000_000_000))
+    remove_scratch(tmp_path)
+    assert not scratch.exists()
+    st = os.lstat(tmp_path)
+    assert (st.st_atime_ns, st.st_mtime_ns) == (1_000_000_000, 2_000_000_000)
