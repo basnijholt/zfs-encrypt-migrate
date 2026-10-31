@@ -147,4 +147,4 @@ zfs-encrypt-migrate audit --exact tank --subtree tank/stage tank
 ## Next Steps
 
 - [Usage](usage.md): every command, option, message and recovery hint.
-- [Guides](guides.md): one dataset end to end, big trees with the tree commands, rebuilding a whole pool encrypted, unlocking after reboot with `zfs-unlock`, and sanoid/syncoid.
+- [Guides](guides.md): one dataset end to end, big trees with the tree commands, datasets bigger than the free space with `file-move`, rebuilding a whole pool encrypted, unlocking after reboot with `zfs-unlock`, and sanoid/syncoid.

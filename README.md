@@ -166,7 +166,7 @@ zfs-encrypt-migrate audit --exact tank --subtree tank/stage tank
 ```
 
 `audit` prints each offending dataset and exits 1 if there are any, or if a pool can't be listed.
-The [guides](https://zfs-encrypt-migrate.nijho.lt/guides/) cover the tree commands, rebuilding a whole pool encrypted, unlocking after reboot, and sanoid/syncoid.
+The [guides](https://zfs-encrypt-migrate.nijho.lt/guides/) cover the tree commands, `file-move` for datasets bigger than the free space, rebuilding a whole pool encrypted, unlocking after reboot, and sanoid/syncoid.
 
 ## CLI
 
@@ -220,7 +220,7 @@ zfs-encrypt-migrate --help
 
 <!-- OUTPUT:END -->
 
-The six migration and tree commands share these options, each with an environment variable fallback:
+The seven migration, tree and file-move commands share these options, each with an environment variable fallback:
 
 ```bash
 zfs-encrypt-migrate seed --help
