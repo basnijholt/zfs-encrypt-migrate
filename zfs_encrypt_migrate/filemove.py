@@ -217,9 +217,10 @@ def open_staged(  # noqa: PLR0917
         }
         zfs.create(staged, props)
     load_stage_key(zfs, staged)
+    # Registered before the mount, so a stop right after it still unmounts; the guard skips it while unmounted.
+    guard.mounted.append(staged)
     if zfs.get("mounted", staged) != "yes":
         zfs.mount(staged)
-    guard.mounted.append(staged)
     return Path(zfs.get("mountpoint", staged))
 
 

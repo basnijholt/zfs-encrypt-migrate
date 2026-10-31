@@ -1059,6 +1059,7 @@ def test_guard_busy_unmount_keeps_key_and_hints(sim: ZfsSim, settings: Settings)
     staged_ready(sim)
     staged = f"{STAGE}/data"
     sim.prop(staged, "keystatus", "available")
+    sim.prop(staged, "mounted", "yes")
     sim.busy.add(staged)
     zfs, _ = make(sim)
 

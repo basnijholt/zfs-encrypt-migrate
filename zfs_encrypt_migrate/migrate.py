@@ -127,10 +127,11 @@ class AbortGuard:
         raise error from exc
 
     def _unload_hint(self) -> list[str]:
-        # A busy mount is never forced; the key stays loaded so the data stays readable.
+        # A busy mount is never forced; the key stays loaded so the data stays readable. A name is listed before
+        # its mount, so one whose mount failed or never ran is skipped: zfs refuses to unmount it.
         for name in reversed(self.mounted):
             try:
-                busy = not self.zfs.unmount(name)
+                busy = self.zfs.get("mounted", name) == "yes" and not self.zfs.unmount(name)
             except MigrationError:
                 busy = True
             if busy:

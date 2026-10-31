@@ -330,6 +330,42 @@ def test_open_staged_reuses_mounted_staged(filemove_env: FileMoveEnv, settings: 
     assert env.sim.ops() == [("zfs", "load-key", STAGED), ("zfs", "mount", STAGED)]
 
 
+def test_interrupt_right_after_staged_mount_unmounts_it(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """Ctrl-C just as the staged mount returns still unmounts it before the key is unloaded."""
+    env = filemove_env
+
+    def interrupt_after_mount(args: Sequence[str]) -> None:
+        if tuple(args) == ("zfs", "mount", STAGED):
+            raise KeyboardInterrupt
+
+    zfs, _ = make(env.sim, after=interrupt_after_mount)
+    guard = AbortGuard(zfs, settings, STAGED, source=None, leaf=None, label="file-move")
+    with pytest.raises(Interrupted), guard:
+        open_staged(zfs, settings, DATASET, zfs.props(DATASET), env.mount_root, guard)
+    assert env.sim.ops()[-2:] == [("zfs", "unmount", STAGED), ("zfs", "unload-key", "-r", STAGED)]
+    assert env.sim.props[STAGED, "mounted"] == "no"
+
+
+def test_failed_staged_mount_still_unloads_the_key(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """A staged dataset whose mount failed is not unmounted: zfs calls that an error, which kept the key loaded."""
+    env = filemove_env
+
+    def mount_fails(args: Sequence[str]) -> CommandResult | None:
+        if tuple(args) == ("zfs", "mount", STAGED):
+            return fail("injected\n")
+        if tuple(args) == ("zfs", "unmount", STAGED) and env.sim.props.get((STAGED, "mounted")) != "yes":
+            return fail(f"cannot unmount '{STAGED}': not currently mounted\n")
+        return None
+
+    zfs, runner = make(env.sim, mount_fails)
+    guard = AbortGuard(zfs, settings, STAGED, source=None, leaf=None, label="file-move")
+    with pytest.raises(ZfsError) as info, guard:
+        open_staged(zfs, settings, DATASET, zfs.props(DATASET), env.mount_root, guard)
+    assert info.value.hints == ()
+    assert ("zfs", "unmount", STAGED) not in runner.calls
+    assert env.sim.props[STAGED, "keystatus"] == "unavailable"
+
+
 @needs_rsync
 def test_copy_tree_copies_dirs_twice_and_marks(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Copy tree copies dirs twice and marks."""
