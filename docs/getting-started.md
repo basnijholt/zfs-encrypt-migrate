@@ -41,6 +41,7 @@ On NixOS, the flake's module installs it for you; see [NixOS module options](usa
 - **Root.** Every command runs `zfs` and `zpool`.
 - **The host's own `zfs` and `zpool` on `PATH`.** The package doesn't bundle them, so they always match the loaded kernel module.
 - **`zfs rename -u`**, which renames a dataset without remounting it. The tool is tested on OpenZFS 2.4.
+- **`rsync` 3.1 or newer, with ACL and xattr support, on `PATH`,** for `file-move` only. The Nix package appends one to `PATH`.
 - **Free space on the same pool** for one dataset at a time, plus the `--min-free` floor (default `1T`).
 - **On NixOS, no boot-time key loading for the stage.** Before the first `seed`, set `boot.zfs.requestEncryptionCredentials` to `false` or to a list without the stage, and keep it that way until the stage is empty. Otherwise a reboot mid-migration makes the pool import fail with `Key load error`; see [NixOS boot prompts](guides.md#nixos-boot-prompts).
 
