@@ -142,6 +142,10 @@ def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
     refuse_nested(settings, dataset)
     source = _refuse_source(zfs, dataset)
     _refuse_pinned_space(zfs, dataset)
+    # Here as well as before each batch, so a snapshot stops the run before anything is written. Only while
+    # files are left: then a snapshot pins nothing, and a rerun after a refused swap keeps its renamed enc-final.
+    if zfs.snapshots(dataset) and scan(source):
+        _refuse_snapshots(zfs, dataset)
     stage = settings.stage
     staged = f"{stage}/{leaf_of(dataset)}"
     staged_exists = zfs.exists(staged)

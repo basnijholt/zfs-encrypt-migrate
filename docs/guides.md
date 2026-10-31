@@ -178,7 +178,7 @@ A 30 TB dataset takes a day or two, and the dataset is not usable meanwhile: fil
 
 - Stop the services that read or write it, including containers that bind-mount it. The tool refuses a dataset it can't unmount, but a container's bind mount is not detected.
 - Stop the NFS server and Samba exports of it.
-- Disable snapshot tools (sanoid, zfs-auto-snapshot) for the dataset, then destroy its snapshots. A snapshot keeps deleted files allocated, so no space would be freed; `file-move` refuses while one exists, and checks again before each batch is copied and before it is deleted.
+- Disable snapshot tools (sanoid, zfs-auto-snapshot) for the dataset, then destroy its snapshots. A snapshot keeps deleted files allocated, so no space would be freed; `file-move` refuses while one exists before it changes anything, and checks again before each batch is copied and before it is deleted.
 
 **2. Run it in tmux or screen.**
 

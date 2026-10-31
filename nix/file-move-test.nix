@@ -155,7 +155,7 @@ pkgs.testers.runNixOSTest {
         assert get("keystatus", "tank/stage/media") == "unavailable"
 
 
-    with subtest("file-move refuses without --delete-source, with snapshots, with children and while busy"):
+    with subtest("file-move refuses without --delete-source, with children, while busy, and while space cannot free"):
         machine.succeed("zfs create -o mountpoint=/srv/media tank/media && mkdir /srv/media/d && echo a > /srv/media/d/a")
         before = files()
         out = machine.fail(f"{CLI} {FINAL} tank/media 2>&1")
@@ -185,15 +185,15 @@ pkgs.testers.runNixOSTest {
         out = machine.fail(f"{CLI} {FINAL} --delete-source tank/clone 2>&1")
         assert "tank/clone is a clone of tank/media@base" in out, out
         machine.succeed("zfs destroy tank/clone && zfs destroy tank/media@base")
-        # Nothing was created by any refusal so far.
-        machine.fail("zfs list tank/stage")
         machine.succeed("zfs snapshot tank/media@autosnap_1")
         out = machine.fail(f"{CLI} {FINAL} --delete-source tank/media 2>&1")
         assert "tank/media has snapshots" in out and "tank/media@autosnap_1" in out, out
-        staged_closed()
+        # Nothing was created by any refusal, and none got as far as the writer probe's noatime remount.
+        machine.fail("zfs list tank/stage")
         assert get("mounted", "tank/media") == "yes"
+        assert "noatime" not in machine.succeed("findmnt -n -o OPTIONS /srv/media")
         assert files() == before
-        machine.succeed("zfs destroy -r tank/media && zfs destroy -r tank/stage")
+        machine.succeed("zfs destroy -r tank/media")
 
     with subtest("file-move moves a dataset bigger than the free space"):
         # atime=on relatime=off: every read updates atime, so a read of the source after @enc-final

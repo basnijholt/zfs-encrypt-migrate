@@ -166,6 +166,27 @@ def test_preflight_refuses_pool_checkpoint(filemove_env: FileMoveEnv, settings: 
     )
 
 
+def test_preflight_refuses_snapshots_before_any_write(filemove_env: FileMoveEnv, settings: Settings) -> None:
+    """A snapshot is refused before the writer probe or the staged dataset changes anything."""
+    filemove_env.sim.snapshot(f"{DATASET}@auto")
+    with pytest.raises(MigrationError) as info:
+        preflight_file_move(filemove_env.zfs, settings, DATASET)
+    assert info.value.message == SNAPSHOT_REFUSAL
+    assert info.value.hints == SNAPSHOT_HINTS
+    assert filemove_env.sim.ops() == []
+
+
+def test_preflight_allows_snapshots_once_only_directories_are_left(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+) -> None:
+    """With no file left to delete, a snapshot pins nothing: a rerun after a refused swap keeps a renamed enc-final."""
+    for name in ("a.txt", "docs/b.txt", "docs/deep/c.txt"):
+        (filemove_env.src / name).unlink()
+    filemove_env.sim.snapshot(f"{DATASET}@enc-final-1")
+    assert preflight_file_move(filemove_env.zfs, settings, DATASET) == filemove_env.src
+
+
 def test_preflight_refuses_foreign_staged(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Preflight refuses foreign staged."""
     filemove_env.sim.datasets.add(STAGED)
