@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import signal
 import threading
 from typing import TYPE_CHECKING
@@ -26,6 +27,13 @@ if TYPE_CHECKING:
     from zfs_encrypt_migrate.zfs import Zfs
 
 runner = CliRunner()
+# Rich styles the help whenever it believes it writes to a terminal, as it does on GitHub Actions.
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def plain(text: str) -> str:
+    """Return the text without its color and style codes."""
+    return ANSI.sub("", text)
 
 
 @pytest.fixture
@@ -511,8 +519,8 @@ def test_file_move_help_lists_options() -> None:
 
     assert result.exit_code == 0
     for text in ("--batch-size", "--delete-source", "Target size of each batch"):
-        assert text in result.output
-    assert "File-Move Commands" in listing.output
+        assert text in plain(result.output)
+    assert "File-Move Commands" in plain(listing.output)
 
 
 def test_file_move_without_delete_source_exits_1(sim: ZfsSim) -> None:
