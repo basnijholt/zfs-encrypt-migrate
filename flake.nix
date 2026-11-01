@@ -18,7 +18,9 @@
         let
           pkgs = import nixpkgs { inherit system; };
           pythonPackages = pkgs.python3Packages;
-          version = builtins.replaceStrings [ "\n" "\r" ] [ "" "" ] (builtins.readFile ./VERSION);
+          # hatch-vcs reads the version from git tags, which a flake source lacks;
+          # releases come from PyPI, so the Nix build carries the commit instead.
+          version = "0+git.${self.shortRev or self.dirtyShortRev or "unknown"}";
         in
         {
           # zfs is deliberately not wrapped onto PATH: a flake-pinned zfs can

@@ -102,10 +102,9 @@ docs/                             # Zensical documentation site
 
 ## Release Checklist
 
-1. Update `VERSION`.
-2. Open and merge a PR.
-3. Publish a GitHub release tagged `vX.Y.Z`, where `X.Y.Z` exactly matches `VERSION`.
-4. Confirm the `Upload Python Package` workflow publishes to PyPI.
+1. Merge the changes to `main`.
+2. Publish a GitHub release tagged `vX.Y.Z`. hatch-vcs takes the package version from that tag; there is no version file to update.
+3. Confirm the `Upload Python Package` workflow publishes to PyPI.
 
 ## License
 

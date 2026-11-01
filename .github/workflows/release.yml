@@ -20,10 +20,11 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v6
+        with:
+          # hatch-vcs derives the package version from the release tag.
+          fetch-depth: 0
       - name: Install uv
         uses: astral-sh/setup-uv@v7
-      - name: Check release tag matches VERSION
-        run: test "${GITHUB_REF_NAME}" = "v$(cat VERSION)"
       - name: Build
         run: uv build
       - name: Publish package distributions to PyPI
