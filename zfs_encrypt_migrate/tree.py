@@ -30,8 +30,8 @@ if TYPE_CHECKING:
     from .migrate import Settings
     from .zfs import Zfs
 
-TREE_SNAPSHOT = "enc-tree"
-TREE_FINAL_SNAPSHOT = "enc-tree-final"
+_TREE_SNAPSHOT = "enc-tree"
+_TREE_FINAL_SNAPSHOT = "enc-tree-final"
 
 
 def _refuse_pool_root(dataset: str) -> None:
@@ -41,14 +41,14 @@ def _refuse_pool_root(dataset: str) -> None:
 
 
 def _require_tree_snapshot(zfs: Zfs, name: str) -> None:
-    if not zfs.exists(f"{name}@{TREE_SNAPSHOT}"):
-        msg = f"{name}@{TREE_SNAPSHOT} does not exist; run tree-seed first"
+    if not zfs.exists(f"{name}@{_TREE_SNAPSHOT}"):
+        msg = f"{name}@{_TREE_SNAPSHOT} does not exist; run tree-seed first"
         raise MigrationError(msg)
 
 
 def _start_over(source: str, staged: str) -> list[str]:
     """Commands that remove what an unfinished tree-move left behind, so the next one can start over."""
-    return [f"  zfs destroy -r {source}@{TREE_SNAPSHOT}", f"  zfs destroy -r {staged}"]
+    return [f"  zfs destroy -r {source}@{_TREE_SNAPSHOT}", f"  zfs destroy -r {staged}"]
 
 
 def _start_over_hint(source: str, staged: str) -> list[str]:
@@ -71,8 +71,8 @@ def _refuse_unfinished(zfs: Zfs, source: str, staged: str, staged_root: str) -> 
     """Refuse a staged child that is not a complete copy of ``source`` at its tree snapshot."""
     # tree-move snapshots the source before it creates the staged child and never removes that snapshot,
     # so a source without one was created after a finished move whose original source is gone.
-    if not zfs.exists(f"{source}@{TREE_SNAPSHOT}"):
-        msg = f"{staged} already exists but {source} has no @{TREE_SNAPSHOT}; {source} looks recreated"
+    if not zfs.exists(f"{source}@{_TREE_SNAPSHOT}"):
+        msg = f"{staged} already exists but {source} has no @{_TREE_SNAPSHOT}; {source} looks recreated"
         raise MigrationError(
             msg,
             [
@@ -81,7 +81,7 @@ def _refuse_unfinished(zfs: Zfs, source: str, staged: str, staged_root: str) -> 
             ],
         )
     # An interrupted receive leaves the child with descendants or its newest snapshots missing.
-    complete = snaps_match(zfs, source, staged, TREE_SNAPSHOT)
+    complete = snaps_match(zfs, source, staged, _TREE_SNAPSHOT)
     if not complete or outside_encryption_root(zfs, staged, staged_root) is not None:
         msg = f"{staged} already exists but is not a complete copy of {source}; a tree-move was interrupted or failed"
         raise MigrationError(
@@ -93,7 +93,7 @@ def _refuse_unfinished(zfs: Zfs, source: str, staged: str, staged_root: str) -> 
 def _refuse_written(zfs: Zfs, source: str) -> None:
     """Flush the source's pool and refuse if anything under the source changed since the tree snapshot."""
     zfs.pool_sync(pool_of(source))
-    dirty = dirty_since(zfs, source, TREE_SNAPSHOT)
+    dirty = dirty_since(zfs, source, _TREE_SNAPSHOT)
     if dirty:
         # The guard's cleanup hint says how to start over.
         raise MigrationError("written since the tree snapshot:\n" + "\n".join(dirty))
@@ -109,8 +109,8 @@ def tree_seed(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
     with abort_guard(zfs, settings, staged, label="tree-seed"):
         ensure_container(zfs, settings.stage)
         ensure_container(zfs, f"{settings.stage}/old")
-        zfs.snapshot(f"{dataset}@{TREE_SNAPSHOT}", recursive=False)
-        zfs.send_recv(["-p", f"{dataset}@{TREE_SNAPSHOT}"], encrypted_recv_args(settings, staged))
+        zfs.snapshot(f"{dataset}@{_TREE_SNAPSHOT}", recursive=False)
+        zfs.send_recv(["-p", f"{dataset}@{_TREE_SNAPSHOT}"], encrypted_recv_args(settings, staged))
         zfs.unload_key(staged)
     return []
 
@@ -143,13 +143,13 @@ def tree_move(zfs: Zfs, settings: Settings, dataset: str, child: str) -> list[st
         load_stage_key(zfs, staged_root)
         guard.source = source
         unmount_subtree(zfs, source)
-        zfs.snapshot(f"{source}@{TREE_SNAPSHOT}", recursive=True)
+        zfs.snapshot(f"{source}@{_TREE_SNAPSHOT}", recursive=True)
         # From here on a rerun refuses until the tree snapshots and any partial copy are gone.
         guard.cleanup = _start_over_hint(source, staged)
         # A replication stream received under an encrypted parent stays unencrypted unless told to inherit.
-        zfs.send_recv(["-R", f"{source}@{TREE_SNAPSHOT}"], ["-u", "-x", "encryption", staged])
-        if not snaps_match(zfs, source, staged, TREE_SNAPSHOT):
-            msg = f"{TREE_SNAPSHOT} snapshots of {source} and {staged} differ"
+        zfs.send_recv(["-R", f"{source}@{_TREE_SNAPSHOT}"], ["-u", "-x", "encryption", staged])
+        if not snaps_match(zfs, source, staged, _TREE_SNAPSHOT):
+            msg = f"{_TREE_SNAPSHOT} snapshots of {source} and {staged} differ"
             raise MigrationError(msg)
         check_encrypted_under(zfs, staged, staged_root)
         _refuse_written(zfs, source)
@@ -170,19 +170,19 @@ def tree_finish(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
         msg = f"children remain under {dataset}; move each with tree-move and destroy it first"
         raise MigrationError(msg)
     # The parent's final snapshot is taken without -r, so it is renamed aside without -r too.
-    refuse_stale(zfs, TREE_FINAL_SNAPSHOT, [dataset, staged], recursive=False)
+    refuse_stale(zfs, _TREE_FINAL_SNAPSHOT, [dataset, staged], recursive=False)
     with abort_guard(zfs, settings, staged, label="tree-finish") as guard:
         load_stage_key(zfs, staged)
         guard.source = dataset
         guard.leaf = leaf
         unmount_subtree(zfs, dataset)
-        zfs.snapshot(f"{dataset}@{TREE_FINAL_SNAPSHOT}", recursive=False)
-        zfs.send_recv(["-p", "-I", f"@{TREE_SNAPSHOT}", f"{dataset}@{TREE_FINAL_SNAPSHOT}"], ["-u", staged])
-        if not snaps_match(zfs, dataset, staged, TREE_FINAL_SNAPSHOT):
-            msg = f"{TREE_FINAL_SNAPSHOT} snapshots of {dataset} and {staged} differ"
+        zfs.snapshot(f"{dataset}@{_TREE_FINAL_SNAPSHOT}", recursive=False)
+        zfs.send_recv(["-p", "-I", f"@{_TREE_SNAPSHOT}", f"{dataset}@{_TREE_FINAL_SNAPSHOT}"], ["-u", staged])
+        if not snaps_match(zfs, dataset, staged, _TREE_FINAL_SNAPSHOT):
+            msg = f"{_TREE_FINAL_SNAPSHOT} snapshots of {dataset} and {staged} differ"
             raise MigrationError(msg)
         zfs.pool_sync(pool_of(dataset))
-        dirty = dirty_since(zfs, dataset, TREE_FINAL_SNAPSHOT)
+        dirty = dirty_since(zfs, dataset, _TREE_FINAL_SNAPSHOT)
         if dirty:
             raise MigrationError(
                 "written since the final snapshot:\n" + "\n".join(dirty),
@@ -192,7 +192,7 @@ def tree_finish(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
                         f"  {command}"
                         for command in rename_aside_commands(
                             zfs,
-                            TREE_FINAL_SNAPSHOT,
+                            _TREE_FINAL_SNAPSHOT,
                             [dataset, staged],
                             recursive=False,
                         )

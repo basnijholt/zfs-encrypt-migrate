@@ -22,19 +22,19 @@ from zfs_encrypt_migrate.constants import (
 )
 from zfs_encrypt_migrate.errors import Interrupted, MigrationError, ZfsError
 from zfs_encrypt_migrate.filemove import (
-    admit,
-    check_passphrase,
-    copy_tree,
+    _admit,
+    _check_passphrase,
+    _copy_tree,
+    _finish,
+    _move_files,
+    _open_staged,
+    _preflight_file_move,
+    _probe_writers,
+    _rsync_dirs,
+    _rsync_files,
+    _run_lock,
+    _wait_for_space,
     file_move,
-    finish,
-    move_files,
-    open_staged,
-    preflight_file_move,
-    probe_writers,
-    rsync_dirs,
-    rsync_files,
-    run_lock,
-    wait_for_space,
 )
 from zfs_encrypt_migrate.migrate import AbortGuard
 from zfs_encrypt_migrate.process import SubprocessRunner
@@ -59,14 +59,14 @@ STAGED = f"{STAGE}/media"
 def refused(env: FileMoveEnv, settings: Settings, message: str, dataset: str = DATASET) -> None:
     """Refused."""
     with pytest.raises(MigrationError) as info:
-        preflight_file_move(env.zfs, settings, dataset)
+        _preflight_file_move(env.zfs, settings, dataset)
     assert info.value.message == message
     assert env.sim.ops() == []
 
 
 def test_preflight_returns_source_mountpoint(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Preflight returns source mountpoint."""
-    assert preflight_file_move(filemove_env.zfs, settings, DATASET) == filemove_env.src
+    assert _preflight_file_move(filemove_env.zfs, settings, DATASET) == filemove_env.src
     assert filemove_env.sim.ops() == []
 
 
@@ -160,7 +160,7 @@ def test_preflight_checks_only_the_path_of_a_final_key_file_not_there_yet(
     bound.mkdir()
     env.bound[bound] = DATASET
     changed = replace(settings, final_keylocation=f"file://{bound / 'later.key'}")
-    assert preflight_file_move(env.zfs, changed, DATASET) == env.src
+    assert _preflight_file_move(env.zfs, changed, DATASET) == env.src
 
 
 def test_preflight_allows_key_files_beside_the_dataset(
@@ -172,7 +172,7 @@ def test_preflight_allows_key_files_beside_the_dataset(
     beside = private_key(tmp_path / "src.key")
     final = f"file://{private_key(tmp_path / 'srcfinal.key')}"
     changed = replace(settings, key_file=beside, final_keylocation=final)
-    assert preflight_file_move(filemove_env.zfs, changed, DATASET) == filemove_env.src
+    assert _preflight_file_move(filemove_env.zfs, changed, DATASET) == filemove_env.src
 
 
 def test_preflight_refuses_pool_root(filemove_env: FileMoveEnv, settings: Settings) -> None:
@@ -183,14 +183,14 @@ def test_preflight_refuses_pool_root(filemove_env: FileMoveEnv, settings: Settin
 def test_preflight_refuses_other_pool(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Preflight refuses other pool."""
     with pytest.raises(MigrationError, match="cannot rename across pools"):
-        preflight_file_move(filemove_env.zfs, settings, "other/media")
+        _preflight_file_move(filemove_env.zfs, settings, "other/media")
     assert filemove_env.sim.ops() == []
 
 
 def test_preflight_refuses_nested(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Preflight refuses nested."""
     with pytest.raises(MigrationError, match="overlaps the stage"):
-        preflight_file_move(filemove_env.zfs, settings, f"{STAGE}/x")
+        _preflight_file_move(filemove_env.zfs, settings, f"{STAGE}/x")
     assert filemove_env.sim.ops() == []
 
 
@@ -295,10 +295,10 @@ def test_preflight_allows_ancestor_reservation_around_the_stage(filemove_env: Fi
     dataset = nested_source(filemove_env)
     filemove_env.sim.prop("tank/srv", "reservation", "1073741824")
     inside = replace(settings, stage="tank/srv/stage")
-    assert preflight_file_move(filemove_env.zfs, inside, dataset) == filemove_env.src
+    assert _preflight_file_move(filemove_env.zfs, inside, dataset) == filemove_env.src
     filemove_env.sim.prop("tank/srv", "reservation", "0")
     filemove_env.sim.prop("tank/srv", "refreservation", "1073741824")
-    assert preflight_file_move(filemove_env.zfs, settings, dataset) == filemove_env.src
+    assert _preflight_file_move(filemove_env.zfs, settings, dataset) == filemove_env.src
 
 
 def test_preflight_refuses_clone(filemove_env: FileMoveEnv, settings: Settings) -> None:
@@ -326,7 +326,7 @@ def test_preflight_refuses_snapshots_before_any_write(filemove_env: FileMoveEnv,
     """A snapshot is refused before the writer probe or the staged dataset changes anything."""
     filemove_env.sim.snapshot(f"{DATASET}@auto")
     with pytest.raises(MigrationError) as info:
-        preflight_file_move(filemove_env.zfs, settings, DATASET)
+        _preflight_file_move(filemove_env.zfs, settings, DATASET)
     assert info.value.message == SNAPSHOT_REFUSAL
     assert info.value.hints == SNAPSHOT_HINTS
     assert filemove_env.sim.ops() == []
@@ -340,7 +340,7 @@ def test_preflight_allows_snapshots_once_only_directories_are_left(
     for name in ("a.txt", "docs/b.txt", "docs/deep/c.txt"):
         (filemove_env.src / name).unlink()
     filemove_env.sim.snapshot(f"{DATASET}@enc-final-1")
-    assert preflight_file_move(filemove_env.zfs, settings, DATASET) == filemove_env.src
+    assert _preflight_file_move(filemove_env.zfs, settings, DATASET) == filemove_env.src
 
 
 @pytest.mark.parametrize("value", ["on", "sha256,verify"])
@@ -388,10 +388,10 @@ def test_preflight_falls_back_to_dedupratio(
     env.sim.pool_props["tank", "dedupratio"] = ratio
     zfs, _ = make(env.sim, no_dedup_table_size)
     if not refuses:
-        assert preflight_file_move(zfs, settings, DATASET) == env.src
+        assert _preflight_file_move(zfs, settings, DATASET) == env.src
         return
     with pytest.raises(MigrationError) as info:
-        preflight_file_move(zfs, settings, DATASET)
+        _preflight_file_move(zfs, settings, DATASET)
     assert info.value.message == (
         f"pool tank has dedupratio 1.50x; deduplicated blocks shared with {DATASET} would not be freed, "
         "so file-move cannot run; see the docs"
@@ -417,7 +417,7 @@ def test_preflight_allows_file_moves_of_other_datasets(filemove_env: FileMoveEnv
     env = filemove_env
     env.sim.datasets |= {"tank/elsewhere", "tank/elsewhere/music"}
     env.sim.prop("tank/elsewhere/music", MARK_SOURCE, "tank/music")
-    assert preflight_file_move(env.zfs, settings, DATASET) == env.src
+    assert _preflight_file_move(env.zfs, settings, DATASET) == env.src
 
 
 def test_preflight_refuses_foreign_staged(filemove_env: FileMoveEnv, settings: Settings) -> None:
@@ -430,7 +430,7 @@ def test_preflight_accepts_own_staged(filemove_env: FileMoveEnv, settings: Setti
     """Preflight accepts own staged."""
     filemove_env.sim.datasets.add(STAGED)
     filemove_env.sim.prop(STAGED, MARK_SOURCE, DATASET)
-    assert preflight_file_move(filemove_env.zfs, settings, DATASET) == filemove_env.src
+    assert _preflight_file_move(filemove_env.zfs, settings, DATASET) == filemove_env.src
 
 
 def test_preflight_refuses_other_in_flight(filemove_env: FileMoveEnv, settings: Settings) -> None:
@@ -448,10 +448,10 @@ def test_preflight_refuses_existing_old(filemove_env: FileMoveEnv, settings: Set
 def test_run_lock_refuses_second_holder(tmp_path: Path) -> None:
     """Run lock refuses second holder."""
     lock = tmp_path / "lock"
-    with run_lock(lock), pytest.raises(MigrationError) as info, run_lock(lock):
+    with _run_lock(lock), pytest.raises(MigrationError) as info, _run_lock(lock):
         pass
     assert info.value.message == f"another file-move is running (lock {lock})"
-    with run_lock(lock):
+    with _run_lock(lock):
         pass
 
 
@@ -459,21 +459,21 @@ def test_probe_writers_busy_refuses(filemove_env: FileMoveEnv) -> None:
     """Probe writers busy refuses."""
     filemove_env.sim.busy.add(DATASET)
     with pytest.raises(MigrationError) as info:
-        probe_writers(filemove_env.zfs, DATASET, filemove_env.src)
+        _probe_writers(filemove_env.zfs, DATASET, filemove_env.src)
     assert info.value.message == f"cannot unmount {DATASET}; a writer is probably still running"
     assert [op for op in filemove_env.sim.ops() if op[1] == "mount"] == []
 
 
 def test_probe_writers_remounts_without_atime(filemove_env: FileMoveEnv) -> None:
     """The remount skips atime updates, so reading the source after enc-final never writes to it."""
-    probe_writers(filemove_env.zfs, DATASET, filemove_env.src)
+    _probe_writers(filemove_env.zfs, DATASET, filemove_env.src)
     assert filemove_env.sim.ops() == [("zfs", "unmount", DATASET), ("zfs", "mount", "-o", "noatime", DATASET)]
 
 
 def mounted_there(monkeypatch: pytest.MonkeyPatch, path: Path, source: str) -> None:
     """Make /proc/self/mountinfo show ``source`` as the zfs filesystem mounted at ``path``."""
     line = f"36 22 0:44 / {os.path.realpath(path)} rw,relatime shared:20 - zfs {source} rw\n"
-    monkeypatch.setattr(filetree, "read_mountinfo", line.encode)
+    monkeypatch.setattr(filetree, "_read_mountinfo", line.encode)
 
 
 def test_probe_writers_refuses_another_filesystem_at_the_path(
@@ -484,7 +484,7 @@ def test_probe_writers_refuses_another_filesystem_at_the_path(
     env = filemove_env
     mounted_there(monkeypatch, env.src, "tank/other")
     with pytest.raises(MigrationError) as info:
-        probe_writers(env.zfs, DATASET, env.src)
+        _probe_writers(env.zfs, DATASET, env.src)
     assert (
         info.value.message == f"{env.src} is not where {DATASET} is mounted (tank/other of type zfs is mounted there)"
     )
@@ -532,7 +532,7 @@ def test_probe_writers_failed_mount_hints(filemove_env: FileMoveEnv) -> None:
     """A failed remount keeps its zfs error and says how to remount."""
     zfs, _ = make(filemove_env.sim, fail_on("zfs", "mount"))
     with pytest.raises(ZfsError) as info:
-        probe_writers(zfs, DATASET, filemove_env.src)
+        _probe_writers(zfs, DATASET, filemove_env.src)
     assert info.value.message == f"zfs mount -o noatime {DATASET} failed: injected"
     assert info.value.hints == (REMOUNT_HINT,)
 
@@ -547,7 +547,7 @@ def test_probe_writers_interrupt_before_remount_hints(filemove_env: FileMoveEnv)
 
     zfs, _ = make(filemove_env.sim, interrupt_mount)
     with pytest.raises(Interrupted) as info:
-        probe_writers(zfs, DATASET, filemove_env.src)
+        _probe_writers(zfs, DATASET, filemove_env.src)
     assert info.value.message == "interrupted"
     assert info.value.hints == (REMOUNT_HINT,)
 
@@ -563,7 +563,7 @@ def test_probe_writers_unexpected_error_before_remount_hints(filemove_env: FileM
 
     zfs, _ = make(filemove_env.sim, broken_read)
     with pytest.raises(MigrationError) as info:
-        probe_writers(zfs, DATASET, filemove_env.src)
+        _probe_writers(zfs, DATASET, filemove_env.src)
     assert info.value.message == "OSError: boom"
     assert info.value.hints == (REMOUNT_HINT,)
 
@@ -578,7 +578,7 @@ def test_open_staged_creates_with_planned_props(filemove_env: FileMoveEnv, setti
     env = filemove_env
     env.sim.prop(DATASET, "compression", "zstd")
     guard = guard_for(env, settings)
-    path, device = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
+    path, device = _open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
     create = next(call for call in env.sim.log if call[1] == "create" and call[-1] == STAGED)
     options = {create[i + 1] for i, arg in enumerate(create) if arg == "-o"}
     assert {
@@ -604,7 +604,7 @@ def test_open_staged_refuses_a_mountpoint_nothing_is_mounted_on(
     env = filemove_env
     monkeypatch.setattr(filemove, "mount_device", lambda _path: None)
     with pytest.raises(MigrationError) as info:
-        open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard_for(env, settings))
+        _open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard_for(env, settings))
     assert info.value.message == f"{STAGED} is not mounted at {env.mount_root / 'media'}"
 
 
@@ -618,7 +618,7 @@ def test_open_staged_refuses_another_filesystem_at_its_mountpoint(
     path = env.mount_root / "media"
     mounted_there(monkeypatch, path, "tank/stage/other")
     with pytest.raises(MigrationError) as info:
-        open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard_for(env, settings))
+        _open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard_for(env, settings))
     assert (
         info.value.message == f"{path} is not where {STAGED} is mounted (tank/stage/other of type zfs is mounted there)"
     )
@@ -652,17 +652,17 @@ def test_staged_on_another_device_stops_the_next_batch(
 def test_open_staged_reuses_mounted_staged(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Open staged reuses mounted staged."""
     env = filemove_env
-    open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard_for(env, settings))
+    _open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard_for(env, settings))
     env.sim.log.clear()
     guard = guard_for(env, settings)
-    open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
+    _open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
     assert env.sim.ops() == []
     assert guard.mounted == [STAGED]
 
     env.sim.prop(STAGED, "keystatus", "unavailable")
     env.sim.prop(STAGED, "mounted", "no")
     env.sim.log.clear()
-    open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard_for(env, settings))
+    _open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard_for(env, settings))
     assert env.sim.ops() == [("zfs", "load-key", STAGED), ("zfs", "mount", STAGED)]
 
 
@@ -677,7 +677,7 @@ def test_interrupt_right_after_staged_mount_unmounts_it(filemove_env: FileMoveEn
     zfs, _ = make(env.sim, after=interrupt_after_mount)
     guard = AbortGuard(zfs, settings, STAGED, source=None, leaf=None, label="file-move")
     with pytest.raises(Interrupted), guard:
-        open_staged(zfs, settings, DATASET, zfs.props(DATASET), env.mount_root, guard)
+        _open_staged(zfs, settings, DATASET, zfs.props(DATASET), env.mount_root, guard)
     assert env.sim.ops()[-2:] == [("zfs", "unmount", STAGED), ("zfs", "unload-key", "-r", STAGED)]
     assert env.sim.props[STAGED, "mounted"] == "no"
 
@@ -696,7 +696,7 @@ def test_failed_staged_mount_still_unloads_the_key(filemove_env: FileMoveEnv, se
     zfs, runner = make(env.sim, mount_fails)
     guard = AbortGuard(zfs, settings, STAGED, source=None, leaf=None, label="file-move")
     with pytest.raises(ZfsError) as info, guard:
-        open_staged(zfs, settings, DATASET, zfs.props(DATASET), env.mount_root, guard)
+        _open_staged(zfs, settings, DATASET, zfs.props(DATASET), env.mount_root, guard)
     assert info.value.hints == ()
     assert ("zfs", "unmount", STAGED) not in runner.calls
     assert env.sim.props[STAGED, "keystatus"] == "unavailable"
@@ -707,8 +707,8 @@ def test_copy_tree_copies_dirs_twice_and_marks(filemove_env: FileMoveEnv, settin
     """Copy tree copies dirs twice and marks."""
     env = filemove_env
     guard = guard_for(env, settings)
-    dst, device = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
-    copy_tree(env.zfs, STAGED, env.src, dst, device)
+    dst, device = _open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
+    _copy_tree(env.zfs, STAGED, env.src, dst, device)
     for root in (dst, dst / SCRATCH / "dirs"):
         for rel in ("docs", "docs/deep", "empty"):
             assert (root / rel).is_dir()
@@ -726,10 +726,10 @@ def test_copy_tree_unmarked_when_staged_unmounted_meanwhile(filemove_env: FileMo
     """
     env = filemove_env
     guard = guard_for(env, settings)
-    dst, device = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
+    dst, device = _open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
     tamper_after_rsync(env, lambda n: env.zfs.unmount(STAGED) if n == 2 else None)  # noqa: PLR2004
     with pytest.raises(MigrationError) as info:
-        copy_tree(env.zfs, STAGED, env.src, dst, device)
+        _copy_tree(env.zfs, STAGED, env.src, dst, device)
     assert info.value.message == f"{STAGED} is no longer mounted at {dst}; nothing of this batch was deleted"
     assert (STAGED, MARK_DIRS) not in env.sim.props
 
@@ -740,7 +740,7 @@ def test_copy_tree_skips_when_marked(filemove_env: FileMoveEnv) -> None:
     env = filemove_env
     env.sim.prop(STAGED, MARK_DIRS, "copied")
     env.sim.datasets.add(STAGED)
-    copy_tree(env.zfs, STAGED, env.src, env.mount_root, 0)
+    _copy_tree(env.zfs, STAGED, env.src, env.mount_root, 0)
     assert not [call for call in env.runner.calls if call[0] == "rsync"]
 
 
@@ -748,8 +748,8 @@ def test_rsync_argument_lists(tmp_path: Path) -> None:
     """The exact rsync calls: never --delete or --remove-source-files, and times compared to the nanosecond."""
     zfs, runner = make(ZfsSim())
     src, dst = tmp_path / "src", tmp_path / "dst"
-    rsync_files(zfs, src, dst, dst / "list")
-    rsync_dirs(zfs, src, dst)
+    _rsync_files(zfs, src, dst, dst / "list")
+    _rsync_dirs(zfs, src, dst)
     assert runner.calls == [
         (
             "rsync",
@@ -787,10 +787,10 @@ def test_directory_time_off_below_a_second_is_restored(filemove_env: FileMoveEnv
     env = filemove_env
     dst = tmp_path / "dst"
     dst.mkdir()
-    rsync_dirs(env.zfs, env.src, dst)
+    _rsync_dirs(env.zfs, env.src, dst)
     os.utime(env.src / "docs", ns=(EARLY_NS, EARLY_NS))
     os.utime(dst / "docs", ns=(LATE_NS, LATE_NS))
-    rsync_dirs(env.zfs, env.src, dst)
+    _rsync_dirs(env.zfs, env.src, dst)
     assert (dst / "docs").stat().st_mtime_ns == EARLY_NS
 
 
@@ -806,9 +806,9 @@ def test_check_passphrase_prompt_needs_terminal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Check passphrase prompt needs terminal."""
-    monkeypatch.setattr(filemove, "stdin_is_terminal", lambda: False)
+    monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: False)
     with pytest.raises(MigrationError) as info:
-        check_passphrase(staged_env(filemove_env).zfs, settings, STAGED)
+        _check_passphrase(staged_env(filemove_env).zfs, settings, STAGED)
     assert info.value.message == "run file-move once from a terminal so it can check the passphrase"
     assert filemove_env.sim.ops() == []
 
@@ -819,8 +819,8 @@ def test_check_passphrase_prompt_attached(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Check passphrase prompt attached."""
-    monkeypatch.setattr(filemove, "stdin_is_terminal", lambda: True)
-    check_passphrase(staged_env(filemove_env).zfs, settings, STAGED)
+    monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: True)
+    _check_passphrase(staged_env(filemove_env).zfs, settings, STAGED)
     assert filemove_env.runner.attached == [("zfs", "load-key", "-n", "-L", "prompt", STAGED)]
     assert filemove_env.sim.props[STAGED, MARK_KEY] == "prompt"
 
@@ -828,7 +828,7 @@ def test_check_passphrase_prompt_attached(
 def test_check_passphrase_file_location_not_attached(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Check passphrase file location not attached."""
     settings = replace(settings, final_keylocation="file:///keys/final")
-    check_passphrase(staged_env(filemove_env).zfs, settings, STAGED)
+    _check_passphrase(staged_env(filemove_env).zfs, settings, STAGED)
     assert filemove_env.runner.attached == []
     assert ("zfs", "load-key", "-n", "-L", "file:///keys/final", STAGED) in filemove_env.runner.calls
     assert filemove_env.sim.props[STAGED, MARK_KEY] == "file:///keys/final"
@@ -839,7 +839,7 @@ def test_check_passphrase_wrong_key_refuses(filemove_env: FileMoveEnv, settings:
     settings = replace(settings, final_keylocation="file:///keys/final")
     zfs, _ = make(staged_env(filemove_env).sim, fail_on("zfs", "load-key", "-n"))
     with pytest.raises(MigrationError) as info:
-        check_passphrase(zfs, settings, STAGED)
+        _check_passphrase(zfs, settings, STAGED)
     assert info.value.message == f"the key for {STAGED} did not load from file:///keys/final; nothing was deleted"
     assert (STAGED, MARK_KEY) not in filemove_env.sim.props
 
@@ -847,7 +847,7 @@ def test_check_passphrase_wrong_key_refuses(filemove_env: FileMoveEnv, settings:
 def test_check_passphrase_skips_when_marked(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Check passphrase skips when marked."""
     staged_env(filemove_env).sim.prop(STAGED, MARK_KEY, "prompt")
-    check_passphrase(filemove_env.zfs, settings, STAGED)
+    _check_passphrase(filemove_env.zfs, settings, STAGED)
     assert filemove_env.runner.attached == []
     assert not [call for call in filemove_env.runner.calls if "load-key" in call]
 
@@ -855,9 +855,9 @@ def test_check_passphrase_skips_when_marked(filemove_env: FileMoveEnv, settings:
 def test_check_passphrase_again_for_another_location(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """The marker records which location was checked; a rerun with another final location checks that one."""
     env = staged_env(filemove_env)
-    check_passphrase(env.zfs, replace(settings, final_keylocation="file:///a"), STAGED)
+    _check_passphrase(env.zfs, replace(settings, final_keylocation="file:///a"), STAGED)
     assert env.sim.props[STAGED, MARK_KEY] == "file:///a"
-    check_passphrase(env.zfs, replace(settings, final_keylocation="file:///b"), STAGED)
+    _check_passphrase(env.zfs, replace(settings, final_keylocation="file:///b"), STAGED)
     assert [call for call in env.runner.calls if "load-key" in call] == [
         ("zfs", "load-key", "-n", "-L", "file:///a", STAGED),
         ("zfs", "load-key", "-n", "-L", "file:///b", STAGED),
@@ -902,7 +902,7 @@ def move(  # noqa: PLR0917
     env.sim.prop(STAGED, "mountpoint", str(dst))
     env.sim.prop(STAGED, "mounted", "yes")
     guard = guard or guard_for(env, settings)
-    move_files(env.zfs, settings, DATASET, env.src, dst, batch_size, sleep, device=dst.stat().st_dev, guard=guard)
+    _move_files(env.zfs, settings, DATASET, env.src, dst, batch_size, sleep, device=dst.stat().st_dev, guard=guard)
 
 
 def source_files(env: FileMoveEnv) -> list[str]:
@@ -1117,7 +1117,7 @@ def test_waits_for_freed_space(filemove_env: FileMoveEnv, settings: Settings) ->
 
     env.runner.responder = responder
     slept, sleep = recorder()
-    wait_for_space(env.zfs, settings, 5000, sleep)
+    _wait_for_space(env.zfs, settings, 5000, sleep)
     assert slept == [SPACE_DELAY_SECONDS, SPACE_DELAY_SECONDS]
     assert syncs == 2  # noqa: PLR2004
 
@@ -1128,7 +1128,7 @@ def test_refuses_when_space_never_frees(filemove_env: FileMoveEnv, settings: Set
     env.sim.avail = 100
     slept, sleep = recorder()
     with pytest.raises(MigrationError) as info:
-        wait_for_space(env.zfs, settings, 5000, sleep)
+        _wait_for_space(env.zfs, settings, 5000, sleep)
     assert info.value.message == ("not enough free space on tank for the next batch (4.9K) above the floor 1000B")
     reads = [c for c in env.sim.log if c[1:2] == ("list",) and "avail" in c]
     assert len(reads) == SPACE_ATTEMPTS
@@ -1158,7 +1158,7 @@ def test_move_removes_partial_files_before_the_space_check(
 SIZES = {"a.txt": 1000, "docs/b.txt": 9000, "docs/deep/c.txt": 1000}
 
 
-def fixed_sizes(root: Path) -> list[filetree.Entry]:
+def fixed_sizes(root: Path) -> list[filetree._Entry]:
     """Scan with the allocations of SIZES: a fresh file's own allocation changes once the pool writes it out."""
     return [replace(item, allocated=SIZES[item.name]) for item in filetree.scan(root)]
 
@@ -1240,7 +1240,7 @@ def test_admission_reads_no_block_cloning_as_none(filemove_env: FileMoveEnv, set
 
     zfs, _ = make(env.sim, no_such_property)
     env.sim.avail = settings.min_free + 9000
-    admit(zfs, settings, DATASET, filetree.group_by_inode(fixed_sizes(env.src), env.src), 1)
+    _admit(zfs, settings, DATASET, filetree.group_by_inode(fixed_sizes(env.src), env.src), 1)
     assert env.sim.props[STAGED, MARK_ADMITTED] == "yes"
 
 
@@ -1255,11 +1255,11 @@ def test_admission_counts_each_tiny_file_as_a_sector(
     groups = filetree.group_by_inode(filetree.scan(env.src), env.src)
     env.sim.avail = settings.min_free + 3 * 4096 + spare
     if spare >= 0:
-        admit(env.zfs, settings, DATASET, groups, 10**9)
+        _admit(env.zfs, settings, DATASET, groups, 10**9)
         assert env.sim.props[STAGED, MARK_ADMITTED] == "yes"
         return
     with pytest.raises(MigrationError, match=r"largest batch or file 12\.0K,"):
-        admit(env.zfs, settings, DATASET, groups, 10**9)
+        _admit(env.zfs, settings, DATASET, groups, 10**9)
 
 
 @needs_rsync
@@ -1276,7 +1276,7 @@ def test_rerun_after_admission_does_not_check_again(
     dst.mkdir()
     groups = filetree.group_by_inode(filetree.scan(env.src), env.src)
     filetree.write_file_list(tmp_path / "list", groups)
-    rsync_files(env.zfs, env.src, dst, tmp_path / "list")
+    _rsync_files(env.zfs, env.src, dst, tmp_path / "list")
     env.sim.prop(STAGED, MARK_ADMITTED, "yes")
     env.sim.pool_props["tank", "bclonesaved"] = "3000"
     env.sim.avail = settings.min_free
@@ -1303,7 +1303,7 @@ def test_copies_left_by_a_stop_need_no_space(
     dst.mkdir()
     groups = filetree.group_by_inode(filetree.scan(env.src), env.src)
     filetree.write_file_list(tmp_path / "list", [g for g in groups if g.first != "docs/deep/c.txt"])
-    rsync_files(env.zfs, env.src, dst, tmp_path / "list")
+    _rsync_files(env.zfs, env.src, dst, tmp_path / "list")
     # Room for c.txt, the one file not copied yet, but not for the whole batch of three. The stopped run that
     # left the copies had passed the admission.
     env.sim.avail = settings.min_free + size
@@ -1531,7 +1531,7 @@ def test_finish_refuses_stale_enc_final(filemove_env: FileMoveEnv, settings: Set
     env = filemove_env
     env.sim.snapshot(f"{DATASET}@enc-final")
     with pytest.raises(MigrationError) as info:
-        finish(env.zfs, settings, DATASET, env.src, tmp_path / "dst", guard_for(env, settings))
+        _finish(env.zfs, settings, DATASET, env.src, tmp_path / "dst", guard_for(env, settings))
     assert info.value.message == (
         f"{DATASET}@enc-final already exists; rename it aside with: zfs rename {DATASET}@enc-final @enc-final-1"
     )
@@ -1555,7 +1555,7 @@ def test_finish_refuses_busy_source_before_enc_final(
     env = filemove_env
     env.sim.busy.add(DATASET)
     with pytest.raises(MigrationError) as info:
-        finish(env.zfs, settings, DATASET, env.src, tmp_path / "dst", guard_for(env, settings))
+        _finish(env.zfs, settings, DATASET, env.src, tmp_path / "dst", guard_for(env, settings))
     assert info.value.message == f"cannot unmount {DATASET}; a writer is probably still running"
     assert env.sim.ops() == [("zfs", "unmount", DATASET)]
 
@@ -1564,7 +1564,7 @@ def test_finish_refuses_files_appearing(filemove_env: FileMoveEnv, settings: Set
     """Files found after the final snapshot stop the swap before anything else changes."""
     env = filemove_env
     with pytest.raises(MigrationError) as info:
-        finish(env.zfs, settings, DATASET, env.src, tmp_path / "dst", guard_for(env, settings))
+        _finish(env.zfs, settings, DATASET, env.src, tmp_path / "dst", guard_for(env, settings))
     assert info.value.message == f"3 files appeared in {DATASET} during the swap; stop the writers and rerun"
     assert env.sim.ops() == FREE_THEN_SNAPSHOT
     assert not [call for call in env.runner.calls if call[0] == "rsync"]
@@ -1572,8 +1572,8 @@ def test_finish_refuses_files_appearing(filemove_env: FileMoveEnv, settings: Set
 
 def moved(env: FileMoveEnv, settings: Settings, guard: AbortGuard) -> Path:
     """Open the staged dataset, copy the tree and move every file; return the staged path."""
-    dst, device = open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
-    copy_tree(env.zfs, STAGED, env.src, dst, device)
+    dst, device = _open_staged(env.zfs, settings, DATASET, env.zfs.props(DATASET), env.mount_root, guard)
+    _copy_tree(env.zfs, STAGED, env.src, dst, device)
     move(env, settings, dst, 10**9, recorder()[1])
     return dst
 
@@ -1587,7 +1587,7 @@ def test_finish_refuses_written_after_scan(filemove_env: FileMoveEnv, settings: 
     dst = moved(env, settings, guard)
     env.sim.prop(DATASET, "written@enc-final", "4096")
     with pytest.raises(MigrationError) as info, guard:
-        finish(env.zfs, settings, DATASET, env.src, dst, guard)
+        _finish(env.zfs, settings, DATASET, env.src, dst, guard)
     assert info.value.message == f"{DATASET} was written after the final scan"
     assert info.value.hints == (
         "rename the stale snapshot aside, then rerun file-move:",
@@ -1610,7 +1610,7 @@ def test_finish_refuses_busy_staged(filemove_env: FileMoveEnv, settings: Setting
     dst = moved(env, settings, guard)
     env.sim.busy.add(STAGED)
     with pytest.raises(MigrationError) as info, guard:
-        finish(env.zfs, settings, DATASET, env.src, dst, guard)
+        _finish(env.zfs, settings, DATASET, env.src, dst, guard)
     assert info.value.message == f"cannot unmount {STAGED}; something still uses {dst}"
     assert info.value.hints[0] == f"could not unmount {STAGED}; run: zfs unmount {STAGED} && zfs unload-key -r {STAGED}"
     assert not [op for op in env.sim.ops() if op[1] in {"rename", "inherit"} or op[2].startswith("mountpoint=")]
@@ -1626,7 +1626,7 @@ def test_finish_frees_last_deletes_before_enc_final(filemove_env: FileMoveEnv, s
     guard = AbortGuard(env.zfs, settings, STAGED, source=None, leaf=None, label="file-move")
     dst = moved(env, settings, guard)
     env.sim.log.clear()
-    finish(env.zfs, settings, DATASET, env.src, dst, guard)
+    _finish(env.zfs, settings, DATASET, env.src, dst, guard)
     assert env.sim.ops()[:4] == FREE_THEN_SNAPSHOT
 
 
@@ -1637,7 +1637,7 @@ def test_post_swap_fixups_never_touch_staged(filemove_env: FileMoveEnv, settings
     guard = AbortGuard(env.zfs, settings, STAGED, source=None, leaf=None, label="file-move")
     dst = moved(env, settings, guard)
     env.sim.log.clear()
-    finish(env.zfs, settings, DATASET, env.src, dst, guard)
+    _finish(env.zfs, settings, DATASET, env.src, dst, guard)
     assert [op for op in env.sim.ops() if op[-1] == STAGED and op[1] in {"set", "inherit"}] == []
 
 

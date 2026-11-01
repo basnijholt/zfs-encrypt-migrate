@@ -14,7 +14,7 @@ from typer.testing import CliRunner
 
 from zfs_encrypt_migrate import cli
 from zfs_encrypt_migrate.constants import COMMAND_STARTUP_ERROR_RETURNCODE
-from zfs_encrypt_migrate.filemove import probe_writers
+from zfs_encrypt_migrate.filemove import _probe_writers
 from zfs_encrypt_migrate.process import SubprocessRunner
 
 from .conftest import FakeRunner, fail, ok
@@ -587,7 +587,7 @@ def test_file_move_interrupt_in_writer_probe_exits_130_with_remount_hint(
         return sim.answer(args)
 
     def probe_only(zfs: Zfs, _settings: object, dataset: str, **_options: object) -> list[str]:
-        probe_writers(zfs, dataset, Path("/mnt"))
+        _probe_writers(zfs, dataset, Path("/mnt"))
         return []
 
     sim.runner.responder = interrupt_mount  # type: ignore[attr-defined]

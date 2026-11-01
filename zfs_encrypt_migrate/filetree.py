@@ -22,7 +22,7 @@ _MIN_FILE = 4096
 
 
 @dataclass(frozen=True)
-class Entry:
+class _Entry:
     """One non-directory name under the source root."""
 
     name: str
@@ -36,7 +36,7 @@ class Entry:
 class Group:
     """All names of one inode; a group always moves whole."""
 
-    entries: tuple[Entry, ...]
+    entries: tuple[_Entry, ...]
 
     @property
     def first(self) -> str:
@@ -49,10 +49,10 @@ class Group:
         return self.entries[0].allocated
 
 
-def scan(root: Path) -> list[Entry]:
+def scan(root: Path) -> list[_Entry]:
     """List every non-directory under ``root`` without following symlinks."""
     root_dev = os.lstat(root).st_dev
-    entries: list[Entry] = []
+    entries: list[_Entry] = []
     pending = [(str(root), "")]
     while pending:
         path, prefix = pending.pop()
@@ -78,13 +78,13 @@ def scan(root: Path) -> list[Entry]:
             allocated = st.st_blocks * _BLOCK
             if stat.S_ISREG(st.st_mode) and st.st_size > 0:
                 allocated = max(allocated, _MIN_FILE)
-            entries.append(Entry(name, st.st_ino, st.st_nlink, st.st_ctime_ns, allocated))
+            entries.append(_Entry(name, st.st_ino, st.st_nlink, st.st_ctime_ns, allocated))
     return entries
 
 
-def group_by_inode(entries: Iterable[Entry], root: Path) -> list[Group]:
+def group_by_inode(entries: Iterable[_Entry], root: Path) -> list[Group]:
     """Join the names of each inode; refuse when fewer names were found than the link count (a writer changed links)."""
-    by_ino: dict[int, list[Entry]] = {}
+    by_ino: dict[int, list[_Entry]] = {}
     for item in entries:
         by_ino.setdefault(item.ino, []).append(item)
     groups = [Group(tuple(sorted(found, key=lambda e: e.name))) for found in by_ino.values()]
@@ -228,14 +228,14 @@ def device_of(path: Path) -> int | None:
         return None
 
 
-MOUNTINFO = Path("/proc/self/mountinfo")
+_MOUNTINFO = Path("/proc/self/mountinfo")
 # mountinfo writes a space, tab, newline or backslash in a field as a backslash and three octal digits.
 _ESCAPE = re.compile(rb"\\([0-7]{3})")
 
 
-def read_mountinfo() -> bytes:
+def _read_mountinfo() -> bytes:
     """Return the kernel's list of the mounts this process sees."""
-    return MOUNTINFO.read_bytes()
+    return _MOUNTINFO.read_bytes()
 
 
 def _field(raw: bytes) -> str:
@@ -250,7 +250,7 @@ def mounted_at(path: Path) -> tuple[str, str] | None:
     """
     target = os.path.realpath(path)
     found = None
-    for line in read_mountinfo().splitlines():
+    for line in _read_mountinfo().splitlines():
         # ID, parent ID, device, root, mount point, options, optional fields, "-", type, source, options.
         fields = line.split(b" ")
         if _field(fields[4]) == target:

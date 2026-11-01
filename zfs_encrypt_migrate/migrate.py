@@ -19,14 +19,14 @@ if TYPE_CHECKING:
     from .zfs import Zfs
 
 ENCRYPTION = "aes-256-gcm"
-SEED_SNAPSHOT = "enc-seed"
+_SEED_SNAPSHOT = "enc-seed"
 FINAL_SNAPSHOT = "enc-final"
 # Signals that end a run; the CLI turns each into a KeyboardInterrupt so the abort guard always runs.
 INTERRUPT_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
 
 @contextlib.contextmanager
-def signals_ignored() -> Iterator[None]:
+def _signals_ignored() -> Iterator[None]:
     """Ignore the interrupt signals so a second one cannot skip the cleanup inside.
 
     Children started inside inherit the ignore. Those started with ``run`` sit in their own process group,
@@ -109,7 +109,7 @@ class AbortGuard:
         """Clean up and re-raise failures as a MigrationError carrying the hints."""
         if exc is None:
             return
-        with signals_ignored():
+        with _signals_ignored():
             hints = self._unload_hint()
         hints += self._phase_hints()
         hints += self.notes
@@ -329,13 +329,13 @@ def seed(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
     with abort_guard(zfs, settings, staged):
         ensure_container(zfs, settings.stage)
         ensure_container(zfs, f"{settings.stage}/old")
-        zfs.snapshot(f"{dataset}@{SEED_SNAPSHOT}", recursive=True)
-        zfs.send_recv(["-R", f"{dataset}@{SEED_SNAPSHOT}"], encrypted_recv_args(settings, staged))
+        zfs.snapshot(f"{dataset}@{_SEED_SNAPSHOT}", recursive=True)
+        zfs.send_recv(["-R", f"{dataset}@{_SEED_SNAPSHOT}"], encrypted_recv_args(settings, staged))
         zfs.unload_key(staged)
     return []
 
 
-def free_snapshot_name(zfs: Zfs, snap: str, names: Sequence[str]) -> str:
+def _free_snapshot_name(zfs: Zfs, snap: str, names: Sequence[str]) -> str:
     """Return the first ``<snap>-N`` that none of ``names`` has, to rename a stale ``snap`` aside to."""
     number = 1
     while any(zfs.exists(f"{name}@{snap}-{number}") for name in names):
@@ -350,7 +350,7 @@ def rename_aside_commands(zfs: Zfs, snap: str, names: Sequence[str], *, recursiv
     so the next incremental receive can start from it, while after a destroy recv refuses the head as
     modified. A renamed snapshot keeps its GUID, so recv skips it on the side that already has it.
     """
-    aside = free_snapshot_name(zfs, snap, names)
+    aside = _free_snapshot_name(zfs, snap, names)
     flag = "-r " if recursive else ""
     return [f"zfs rename {flag}{name}@{snap} @{aside}" for name in names]
 
@@ -367,21 +367,21 @@ def refuse_stale(zfs: Zfs, snap: str, names: Sequence[str], *, recursive: bool) 
         raise MigrationError("\n".join(lines))
 
 
-def catchup_staged(zfs: Zfs, settings: Settings, dataset: str) -> None:
+def _catchup_staged(zfs: Zfs, settings: Settings, dataset: str) -> None:
     """Send what changed since the seed and verify the result; the caller guards the staged key."""
     staged = f"{settings.stage}/{leaf_of(dataset)}"
     if not zfs.exists(staged):
         msg = f"{staged} does not exist; run seed first"
         raise MigrationError(msg)
-    if not zfs.exists(f"{dataset}@{SEED_SNAPSHOT}"):
-        msg = f"{dataset}@{SEED_SNAPSHOT} does not exist; run seed first"
+    if not zfs.exists(f"{dataset}@{_SEED_SNAPSHOT}"):
+        msg = f"{dataset}@{_SEED_SNAPSHOT} does not exist; run seed first"
         raise MigrationError(msg)
     refuse_stale(zfs, FINAL_SNAPSHOT, [dataset, staged], recursive=True)
     load_stage_key(zfs, staged)
     zfs.snapshot(f"{dataset}@{FINAL_SNAPSHOT}", recursive=True)
     # Children created after the seed arrive as full streams, which stay unencrypted unless told to inherit.
     zfs.send_recv(
-        ["-R", "-I", f"@{SEED_SNAPSHOT}", f"{dataset}@{FINAL_SNAPSHOT}"],
+        ["-R", "-I", f"@{_SEED_SNAPSHOT}", f"{dataset}@{FINAL_SNAPSHOT}"],
         ["-u", "-x", "encryption", staged],
     )
     if not snaps_match(zfs, dataset, staged, FINAL_SNAPSHOT):
@@ -395,7 +395,7 @@ def catchup(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
     refuse_nested(settings, dataset)
     staged = f"{settings.stage}/{leaf_of(dataset)}"
     with abort_guard(zfs, settings, staged):
-        catchup_staged(zfs, settings, dataset)
+        _catchup_staged(zfs, settings, dataset)
         zfs.unload_key(staged)
     return []
 
@@ -451,7 +451,7 @@ def cutover(zfs: Zfs, settings: Settings, dataset: str) -> list[str]:
         unmount_subtree(zfs, dataset)
         # A catch-up whose enc-final snapshots still match on both sides is not repeated.
         if not snaps_match(zfs, dataset, staged, FINAL_SNAPSHOT):
-            catchup_staged(zfs, settings, dataset)
+            _catchup_staged(zfs, settings, dataset)
         zfs.pool_sync(pool_of(dataset))
         dirty = dirty_since(zfs, dataset, FINAL_SNAPSHOT)
         if dirty:

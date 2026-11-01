@@ -64,11 +64,11 @@ if TYPE_CHECKING:
     from .migrate import AbortGuard, Settings
     from .zfs import Prop, Zfs
 
-NO_MOUNTPOINT = {"none", "legacy"}
+_NO_MOUNTPOINT = {"none", "legacy"}
 
 
 @contextlib.contextmanager
-def run_lock(path: Path) -> Iterator[None]:
+def _run_lock(path: Path) -> Iterator[None]:
     """Hold an exclusive non-blocking lock so two file-moves never run at once."""
     with path.open("a") as handle:
         try:
@@ -109,7 +109,7 @@ def _refuse_source(zfs: Zfs, dataset: str) -> Path:
         msg = f"{dataset} is read-only; file-move must delete its files"
         raise MigrationError(msg)
     mountpoint = zfs.get("mountpoint", dataset)
-    if mountpoint in NO_MOUNTPOINT:
+    if mountpoint in _NO_MOUNTPOINT:
         msg = f"{dataset} has mountpoint {mountpoint}; file-move needs a mounted path"
         raise MigrationError(msg)
     if zfs.get("mounted", dataset) != "yes":
@@ -237,7 +237,7 @@ def _refuse_other_stage(zfs: Zfs, dataset: str) -> None:
             raise MigrationError(msg)
 
 
-def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
+def _preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
     """Refuse unless the run can start or resume; return the source mountpoint. Writes nothing."""
     check_key_file(settings)
     if "/" not in dataset:
@@ -278,7 +278,7 @@ def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
     return source
 
 
-def probe_writers(zfs: Zfs, dataset: str, path: Path) -> dict[str, Prop]:
+def _probe_writers(zfs: Zfs, dataset: str, path: Path) -> dict[str, Prop]:
     """Unmount the source and mount it again with noatime: a busy dataset means a writer is still running.
 
     Return the source's properties, read while it is unmounted: once mounted with noatime, zfs reports
@@ -308,7 +308,7 @@ def probe_writers(zfs: Zfs, dataset: str, path: Path) -> dict[str, Prop]:
     return props
 
 
-def open_staged(  # noqa: PLR0917
+def _open_staged(  # noqa: PLR0917
     zfs: Zfs,
     settings: Settings,
     dataset: str,
@@ -354,7 +354,7 @@ def open_staged(  # noqa: PLR0917
 # rsync compares times in whole seconds by default; a negative window (rsync 3.1.3+) adds the nanoseconds.
 # Without it, a copy whose time is off by less than a second is skipped by the quick check, then refused by
 # verify on every rerun, and the pristine pass cannot restore a directory time off by less than a second.
-MODIFY_WINDOW = "--modify-window=-1"
+_MODIFY_WINDOW = "--modify-window=-1"
 
 
 def _rsync(zfs: Zfs, args: list[str]) -> None:
@@ -365,7 +365,7 @@ def _rsync(zfs: Zfs, args: list[str]) -> None:
         raise MigrationError(msg)
 
 
-def rsync_files(zfs: Zfs, src: Path, dst: Path, file_list: Path) -> None:
+def _rsync_files(zfs: Zfs, src: Path, dst: Path, file_list: Path) -> None:
     """Copy the NUL-separated list of files, keeping hardlinks, ACLs, xattrs and sparseness."""
     temp = temp_dir(dst)
     temp.mkdir(parents=True, exist_ok=True)
@@ -375,7 +375,7 @@ def rsync_files(zfs: Zfs, src: Path, dst: Path, file_list: Path) -> None:
             "rsync",
             "-aHAXS",
             "--numeric-ids",
-            MODIFY_WINDOW,
+            _MODIFY_WINDOW,
             "--from0",
             f"--files-from={file_list}",
             f"--temp-dir={temp}",
@@ -385,7 +385,7 @@ def rsync_files(zfs: Zfs, src: Path, dst: Path, file_list: Path) -> None:
     )
 
 
-def rsync_dirs(zfs: Zfs, src: Path, dst: Path) -> None:
+def _rsync_dirs(zfs: Zfs, src: Path, dst: Path) -> None:
     """Copy only the directory tree with its metadata."""
     _rsync(
         zfs,
@@ -393,7 +393,7 @@ def rsync_dirs(zfs: Zfs, src: Path, dst: Path) -> None:
             "rsync",
             "-aAX",
             "--numeric-ids",
-            MODIFY_WINDOW,
+            _MODIFY_WINDOW,
             "--exclude=/.zfs",
             "--include=*/",
             "--exclude=*",
@@ -403,25 +403,25 @@ def rsync_dirs(zfs: Zfs, src: Path, dst: Path) -> None:
     )
 
 
-def copy_tree(zfs: Zfs, staged: str, src: Path, dst: Path, device: int) -> None:
+def _copy_tree(zfs: Zfs, staged: str, src: Path, dst: Path, device: int) -> None:
     """Copy the directories twice, the second time into scratch so later batches can restore their mtimes."""
     if zfs.get(MARK_DIRS, staged) == "copied":
         return
-    rsync_dirs(zfs, src, dst)
+    _rsync_dirs(zfs, src, dst)
     shadow = dst / SCRATCH / "dirs"
     shadow.mkdir(parents=True, exist_ok=True)
-    rsync_dirs(zfs, src, shadow)
+    _rsync_dirs(zfs, src, shadow)
     # The marker vouches for copies in the staged dataset; after an unmount they went to the bare directory.
     _refuse_unmounted(zfs, staged, dst, device)
     zfs.set_prop(staged, MARK_DIRS, "copied")
 
 
-def stdin_is_terminal() -> bool:
+def _stdin_is_terminal() -> bool:
     """Return whether a person can type a passphrase."""
     return sys.stdin.isatty()
 
 
-def check_passphrase(zfs: Zfs, settings: Settings, staged: str) -> None:
+def _check_passphrase(zfs: Zfs, settings: Settings, staged: str) -> None:
     """Prove the final key unlocks the staged dataset before any file is deleted.
 
     The marker records the location that was checked, so a rerun with another final location checks again.
@@ -430,7 +430,7 @@ def check_passphrase(zfs: Zfs, settings: Settings, staged: str) -> None:
     if zfs.get(MARK_KEY, staged) == location:
         return
     if location == "prompt":
-        if not stdin_is_terminal():
+        if not _stdin_is_terminal():
             msg = "run file-move once from a terminal so it can check the passphrase"
             raise MigrationError(msg)
         loaded = zfs.check_key(staged, "prompt", attached=True)
@@ -442,7 +442,7 @@ def check_passphrase(zfs: Zfs, settings: Settings, staged: str) -> None:
     zfs.set_prop(staged, MARK_KEY, location)
 
 
-def wait_for_space(zfs: Zfs, settings: Settings, needed: int, sleep: Callable[[float], None]) -> None:
+def _wait_for_space(zfs: Zfs, settings: Settings, needed: int, sleep: Callable[[float], None]) -> None:
     """Wait until the batch fits above the free-space floor; deleted space is freed asynchronously."""
     pool = pool_of(settings.stage)
     for attempt in range(SPACE_ATTEMPTS):
@@ -466,7 +466,7 @@ def _refuse_snapshots(zfs: Zfs, dataset: str) -> None:
         raise MigrationError(msg, hints)
 
 
-def admit(
+def _admit(
     zfs: Zfs,
     settings: Settings,
     dataset: str,
@@ -519,7 +519,7 @@ def _refuse_unmounted(zfs: Zfs, staged: str, dst: Path, device: int) -> None:
         raise MigrationError(msg)
 
 
-def split_notes(dataset: str, staged: str) -> list[str]:
+def _split_notes(dataset: str, staged: str) -> list[str]:
     """Return the guard's notes for a stop once files were deleted: they are split between the two datasets."""
     return [
         f"file-move stopped; the files are split between {dataset} and {staged}; do not destroy either.",
@@ -527,7 +527,7 @@ def split_notes(dataset: str, staged: str) -> list[str]:
     ]
 
 
-def move_files(  # noqa: PLR0917
+def _move_files(  # noqa: PLR0917
     zfs: Zfs,
     settings: Settings,
     dataset: str,
@@ -553,7 +553,7 @@ def move_files(  # noqa: PLR0917
     while entries := scan(src):
         groups = group_by_inode(entries, src)
         # Before the first batch of the move; skipped once the staged dataset is marked admitted.
-        admit(zfs, settings, dataset, groups, batch_size)
+        _admit(zfs, settings, dataset, groups, batch_size)
         left = sum(group.allocated for group in groups)
         deleted = 0
         for batch in plan_batches(groups, batch_size):
@@ -566,16 +566,16 @@ def move_files(  # noqa: PLR0917
             moved = sum(group.allocated for group in batch)
             # A stop between copy and delete leaves copies that need no new space; rsync skips them.
             missing = sum(group.allocated for group in batch if not os.path.lexists(dst / group.first))
-            wait_for_space(zfs, settings, missing, sleep)
+            _wait_for_space(zfs, settings, missing, sleep)
             write_file_list(scratch / "files", batch)
-            rsync_files(zfs, src, dst, scratch / "files")
+            _rsync_files(zfs, src, dst, scratch / "files")
             verified, _changed = verify(src, dst, batch, device=device)
             zfs.pool_sync(pool)
             # And again right before deleting: a snapshot taken while the batch copied would pin it.
             _refuse_snapshots(zfs, dataset)
             if verified:
                 # Set before the first unlink, so a stop part-way through it already gives the note.
-                guard.notes = split_notes(dataset, staged)
+                guard.notes = _split_notes(dataset, staged)
             deleted += delete(src, verified)
             batch_number += 1
             left -= moved
@@ -586,7 +586,7 @@ def move_files(  # noqa: PLR0917
             raise MigrationError(msg)
 
 
-def finish(  # noqa: PLR0917
+def _finish(  # noqa: PLR0917
     zfs: Zfs,
     settings: Settings,
     dataset: str,
@@ -600,7 +600,7 @@ def finish(  # noqa: PLR0917
     refuse_stale(zfs, FINAL_SNAPSHOT, [dataset], recursive=False)
     # Unmounting finishes what the last batch's deletes left pending and the sync commits it, so it does not
     # count in written@enc-final; a busy source means a writer came back.
-    probe_writers(zfs, dataset, src)
+    _probe_writers(zfs, dataset, src)
     zfs.pool_sync(pool_of(dataset))
     # Taken before the last scan, so written@ catches a writer between that scan and the unmount.
     zfs.snapshot(f"{dataset}@{FINAL_SNAPSHOT}", recursive=False)
@@ -613,8 +613,8 @@ def finish(  # noqa: PLR0917
     # carry the times the deletes changed, so copying them again would lose the restored ones.
     pristine = dst / SCRATCH / "dirs"
     if pristine.is_dir():
-        rsync_dirs(zfs, src, dst)
-        rsync_dirs(zfs, pristine, dst)
+        _rsync_dirs(zfs, src, dst)
+        _rsync_dirs(zfs, pristine, dst)
     # From here the copy holds everything, so the swap's own recovery hints replace the split-data note.
     guard.notes = []
     guard.source = dataset
@@ -637,7 +637,7 @@ def finish(  # noqa: PLR0917
     # Read before the swap, which sets canmount=noauto on the source. The final dataset gets the
     # source's mountpoint, so the source's effective one says whether it will mount.
     fix = fixups(zfs.props(dataset))
-    mount = fix.canmount == "on" and zfs.get("mountpoint", dataset) not in NO_MOUNTPOINT
+    mount = fix.canmount == "on" and zfs.get("mountpoint", dataset) not in _NO_MOUNTPOINT
     markers = (MARK_SOURCE, MARK_DIRS, MARK_KEY, MARK_ADMITTED)
     # Hinted before the swap: each acts on <dataset> and is idempotent, so it is right whatever step failed.
     guard.cleanup += [
@@ -682,20 +682,20 @@ def file_move(
         msg = "file-move deletes each source file once its encrypted copy is verified; pass --delete-source to confirm"
         raise MigrationError(msg)
     staged = f"{settings.stage}/{leaf_of(dataset)}"
-    with run_lock(lock_path):
-        src = preflight_file_move(zfs, settings, dataset)
-        source_props = probe_writers(zfs, dataset, src)
+    with _run_lock(lock_path):
+        src = _preflight_file_move(zfs, settings, dataset)
+        source_props = _probe_writers(zfs, dataset, src)
         with abort_guard(zfs, settings, staged, label="file-move") as guard:
             # Until the first delete every file is still in the source. Files only ever get deleted once the
             # move is admitted, so an earlier run of an admitted move may have split them already.
             if zfs.exists(staged) and zfs.get(MARK_ADMITTED, staged) == "yes":
-                guard.notes = split_notes(dataset, staged)
-            dst, device = open_staged(zfs, settings, dataset, source_props, mount_root, guard)
+                guard.notes = _split_notes(dataset, staged)
+            dst, device = _open_staged(zfs, settings, dataset, source_props, mount_root, guard)
             # Copying into or over the source would verify each file against itself and delete it.
             if dst.is_relative_to(src) or src.is_relative_to(dst):
                 msg = f"{staged} is mounted at {dst}, which overlaps {dataset} at {src}"
                 raise MigrationError(msg)
-            copy_tree(zfs, staged, src, dst, device)
-            check_passphrase(zfs, settings, staged)
-            move_files(zfs, settings, dataset, src, dst, batch_size, sleep, device=device, guard=guard)
-            return finish(zfs, settings, dataset, src, dst, guard)
+            _copy_tree(zfs, staged, src, dst, device)
+            _check_passphrase(zfs, settings, staged)
+            _move_files(zfs, settings, dataset, src, dst, batch_size, sleep, device=device, guard=guard)
+            return _finish(zfs, settings, dataset, src, dst, guard)

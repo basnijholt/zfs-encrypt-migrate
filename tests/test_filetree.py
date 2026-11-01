@@ -14,8 +14,8 @@ from zfs_encrypt_migrate import filetree
 from zfs_encrypt_migrate.constants import SCRATCH
 from zfs_encrypt_migrate.errors import MigrationError
 from zfs_encrypt_migrate.filetree import (
-    Entry,
     Group,
+    _Entry,
     delete,
     device_of,
     group_by_inode,
@@ -31,9 +31,9 @@ from zfs_encrypt_migrate.filetree import (
 BAD_NAME = os.fsdecode(b"bad\xff")
 
 
-def entry(name: str, ino: int = 1, nlink: int = 1, allocated: int = 0) -> Entry:
+def entry(name: str, ino: int = 1, nlink: int = 1, allocated: int = 0) -> _Entry:
     """Entry."""
-    return Entry(name=name, ino=ino, nlink=nlink, ctime_ns=0, allocated=allocated)
+    return _Entry(name=name, ino=ino, nlink=nlink, ctime_ns=0, allocated=allocated)
 
 
 def group(name: str, allocated: int) -> Group:
@@ -49,7 +49,7 @@ def make_pair(tmp_path: Path) -> tuple[Path, Path]:
     return src, dst
 
 
-def copy_tree(src: Path, dst: Path, names: list[str]) -> None:
+def _copy_tree(src: Path, dst: Path, names: list[str]) -> None:
     """Copy tree."""
     for name in names:
         target = dst / name
@@ -198,7 +198,7 @@ def test_verify_ok_after_copy(tmp_path: Path) -> None:
     (src / "s").symlink_to("d/f")
     os.mkfifo(src / "fifo")
     groups = scanned(src)
-    copy_tree(src, dst, ["d/f", "s"])
+    _copy_tree(src, dst, ["d/f", "s"])
     os.mkfifo(dst / "fifo")
     (dst / "fifo").chmod(stat.S_IMODE(os.lstat(src / "fifo").st_mode))
     os.link(dst / "d" / "f", dst / "h")
@@ -213,7 +213,7 @@ def test_verify_changed_source_is_skipped(tmp_path: Path) -> None:
     (src / "f").write_text("x")
     (src / "g").write_text("y")
     groups = scanned(src)
-    copy_tree(src, dst, ["f", "g"])
+    _copy_tree(src, dst, ["f", "g"])
     os.utime(src / "f", ns=(1, 2))
     (src / "g").unlink()
     verified, changed = verify(src, dst, groups, device=dst.stat().st_dev)
@@ -239,7 +239,7 @@ def test_verify_copy_on_another_device_raises(tmp_path: Path) -> None:
     """A copy that is not on the staged dataset's device is never trusted, however well it matches."""
     src, dst = make_pair(tmp_path)
     (src / "f").write_text("x")
-    copy_tree(src, dst, ["f"])
+    _copy_tree(src, dst, ["f"])
     with pytest.raises(MigrationError) as exc:
         verify(src, dst, scanned(src), device=dst.stat().st_dev + 1)
     assert exc.value.message == "the copy of f is not on the staged dataset"
@@ -272,7 +272,7 @@ def test_device_of_follows_symlinks_and_is_none_when_missing(tmp_path: Path) -> 
 
 def mountinfo(monkeypatch: pytest.MonkeyPatch, *lines: str) -> None:
     """Make the given lines what /proc/self/mountinfo reads."""
-    monkeypatch.setattr(filetree, "read_mountinfo", lambda: os.fsencode("".join(f"{line}\n" for line in lines)))
+    monkeypatch.setattr(filetree, "_read_mountinfo", lambda: os.fsencode("".join(f"{line}\n" for line in lines)))
 
 
 def test_mounted_at_gives_source_and_type(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -350,7 +350,7 @@ def test_verify_mode_mismatch_raises(tmp_path: Path) -> None:
     """Verify mode mismatch raises."""
     src, dst = make_pair(tmp_path)
     (src / "f").write_text("x")
-    copy_tree(src, dst, ["f"])
+    _copy_tree(src, dst, ["f"])
     (dst / "f").chmod(0o600)
     (src / "f").chmod(0o644)
     assert verify_message(src, dst) == "f differs from its copy (mode)"
@@ -360,7 +360,7 @@ def test_verify_owner_mismatch_raises(tmp_path: Path, monkeypatch: pytest.Monkey
     """Verify owner mismatch raises."""
     src, dst = make_pair(tmp_path)
     (src / "f").write_text("x")
-    copy_tree(src, dst, ["f"])
+    _copy_tree(src, dst, ["f"])
     real = os.lstat
 
     def fake(path: str | os.PathLike[str], *args: object, **kwargs: object) -> os.stat_result:
@@ -382,7 +382,7 @@ def test_verify_group_mismatch_raises(tmp_path: Path, monkeypatch: pytest.Monkey
     """Verify group mismatch raises."""
     src, dst = make_pair(tmp_path)
     (src / "f").write_text("x")
-    copy_tree(src, dst, ["f"])
+    _copy_tree(src, dst, ["f"])
     real = os.lstat
 
     def fake(path: str | os.PathLike[str], *args: object, **kwargs: object) -> os.stat_result:
@@ -404,7 +404,7 @@ def test_verify_size_mismatch_raises(tmp_path: Path) -> None:
     """Verify size mismatch raises."""
     src, dst = make_pair(tmp_path)
     (src / "f").write_text("xx")
-    copy_tree(src, dst, ["f"])
+    _copy_tree(src, dst, ["f"])
     st = os.lstat(src / "f")
     (dst / "f").write_text("x")
     os.utime(dst / "f", ns=(st.st_atime_ns, st.st_mtime_ns))
@@ -415,7 +415,7 @@ def test_verify_mtime_mismatch_raises(tmp_path: Path) -> None:
     """Verify mtime mismatch raises."""
     src, dst = make_pair(tmp_path)
     (src / "f").write_text("x")
-    copy_tree(src, dst, ["f"])
+    _copy_tree(src, dst, ["f"])
     os.utime(dst / "f", ns=(1, 1))
     assert verify_message(src, dst) == "f differs from its copy (mtime)"
 
@@ -454,7 +454,7 @@ def test_verify_broken_hardlink_raises(tmp_path: Path) -> None:
     src, dst = make_pair(tmp_path)
     (src / "b").write_text("x")
     os.link(src / "b", src / "a")
-    copy_tree(src, dst, ["a", "b"])
+    _copy_tree(src, dst, ["a", "b"])
     assert verify_message(src, dst) == "hard links of a were not kept in the copy"
 
 
@@ -508,7 +508,7 @@ def test_delete_skips_group_replaced_after_verify(tmp_path: Path) -> None:
     (src / "cfg").write_text("old")
     (src / "other").write_text("o")
     groups = scanned(src)
-    copy_tree(src, dst, ["cfg", "other"])
+    _copy_tree(src, dst, ["cfg", "other"])
     verified, changed = verify(src, dst, groups, device=dst.stat().st_dev)
     assert changed == []
     (src / "cfg.new").write_text("new")

@@ -164,6 +164,6 @@ def filemove_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FileMoveEnv
     monkeypatch.setattr(filemove, "mount_device", mount_device)
     monkeypatch.setattr(filemove, "device_of", device_of)
     # What the kernel would list: each dataset the simulator has mounted, at its mountpoint.
-    monkeypatch.setattr(filetree, "read_mountinfo", sim.mountinfo)
+    monkeypatch.setattr(filetree, "_read_mountinfo", sim.mountinfo)
     zfs, runner = make(sim, responder)
     return FileMoveEnv(sim, zfs, runner, src, tmp_path / "run", bound=bound)
