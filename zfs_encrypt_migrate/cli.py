@@ -187,6 +187,17 @@ def _run_migration(
         console.print(line, markup=False, highlight=False, soft_wrap=True)
 
 
+def _refuse_unanswerable_prompt(final_keylocation: str, keyformat: Keyformat) -> None:
+    """Refuse --check-prompt-with-key-file unless the dataset ends with a prompt a person can answer."""
+    if final_keylocation != "prompt":
+        msg = f"needs --final-keylocation prompt, not {final_keylocation}"
+        raise typer.BadParameter(msg, param_hint="'--check-prompt-with-key-file'")
+    # zfs refuses a raw key typed at a terminal, so that prompt could only be fed from a file or a pipe.
+    if keyformat is Keyformat.raw:
+        msg = "needs --keyformat passphrase or hex, since a raw key can't be typed at the prompt"
+        raise typer.BadParameter(msg, param_hint="'--check-prompt-with-key-file'")
+
+
 def _validate_names(values: list[str] | None) -> list[str] | None:
     return None if values is None else [validate_name(value) for value in values]
 
@@ -315,8 +326,19 @@ def file_move_command(
         bool,
         typer.Option(help="Confirm that each source file is deleted once its encrypted copy is verified"),
     ] = False,
+    # No environment variable: like --delete-source, the operator vouches for the key file on each command line.
+    check_prompt_with_key_file: Annotated[
+        bool,
+        typer.Option(
+            "--check-prompt-with-key-file",
+            help="With --final-keylocation prompt, check the final key against the key file instead of at a "
+            "terminal; confirms that the key file holds the passphrase you keep",
+        ),
+    ] = False,
 ) -> None:
     """Move a dataset's files in verified batches into an encrypted dataset, then swap it into place."""
+    if check_prompt_with_key_file:
+        _refuse_unanswerable_prompt(final_keylocation, keyformat)
     _run_migration(
         lambda zfs, settings, name: file_move(
             zfs,
@@ -324,6 +346,7 @@ def file_move_command(
             name,
             batch_size=parse_size(batch_size),
             delete_source=delete_source,
+            check_prompt_with_key_file=check_prompt_with_key_file,
         ),
         Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation),
         dataset,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -23,6 +24,7 @@ from zfs_encrypt_migrate.constants import (
 from zfs_encrypt_migrate.errors import Interrupted, MigrationError, ZfsError
 from zfs_encrypt_migrate.filemove import (
     _admit,
+    _batch_line,
     _check_passphrase,
     _copy_tree,
     _finish,
@@ -865,6 +867,124 @@ def test_check_passphrase_again_for_another_location(filemove_env: FileMoveEnv, 
     assert env.sim.props[STAGED, MARK_KEY] == "file:///b"
 
 
+def test_check_passphrase_prompt_needs_terminal_names_the_key_file_check(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unattended run is told about the opt-in check against the key file; it never falls back to it."""
+    monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: False)
+    with pytest.raises(MigrationError) as info:
+        _check_passphrase(staged_env(filemove_env).zfs, settings, STAGED)
+    assert info.value.hints == (
+        (
+            "or, if the key file holds the passphrase you keep, check that file instead: "
+            "rerun with --check-prompt-with-key-file"
+        ),
+    )
+    assert not [call for call in filemove_env.runner.calls if "load-key" in call]
+
+
+@pytest.mark.parametrize("raw", ["--keyformat", "staged dataset"])
+def test_check_passphrase_prompt_needs_terminal_offers_no_flag_for_a_raw_key(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str,
+) -> None:
+    """The flag refuses a raw key, from this run's --keyformat or the staged dataset's, so the refusal skips it."""
+    monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: False)
+    env = staged_env(filemove_env)
+    if raw == "--keyformat":
+        settings = replace(settings, keyformat="raw")
+    else:
+        env.sim.prop(STAGED, "keyformat", "raw")
+    with pytest.raises(MigrationError) as info:
+        _check_passphrase(env.zfs, settings, STAGED)
+    assert info.value.message == "run file-move once from a terminal so it can check the passphrase"
+    assert info.value.hints == ()
+
+
+def key_file_check(key_file: Path) -> tuple[str, ...]:
+    """Return the check of the final key against the key file."""
+    return ("zfs", "load-key", "-n", "-L", f"file://{key_file}", STAGED)
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_check_passphrase_prompt_with_key_file(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    key_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal: bool,  # noqa: FBT001
+) -> None:
+    """With the flag a final prompt is checked against the key file, never at the terminal, and recorded as such."""
+    monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: terminal)
+    env = staged_env(filemove_env)
+    _check_passphrase(env.zfs, settings, STAGED, check_prompt_with_key_file=True)
+    assert env.runner.attached == []
+    assert [call for call in env.runner.calls if "load-key" in call] == [key_file_check(key_file)]
+    assert env.sim.props[STAGED, MARK_KEY] == f"file://{key_file}"
+
+
+def test_check_passphrase_prompt_with_key_file_wrong_key_refuses(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    key_file: Path,
+) -> None:
+    """A key file that does not open the staged dataset stops the run before anything is deleted."""
+    zfs, _ = make(staged_env(filemove_env).sim, fail_on("zfs", "load-key", "-n"))
+    with pytest.raises(MigrationError) as info:
+        _check_passphrase(zfs, settings, STAGED, check_prompt_with_key_file=True)
+    assert info.value.message == f"the key for {STAGED} did not load from file://{key_file}; nothing was deleted"
+    assert (STAGED, MARK_KEY) not in filemove_env.sim.props
+
+
+@pytest.mark.parametrize("checked", ["key file", "prompt"])
+def test_check_passphrase_prompt_with_key_file_checks_on_every_run(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    key_file: Path,
+    checked: str,
+) -> None:
+    """The key file is checked again even after it passed; a passphrase typed at a terminal before stays recorded."""
+    marker = f"file://{key_file}" if checked == "key file" else "prompt"
+    env = staged_env(filemove_env)
+    env.sim.prop(STAGED, MARK_KEY, marker)
+    _check_passphrase(env.zfs, settings, STAGED, check_prompt_with_key_file=True)
+    assert [call for call in env.runner.calls if "load-key" in call] == [key_file_check(key_file)]
+    assert env.sim.props[STAGED, MARK_KEY] == marker
+
+
+def test_check_passphrase_prompt_with_another_key_file_checks_again(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    key_file: Path,
+) -> None:
+    """Only the key file that passed counts: another one is checked before anything more is deleted."""
+    env = staged_env(filemove_env)
+    env.sim.prop(STAGED, MARK_KEY, "file:///keys/other")
+    _check_passphrase(env.zfs, settings, STAGED, check_prompt_with_key_file=True)
+    assert [call for call in env.runner.calls if "load-key" in call] == [key_file_check(key_file)]
+    assert env.sim.props[STAGED, MARK_KEY] == f"file://{key_file}"
+
+
+def test_check_passphrase_prompt_after_a_key_file_check_needs_terminal(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    key_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The key file check counts only for runs that pass the flag; without it the passphrase is asked for again."""
+    monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: False)
+    env = staged_env(filemove_env)
+    env.sim.prop(STAGED, MARK_KEY, f"file://{key_file}")
+    with pytest.raises(MigrationError) as info:
+        _check_passphrase(env.zfs, settings, STAGED)
+    assert info.value.message == "run file-move once from a terminal so it can check the passphrase"
+    assert not [call for call in env.runner.calls if "load-key" in call]
+
+
 # --- move loop ---
 
 
@@ -934,9 +1054,288 @@ def test_moves_everything_in_batches(
     lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("batch ")]
     assert len(lines) == 5  # noqa: PLR2004
     assert lines[0].startswith("batch 1: ")
-    assert lines[-1].endswith(" left")
+    assert " left (0B data)" in lines[-1]
     assert lines[-1].startswith("batch 5: ")
     assert ("zpool", "sync", "tank") in env.sim.ops()
+
+
+def ticking_clock(*ticks: float) -> Callable[[], float]:
+    """Return a clock that hands out the given times in order."""
+    times = iter(ticks)
+    return lambda: next(times)
+
+
+def fixed_allocation(monkeypatch: pytest.MonkeyPatch, allocated: int = 4096) -> None:
+    """Scan with one allocation per file: the real one depends on the filesystem and on when the pool writes it."""
+    monkeypatch.setattr(
+        filemove,
+        "scan",
+        lambda root: [replace(item, allocated=allocated) for item in filetree.scan(root)],
+    )
+
+
+def move_timed(
+    env: FileMoveEnv,
+    settings: Settings,
+    dst: Path,
+    *,
+    clock: Callable[[], float],
+    wall_clock: Callable[[], float],
+) -> None:
+    """Move with batches of one file and the given clocks."""
+    env.sim.prop(STAGED, "mountpoint", str(dst))
+    env.sim.prop(STAGED, "mounted", "yes")
+    _move_files(
+        env.zfs,
+        settings,
+        DATASET,
+        env.src,
+        dst,
+        1,
+        recorder()[1],
+        device=dst.stat().st_dev,
+        guard=guard_for(env, settings),
+        clock=clock,
+        wall_clock=wall_clock,
+    )
+
+
+def only_files(env: FileMoveEnv, sizes: dict[str, int]) -> None:
+    """Replace the source files by regular files of the given apparent sizes."""
+    for path in [p for p in env.src.rglob("*") if not p.is_dir() or p.is_symlink()]:
+        path.unlink()
+    for name, size in sizes.items():
+        (env.src / name).write_bytes(b"x" * size)
+
+
+def batch_lines(capsys: pytest.CaptureFixture[str]) -> list[str]:
+    """Return the printed batch lines."""
+    return [line for line in capsys.readouterr().out.splitlines() if line.startswith("batch ")]
+
+
+def stamp(wall: float) -> str:
+    """Return the local HH:MM of an epoch time, as a batch line shows it."""
+    return datetime.fromtimestamp(wall).strftime("%H:%M")  # noqa: DTZ006
+
+
+WALL = 1_700_000_000.0
+
+
+@needs_rsync
+def test_batch_line_shows_pace_data_size_and_eta(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each line has the duration, throughput, apparent sizes, ETA from the run's average rate and a timestamp."""
+    env = filemove_env
+    only_files(env, {"a": 2048, "b": 1024, "c": 512})
+    fixed_allocation(monkeypatch)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    move_timed(
+        env,
+        settings,
+        dst,
+        clock=ticking_clock(100, 104, 104, 116, 116, 117),
+        wall_clock=ticking_clock(WALL, WALL + 60, WALL + 3600),
+    )
+    assert batch_lines(capsys) == [
+        f"batch 1: 1 files, 4.0K moved (2.0K data) in 4s at 1.0K/s, 8.0K left (1.5K data), ETA 8s [{stamp(WALL)}]",
+        (
+            f"batch 2: 1 files, 4.0K moved (1.0K data) in 12s at 341B/s, 4.0K left (512B data), ETA 8s "
+            f"[{stamp(WALL + 60)}]"
+        ),
+        f"batch 3: 1 files, 4.0K moved (512B data) in 1s at 4.0K/s, 0B left (0B data) [{stamp(WALL + 3600)}]",
+    ]
+
+
+@needs_rsync
+def test_a_group_verification_kept_is_not_progress(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A group that changed is not deleted: it adds nothing to moved or data, does not lower left, and moves later."""
+    env = filemove_env
+    only_files(env, {"a": 2048, "b": 1024, "c": 512})
+    fixed_allocation(monkeypatch)
+    real_verify = filetree.verify
+    calls = 0
+
+    def keep_first(
+        src: Path,
+        dst: Path,
+        groups: Sequence[filetree.Group],
+        *,
+        device: int,
+    ) -> tuple[list[filetree.Group], list[filetree.Group]]:
+        nonlocal calls
+        calls += 1
+        verified, changed = real_verify(src, dst, groups, device=device)
+        if calls == 1:
+            return [], [*verified, *changed]
+        return verified, changed
+
+    monkeypatch.setattr(filemove, "verify", keep_first)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    move_timed(
+        env,
+        settings,
+        dst,
+        clock=ticking_clock(*(t for batch in range(4) for t in (batch * 4, batch * 4 + 4))),
+        wall_clock=ticking_clock(WALL, WALL, WALL, WALL),
+    )
+    at = stamp(WALL)
+    assert batch_lines(capsys) == [
+        # Copied but kept: the rate counts the copy, "moved" and "left" count only deletions.
+        f"batch 1: 0 files, 0B moved (0B data) in 4s at 1.0K/s, 12.0K left (3.5K data), ETA 12s [{at}]",
+        f"batch 2: 1 files, 4.0K moved (1.0K data) in 4s at 1.0K/s, 8.0K left (2.5K data), ETA 8s [{at}]",
+        f"batch 3: 1 files, 4.0K moved (512B data) in 4s at 1.0K/s, 4.0K left (2.0K data), ETA 4s [{at}]",
+        # The retry finds the copy of a already in place: nothing is copied, so the rate is 0.
+        f"batch 4: 1 files, 4.0K moved (2.0K data) in 4s at 0B/s, 0B left (0B data) [{at}]",
+    ]
+    assert source_files(env) == []
+
+
+@needs_rsync
+def test_copies_a_stopped_run_left_do_not_inflate_the_rate(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A file whose copy exists already is moved without copying: no rate, and no ETA until something was copied."""
+    env = filemove_env
+    only_files(env, {"a": 2048, "b": 1024})
+    fixed_allocation(monkeypatch)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    shutil.copy2(env.src / "a", dst / "a")
+    move_timed(
+        env,
+        settings,
+        dst,
+        clock=ticking_clock(0, 4, 4, 8),
+        wall_clock=ticking_clock(WALL, WALL),
+    )
+    at = stamp(WALL)
+    assert batch_lines(capsys) == [
+        f"batch 1: 1 files, 4.0K moved (2.0K data) in 4s at 0B/s, 4.0K left (1.0K data) [{at}]",
+        f"batch 2: 1 files, 4.0K moved (1.0K data) in 4s at 1.0K/s, 0B left (0B data) [{at}]",
+    ]
+
+
+@needs_rsync
+def test_a_resent_stale_copy_is_not_in_the_rate(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The rate counts files with no copy yet: a stale copy rsync sends again adds nothing, so that batch reads low."""
+    env = filemove_env
+    only_files(env, {"a": 2048, "b": 1024})
+    fixed_allocation(monkeypatch)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    (dst / "a").write_bytes(b"old")
+    move_timed(env, settings, dst, clock=ticking_clock(0, 4, 4, 8), wall_clock=ticking_clock(WALL, WALL))
+    at = stamp(WALL)
+    assert batch_lines(capsys) == [
+        f"batch 1: 1 files, 4.0K moved (2.0K data) in 4s at 0B/s, 4.0K left (1.0K data) [{at}]",
+        f"batch 2: 1 files, 4.0K moved (1.0K data) in 4s at 1.0K/s, 0B left (0B data) [{at}]",
+    ]
+    assert (dst / "a").read_bytes() == b"x" * 2048
+
+
+@needs_rsync
+def test_a_group_delete_skipped_is_not_progress(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verified group whose names are still there after delete (a writer replaced one) is not moved."""
+    env = filemove_env
+    only_files(env, {"a": 2048, "b": 1024})
+    fixed_allocation(monkeypatch)
+    real_delete = filetree.delete
+    calls = 0
+
+    def skip_first(src: Path, groups: Sequence[filetree.Group]) -> int:
+        nonlocal calls
+        calls += 1
+        return real_delete(src, [] if calls == 1 else groups)
+
+    monkeypatch.setattr(filemove, "delete", skip_first)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    move_timed(
+        env,
+        settings,
+        dst,
+        clock=ticking_clock(0, 4, 4, 8, 8, 12),
+        wall_clock=ticking_clock(WALL, WALL, WALL),
+    )
+    assert batch_lines(capsys)[0] == (
+        f"batch 1: 0 files, 0B moved (0B data) in 4s at 1.0K/s, 8.0K left (3.0K data), ETA 8s [{stamp(WALL)}]"
+    )
+    assert source_files(env) == []
+
+
+def line(**changes: float) -> str:
+    """Format a batch line from the numbers of a 58-minute batch, with ``changes`` replacing some of them."""
+    numbers = {
+        "number": 7,
+        "files": 1204,
+        "moved": int(99.8 * 1024**3),
+        "moved_data": 146 * 1024**3,
+        "copied": int(99.8 * 1024**3),
+        "seconds": 3490,
+        "left": int(4.2 * 1024**4),
+        "left_data": int(6.1 * 1024**4),
+        "run_copied": int(99.8 * 1024**3),
+        "run_seconds": 3490,
+        "stamp": datetime(2026, 1, 1, 14, 2).timestamp(),  # noqa: DTZ001
+        **changes,
+    }
+    return _batch_line(**numbers)  # type: ignore[arg-type]
+
+
+# The line shown in docs/usage.md and docs/guides.md: it must be what the code prints for those numbers.
+DOCUMENTED_LINE = (
+    "batch 7: 1204 files, 99.8G moved (146.0G data) in 58m 10s at 29.3M/s, 4.2T left (6.1T data), ETA 1d 17h [14:02]"
+)
+
+
+def test_documented_batch_line_is_what_the_code_prints() -> None:
+    """The example in the docs is built from the numbers it shows, so it cannot drift."""
+    assert line() == DOCUMENTED_LINE
+    for doc in ("usage.md", "guides.md"):
+        assert DOCUMENTED_LINE in (Path(__file__).parent.parent / "docs" / doc).read_text()
+
+
+def test_batch_line_without_elapsed_time_has_no_rate_and_no_eta() -> None:
+    """A batch that took no measurable time has no rate to divide by."""
+    assert " at " not in line(seconds=0)
+    assert ", ETA " not in line(seconds=0, run_seconds=0)
+    assert " in 0s, 4.2T left" in line(seconds=0, run_seconds=0)
+
+
+def test_batch_line_without_a_copy_has_no_eta() -> None:
+    """Before anything was copied in this run, the run has no rate."""
+    text = line(copied=0, run_copied=0)
+    assert " at 0B/s, " in text
+    assert ", ETA " not in text
 
 
 @needs_rsync
@@ -1504,6 +1903,141 @@ def test_file_move_end_to_end(filemove_env: FileMoveEnv, settings: Settings, tmp
             ("zfs", "mount", DATASET),
         ],
     )
+
+
+@needs_rsync
+def test_file_move_unattended_ends_with_prompt(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    key_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a terminal, the flag checks the key file before the first delete and still ends with prompt."""
+    env = filemove_env
+    monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: False)
+    before = contents(env.src)
+
+    file_move(
+        env.zfs,
+        settings,
+        DATASET,
+        batch_size=1,
+        delete_source=True,
+        check_prompt_with_key_file=True,
+        mount_root=env.mount_root,
+        lock_path=tmp_path / "lock",
+        sleep=recorder()[1],
+    )
+
+    assert contents(staged_dir(env)) == before
+    assert env.runner.attached == []
+    assert env.sim.props[DATASET, "keylocation"] == "prompt"
+    check = ("zfs", "load-key", "-n", "-L", f"file://{key_file}", STAGED)
+    assert [call for call in env.sim.ops() if call[:3] == ("zfs", "load-key", "-n")] == [check]
+    # The move is admitted before its first delete.
+    admitted = ("zfs", "set", f"{MARK_ADMITTED}=yes", STAGED)
+    assert_in_order(env.sim.ops(), [check, admitted, ("zfs", "set", "keylocation=prompt", DATASET)])
+
+
+@needs_rsync
+def test_file_move_rerun_checks_a_replaced_key_file_while_the_key_stays_loaded(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    key_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a kill the staged key stays loaded, so only the check notices a key file replaced since it passed."""
+    env = filemove_env
+    monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: False)
+    file_rsyncs = 0
+
+    def stop_second_batch(args: Sequence[str]) -> CommandResult | None:
+        nonlocal file_rsyncs
+        if args[0] == "rsync" and "-aHAXS" in args:
+            file_rsyncs += 1
+            if file_rsyncs == 2:  # noqa: PLR2004
+                raise KeyboardInterrupt
+        return real_rsync(args)
+
+    def wrong_key(args: Sequence[str]) -> CommandResult | None:
+        if tuple(args[:3]) == ("zfs", "load-key", "-n"):
+            return fail("Key load error: Incorrect key provided\n")
+        return real_rsync(args)
+
+    def move(zfs: Zfs) -> list[str]:
+        return file_move(
+            zfs,
+            settings,
+            DATASET,
+            batch_size=1,
+            delete_source=True,
+            check_prompt_with_key_file=True,
+            mount_root=env.mount_root,
+            lock_path=tmp_path / "lock",
+            sleep=recorder()[1],
+        )
+
+    zfs, _ = make(env.sim, stop_second_batch)
+    with pytest.raises(Interrupted):
+        move(zfs)
+    assert env.sim.props[STAGED, MARK_KEY] == f"file://{key_file}"
+    # A kill instead of that interrupt cleans nothing up: the staged key stays loaded and its dataset mounted.
+    env.sim.props[STAGED, "keystatus"] = "available"
+    env.sim.props[STAGED, "mounted"] = "yes"
+    left = source_files(env)
+    key_file.write_text("another passphrase")
+
+    zfs, runner = make(env.sim, wrong_key)
+    with pytest.raises(MigrationError) as info:
+        move(zfs)
+
+    assert info.value.message == f"the key for {STAGED} did not load from file://{key_file}; nothing was deleted"
+    assert source_files(env) == left
+    # The loaded key was not loaded again from the file, so nothing but the check read it.
+    assert ("zfs", "load-key", STAGED) not in runner.calls
+
+
+@needs_rsync
+def test_file_move_rerun_refuses_the_flag_for_a_staged_raw_key(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The staged dataset's own keyformat counts: a rerun that leaves out --keyformat raw cannot end with prompt."""
+    env = filemove_env
+    monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: False)
+    before = source_files(env)
+
+    def move(changed: Settings, *, flag: bool) -> list[str]:
+        return file_move(
+            env.zfs,
+            changed,
+            DATASET,
+            batch_size=1,
+            delete_source=True,
+            check_prompt_with_key_file=flag,
+            mount_root=env.mount_root,
+            lock_path=tmp_path / "lock",
+            sleep=recorder()[1],
+        )
+
+    # A first run with a raw key creates the staged dataset, then stops at the check: nobody is at a terminal.
+    with pytest.raises(MigrationError):
+        move(replace(settings, keyformat="raw"), flag=False)
+    assert env.sim.props[STAGED, "keyformat"] == "raw"
+
+    with pytest.raises(MigrationError) as info:
+        move(settings, flag=True)
+
+    assert info.value.message == (
+        f"{STAGED} has keyformat=raw, which can't be typed at the prompt; "
+        "--check-prompt-with-key-file needs a passphrase or hex key"
+    )
+    assert source_files(env) == before
+    assert not [call for call in env.runner.calls if call[:3] == ("zfs", "load-key", "-n")]
 
 
 def test_file_move_needs_delete_source(filemove_env: FileMoveEnv, settings: Settings, tmp_path: Path) -> None:

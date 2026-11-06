@@ -8,6 +8,7 @@ import os
 import shlex
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -55,7 +56,7 @@ from .migrate import (
 )
 from .output import console
 from .props import create_props, fixups
-from .sizes import format_size
+from .sizes import format_duration, format_size
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -421,25 +422,53 @@ def _stdin_is_terminal() -> bool:
     return sys.stdin.isatty()
 
 
-def _check_passphrase(zfs: Zfs, settings: Settings, staged: str) -> None:
+def _raw_key(zfs: Zfs, settings: Settings, staged: str) -> bool:
+    """Return whether the staged key is raw, which zfs refuses to take typed at a terminal.
+
+    The staged dataset's own keyformat counts: a rerun may leave out the --keyformat raw that created it.
+    """
+    return settings.keyformat == "raw" or zfs.get("keyformat", staged) == "raw"
+
+
+def _check_passphrase(zfs: Zfs, settings: Settings, staged: str, *, check_prompt_with_key_file: bool = False) -> None:
     """Prove the final key unlocks the staged dataset before any file is deleted.
 
-    The marker records the location that was checked, so a rerun with another final location checks again.
+    The marker records the location that was checked, so a rerun with another final location checks again. Only
+    when the operator vouches for the key file is a final ``prompt`` checked against that file, on every run, never
+    because no terminal is attached. That proves the file opens the dataset, not that anyone knows the passphrase.
     """
     location = settings.final_keylocation
-    if zfs.get(MARK_KEY, staged) == location:
+    from_key_file = location == "prompt" and check_prompt_with_key_file
+    if from_key_file and _raw_key(zfs, settings, staged):
+        msg = (
+            f"{staged} has keyformat=raw, which can't be typed at the prompt; "
+            "--check-prompt-with-key-file needs a passphrase or hex key"
+        )
+        raise MigrationError(msg)
+    check = f"file://{settings.key_file}" if from_key_file else location
+    checked = zfs.get(MARK_KEY, staged)
+    # The key file is checked on every run: it may have changed since it passed, and the staged key a killed run
+    # left loaded would not notice before files are deleted.
+    if checked == location and not from_key_file:
         return
-    if location == "prompt":
+    if check == "prompt":
         if not _stdin_is_terminal():
             msg = "run file-move once from a terminal so it can check the passphrase"
-            raise MigrationError(msg)
+            hint = (
+                "or, if the key file holds the passphrase you keep, check that file instead: "
+                "rerun with --check-prompt-with-key-file"
+            )
+            # The flag refuses a raw key, so it is no way out for one.
+            raise MigrationError(msg, [] if _raw_key(zfs, settings, staged) else [hint])
         loaded = zfs.check_key(staged, "prompt", attached=True)
     else:
-        loaded = zfs.check_key(staged, location, attached=False)
+        loaded = zfs.check_key(staged, check, attached=False)
     if not loaded:
-        msg = f"the key for {staged} did not load from {location}; nothing was deleted"
+        msg = f"the key for {staged} did not load from {check}; nothing was deleted"
         raise MigrationError(msg)
-    zfs.set_prop(staged, MARK_KEY, location)
+    # A passphrase typed at a terminal stays the record: a later run without the flag relies on it.
+    if checked != check and not (from_key_file and checked == "prompt"):
+        zfs.set_prop(staged, MARK_KEY, check)
 
 
 def _wait_for_space(zfs: Zfs, settings: Settings, needed: int, sleep: Callable[[float], None]) -> None:
@@ -527,6 +556,38 @@ def _split_notes(dataset: str, staged: str) -> list[str]:
     ]
 
 
+def _batch_line(
+    *,
+    number: int,
+    files: int,
+    moved: int,
+    moved_data: int,
+    copied: int,
+    seconds: float,
+    left: int,
+    left_data: int,
+    run_copied: int,
+    run_seconds: float,
+    stamp: float,
+) -> str:
+    """Format the progress line of a finished batch; it always starts with ``batch N:``.
+
+    ``files``, ``moved`` and ``moved_data`` (allocated and apparent bytes) count what the batch deleted, and
+    ``left`` and ``left_data`` what is still in the source. ``copied`` is what the batch wrote into the copy
+    in ``seconds``, and ``run_copied`` in ``run_seconds`` is the same for every batch of this run so far: the rate
+    and the ETA come from those, since a copy that already existed took no time. With no elapsed time there is
+    no rate, and with nothing copied or nothing left there is no ETA. ``stamp`` is the epoch time of the line.
+    """
+    text = f"batch {number}: {files} files, {format_size(moved)} moved ({format_size(moved_data)} data)"
+    text += f" in {format_duration(seconds)}"
+    if seconds > 0:
+        text += f" at {format_size(int(copied / seconds))}/s"
+    text += f", {format_size(left)} left ({format_size(left_data)} data)"
+    if run_seconds > 0 and run_copied > 0 and left > 0:
+        text += f", ETA {format_duration(left / (run_copied / run_seconds))}"
+    return f"{text} [{datetime.fromtimestamp(stamp).strftime('%H:%M')}]"  # noqa: DTZ006
+
+
 def _move_files(  # noqa: PLR0917
     zfs: Zfs,
     settings: Settings,
@@ -538,8 +599,12 @@ def _move_files(  # noqa: PLR0917
     *,
     device: int,
     guard: AbortGuard,
+    clock: Callable[[], float] = time.monotonic,
+    wall_clock: Callable[[], float] = time.time,
 ) -> None:
     """Move every file into the copy in verified batches; delete a batch only after its copy is verified and synced.
+
+    ``clock`` is a monotonic clock that times each batch; ``wall_clock`` returns the epoch time that stamps its line.
 
     ``device`` is the device of the staged dataset mounted at ``dst``; every copy must be on it. From the first
     delete on, ``guard`` says the files are split.
@@ -550,20 +615,24 @@ def _move_files(  # noqa: PLR0917
     # Before any space check, since they hold space; the run lock keeps every other run out of scratch.
     remove_partials(dst)
     batch_number = 0
+    # Of the batches finished in this run only, so the ETA does not depend on earlier runs.
+    run_copied = 0
+    run_seconds = 0.0
     while entries := scan(src):
         groups = group_by_inode(entries, src)
         # Before the first batch of the move; skipped once the staged dataset is marked admitted.
         _admit(zfs, settings, dataset, groups, batch_size)
         left = sum(group.allocated for group in groups)
+        left_data = sum(group.apparent for group in groups)
         deleted = 0
         for batch in plan_batches(groups, batch_size):
+            started = clock()
             # Before anything is written into dst: it may have become a bare directory since the last batch.
             _refuse_unmounted(zfs, staged, dst, device)
             # Created only when files remain: a rerun after finish removed scratch must not change the copy's root.
             scratch.mkdir(exist_ok=True)
             # Checked before every batch: a snapshot that appears mid-run would pin the deleted files.
             _refuse_snapshots(zfs, dataset)
-            moved = sum(group.allocated for group in batch)
             # A stop between copy and delete leaves copies that need no new space; rsync skips them.
             missing = sum(group.allocated for group in batch if not os.path.lexists(dst / group.first))
             _wait_for_space(zfs, settings, missing, sleep)
@@ -578,9 +647,31 @@ def _move_files(  # noqa: PLR0917
                 guard.notes = _split_notes(dataset, staged)
             deleted += delete(src, verified)
             batch_number += 1
+            # Only names that are gone count as moved: a group verification or delete kept comes back next pass.
+            gone = [g for g in verified if not any(os.path.lexists(src / item.name) for item in g.entries)]
+            moved = sum(group.allocated for group in gone)
+            moved_data = sum(group.apparent for group in gone)
             left -= moved
-            files = sum(len(group.entries) for group in batch)
-            console.print(f"batch {batch_number}: {files} files, {format_size(moved)} moved, {format_size(left)} left")
+            left_data -= moved_data
+            seconds = max(clock() - started, 0.0)
+            run_copied += missing
+            run_seconds += seconds
+            console.print(
+                _batch_line(
+                    number=batch_number,
+                    files=sum(len(group.entries) for group in gone),
+                    moved=moved,
+                    moved_data=moved_data,
+                    copied=missing,
+                    seconds=seconds,
+                    left=left,
+                    left_data=left_data,
+                    run_copied=run_copied,
+                    run_seconds=run_seconds,
+                    stamp=wall_clock(),
+                ),
+                soft_wrap=True,
+            )
         if deleted == 0:
             msg = f"{len(entries)} files kept changing during the move; stop the writers and rerun"
             raise MigrationError(msg)
@@ -673,6 +764,7 @@ def file_move(
     *,
     batch_size: int,
     delete_source: bool,
+    check_prompt_with_key_file: bool = False,
     mount_root: Path = STAGING_MOUNT_ROOT,
     lock_path: Path = LOCK_FILE,
     sleep: Callable[[float], None] = time.sleep,
@@ -696,6 +788,16 @@ def file_move(
                 msg = f"{staged} is mounted at {dst}, which overlaps {dataset} at {src}"
                 raise MigrationError(msg)
             _copy_tree(zfs, staged, src, dst, device)
-            _check_passphrase(zfs, settings, staged)
-            _move_files(zfs, settings, dataset, src, dst, batch_size, sleep, device=device, guard=guard)
+            _check_passphrase(zfs, settings, staged, check_prompt_with_key_file=check_prompt_with_key_file)
+            _move_files(
+                zfs,
+                settings,
+                dataset,
+                src,
+                dst,
+                batch_size,
+                sleep,
+                device=device,
+                guard=guard,
+            )
             return _finish(zfs, settings, dataset, src, dst, guard)

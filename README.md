@@ -123,7 +123,7 @@ Write the passphrase into a key file with mode `600` (OpenZFS wants 8 to 512 byt
 
 ```bash
 install -m 600 /dev/null /run/zfs-encrypt-migrate.key
-read -rs passphrase && printf '%s' "$passphrase" > /run/zfs-encrypt-migrate.key && unset passphrase
+IFS= read -rs passphrase && printf '%s' "$passphrase" > /run/zfs-encrypt-migrate.key && unset passphrase
 ```
 
 Store the passphrase somewhere safe as well: once the migration is done, it is the only way into your data.
