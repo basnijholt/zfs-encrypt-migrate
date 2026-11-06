@@ -277,8 +277,10 @@ First create the key file in `/run`, without echoing the passphrase. Type it fro
 
 ```bash
 install -m 600 /dev/null /run/zfs-encrypt-migrate.key
-read -rs passphrase && printf '%s' "$passphrase" > /run/zfs-encrypt-migrate.key && unset passphrase
+IFS= read -rs passphrase && printf '%s' "$passphrase" > /run/zfs-encrypt-migrate.key && unset passphrase
 ```
+
+`IFS=` keeps spaces at the start and end of the passphrase, which `read` would otherwise strip, so the file holds exactly what you typed.
 
 Then start the run, and follow its log:
 

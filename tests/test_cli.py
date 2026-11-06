@@ -663,6 +663,20 @@ def test_check_prompt_with_key_file_needs_final_keylocation_prompt(
     assert sim.runner.calls == []  # type: ignore[attr-defined]
 
 
+@pytest.mark.parametrize("argv", FINAL_KEY_COMMANDS.values(), ids=FINAL_KEY_COMMANDS.keys())
+def test_check_prompt_with_key_file_refuses_a_raw_key(sim: ZfsSim, received: list[Settings], argv: list[str]) -> None:
+    """OpenZFS takes no raw key typed at a terminal, so the prompt it ends with could not be answered; hex can."""
+    flagged = [*argv, "--check-prompt-with-key-file"]
+    raw = runner.invoke(cli.app, [*flagged, "--keyformat", "raw"], env={"COLUMNS": "200"})
+    hexadecimal = runner.invoke(cli.app, [*flagged, "--keyformat", "hex"])
+
+    assert raw.exit_code == 2  # noqa: PLR2004
+    assert "needs --keyformat passphrase or hex, since a raw key can't be typed at the prompt" in plain(raw.output)
+    assert hexadecimal.exit_code == 0, hexadecimal.output
+    assert [(s.keyformat, s.check_prompt_with_key_file) for s in received] == [("hex", True)]
+    assert sim.runner.calls == []  # type: ignore[attr-defined]
+
+
 def test_check_prompt_with_key_file_has_no_env_var() -> None:
     """Consent is given on each command line, as for --delete-source: no environment variable turns the flag on."""
     commands = typer.main.get_command(cli.app).commands  # type: ignore[attr-defined]

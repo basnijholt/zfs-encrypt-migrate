@@ -425,14 +425,16 @@ def _check_passphrase(zfs: Zfs, settings: Settings, staged: str) -> None:
     """Prove the final key unlocks the staged dataset before any file is deleted.
 
     The marker records the location that was checked, so a rerun with another final location checks again. Only
-    when the operator vouches for the key file is a final ``prompt`` checked against that file, never because no
-    terminal is attached. That proves the file opens the dataset, not that anyone knows the passphrase.
+    when the operator vouches for the key file is a final ``prompt`` checked against that file, on every run, never
+    because no terminal is attached. That proves the file opens the dataset, not that anyone knows the passphrase.
     """
     location = settings.final_keylocation
     from_key_file = location == "prompt" and settings.check_prompt_with_key_file
     check = f"file://{settings.key_file}" if from_key_file else location
-    # A passphrase typed at a terminal earlier is the stronger check, so it satisfies a run that vouches for the file.
-    if zfs.get(MARK_KEY, staged) in {location, check}:
+    checked = zfs.get(MARK_KEY, staged)
+    # The key file is checked on every run: it may have changed since it passed, and the staged key a killed run
+    # left loaded would not notice before files are deleted.
+    if checked == location and not from_key_file:
         return
     if check == "prompt":
         if not _stdin_is_terminal():
@@ -448,7 +450,9 @@ def _check_passphrase(zfs: Zfs, settings: Settings, staged: str) -> None:
     if not loaded:
         msg = f"the key for {staged} did not load from {check}; nothing was deleted"
         raise MigrationError(msg)
-    zfs.set_prop(staged, MARK_KEY, check)
+    # A passphrase typed at a terminal stays the record: a later run without the flag relies on it.
+    if checked != check and not (from_key_file and checked == "prompt"):
+        zfs.set_prop(staged, MARK_KEY, check)
 
 
 def _wait_for_space(zfs: Zfs, settings: Settings, needed: int, sleep: Callable[[float], None]) -> None:

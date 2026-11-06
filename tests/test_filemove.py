@@ -919,18 +919,18 @@ def test_check_passphrase_prompt_with_key_file_wrong_key_refuses(
 
 
 @pytest.mark.parametrize("checked", ["key file", "prompt"])
-def test_check_passphrase_prompt_with_key_file_skips_when_marked(
+def test_check_passphrase_prompt_with_key_file_checks_on_every_run(
     filemove_env: FileMoveEnv,
     settings: Settings,
     key_file: Path,
     checked: str,
 ) -> None:
-    """A rerun skips the check once the key file passed, and a passphrase typed at a terminal before stays recorded."""
+    """The key file is checked again even after it passed; a passphrase typed at a terminal before stays recorded."""
     marker = f"file://{key_file}" if checked == "key file" else "prompt"
     env = staged_env(filemove_env)
     env.sim.prop(STAGED, MARK_KEY, marker)
     _check_passphrase(env.zfs, replace(settings, check_prompt_with_key_file=True), STAGED)
-    assert not [call for call in env.runner.calls if "load-key" in call]
+    assert [call for call in env.runner.calls if "load-key" in call] == [key_file_check(key_file)]
     assert env.sim.props[STAGED, MARK_KEY] == marker
 
 
@@ -1636,6 +1636,65 @@ def test_file_move_unattended_ends_with_prompt(
     # The move is admitted before its first delete.
     admitted = ("zfs", "set", f"{MARK_ADMITTED}=yes", STAGED)
     assert_in_order(env.sim.ops(), [check, admitted, ("zfs", "set", "keylocation=prompt", DATASET)])
+
+
+@needs_rsync
+def test_file_move_rerun_checks_a_replaced_key_file_while_the_key_stays_loaded(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    key_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a kill the staged key stays loaded, so only the check notices a key file replaced since it passed."""
+    env = filemove_env
+    monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: False)
+    flagged = replace(settings, check_prompt_with_key_file=True)
+    file_rsyncs = 0
+
+    def stop_second_batch(args: Sequence[str]) -> CommandResult | None:
+        nonlocal file_rsyncs
+        if args[0] == "rsync" and "-aHAXS" in args:
+            file_rsyncs += 1
+            if file_rsyncs == 2:  # noqa: PLR2004
+                raise KeyboardInterrupt
+        return real_rsync(args)
+
+    def wrong_key(args: Sequence[str]) -> CommandResult | None:
+        if tuple(args[:3]) == ("zfs", "load-key", "-n"):
+            return fail("Key load error: Incorrect key provided\n")
+        return real_rsync(args)
+
+    def move(zfs: Zfs) -> list[str]:
+        return file_move(
+            zfs,
+            flagged,
+            DATASET,
+            batch_size=1,
+            delete_source=True,
+            mount_root=env.mount_root,
+            lock_path=tmp_path / "lock",
+            sleep=recorder()[1],
+        )
+
+    zfs, _ = make(env.sim, stop_second_batch)
+    with pytest.raises(Interrupted):
+        move(zfs)
+    assert env.sim.props[STAGED, MARK_KEY] == f"file://{key_file}"
+    # A kill instead of that interrupt cleans nothing up: the staged key stays loaded and its dataset mounted.
+    env.sim.props[STAGED, "keystatus"] = "available"
+    env.sim.props[STAGED, "mounted"] = "yes"
+    left = source_files(env)
+    key_file.write_text("another passphrase")
+
+    zfs, runner = make(env.sim, wrong_key)
+    with pytest.raises(MigrationError) as info:
+        move(zfs)
+
+    assert info.value.message == f"the key for {STAGED} did not load from file://{key_file}; nothing was deleted"
+    assert source_files(env) == left
+    # The loaded key was not loaded again from the file, so nothing but the check read it.
+    assert ("zfs", "load-key", STAGED) not in runner.calls
 
 
 def test_file_move_needs_delete_source(filemove_env: FileMoveEnv, settings: Settings, tmp_path: Path) -> None:

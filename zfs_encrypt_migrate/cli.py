@@ -169,9 +169,13 @@ def _settings(  # noqa: PLR0917
     final_keylocation: str,
     check_prompt_with_key_file: bool,  # noqa: FBT001
 ) -> Settings:
-    """Build the shared settings; checking against the key file is refused for a final keylocation other than prompt."""
+    """Build the shared settings; checking against the key file needs a final prompt a person can answer."""
     if check_prompt_with_key_file and final_keylocation != "prompt":
         msg = f"needs --final-keylocation prompt, not {final_keylocation}"
+        raise typer.BadParameter(msg, param_hint="'--check-prompt-with-key-file'")
+    # zfs refuses a raw key typed at a terminal, so that prompt could only be fed from a file or a pipe.
+    if check_prompt_with_key_file and keyformat is Keyformat.raw:
+        msg = "needs --keyformat passphrase or hex, since a raw key can't be typed at the prompt"
         raise typer.BadParameter(msg, param_hint="'--check-prompt-with-key-file'")
     return Settings(
         stage,
