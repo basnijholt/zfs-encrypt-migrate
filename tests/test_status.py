@@ -123,6 +123,7 @@ def test_status_only_stats_the_lock_and_touches_no_mountpoint(
     for owner, name in (
         (os, "open"),
         (os, "scandir"),
+        (os, "listdir"),
         (builtins, "open"),
         (io, "open"),
         (Path, "open"),
@@ -174,7 +175,6 @@ def test_lock_unheld_file(lock: Path) -> None:
 def test_lock_held_and_status_does_not_disturb(lock: Path) -> None:
     """A held lock is seen; looking never takes it, and a run can start right after."""
     with _run_lock(lock):
-        assert _lock_state(lock).startswith("held by pid")
         assert _lock_state(lock).startswith("held by pid")
     assert _lock_state(lock) == "not held"
     with _run_lock(lock):

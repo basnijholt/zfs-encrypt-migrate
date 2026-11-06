@@ -440,7 +440,7 @@ What it prints:
 The status interprets nothing and gives no advice.
 The output and the recovery hints of the run itself are authoritative.
 `used` and `logicalused` are exact bytes, so progress between two checks shows.
-`zfs-encrypt-migrate:key-checked` holds the final keylocation whose key was verified, and `zfs-encrypt-migrate:dirs` is `copied` once the directory tree is copied.
+`zfs-encrypt-migrate:key-checked` holds the key location whose check passed: the `--final-keylocation`, or `file://KEY` when a final `prompt` was checked against the key file with `--check-prompt-with-key-file` (the swap still sets `keylocation=prompt`); and `zfs-encrypt-migrate:dirs` is `copied` once the directory tree is copied.
 
 The lock line reads `/proc/locks`; the lock file is only stat'ed, never opened, so a starting run cannot be blocked.
 It says `held by pid N` (some `file-move` on this host holds the lock, not necessarily for this dataset), `not held` (also when there is no lock file), or `unknown (ERROR)`.

@@ -1,4 +1,7 @@
-"""Report where a file-move stands. Strictly read-only: it runs only ``zfs list`` and ``zfs get``."""
+"""Report where a file-move stands.
+
+Read-only: ``zfs list`` and ``zfs get``, a stat of the lock file, and ``/proc/locks``.
+"""
 
 from __future__ import annotations
 
