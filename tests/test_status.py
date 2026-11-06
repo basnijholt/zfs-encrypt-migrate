@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import builtins
 import fcntl
+import io
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -14,6 +17,11 @@ from zfs_encrypt_migrate.filemove import _run_lock
 from zfs_encrypt_migrate.status import _lock_state, file_move_status
 
 from .conftest import STAGE, FileMoveEnv
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from .zfs_sim import ZfsSim
 
 DATASET = "tank/media"
 STAGED = f"{STAGE}/media"
@@ -101,16 +109,29 @@ def test_status_opens_nothing_on_the_mountpoints(
     stage(filemove_env, admitted=True, dirs=True, key="prompt")
     filemove_env.sim.prop(STAGED, "mountpoint", str(filemove_env.mount_root))
     seen: list[str] = []
-    for name in ("scandir", "listdir", "open"):
-        real = getattr(os, name)
 
-        def spy(*args: object, _real: object = real, **kwargs: object) -> object:
+    def spied(real: Callable[..., object]) -> Callable[..., object]:
+        def spy(*args: object, **kwargs: object) -> object:
+            # A method is called with the Path as its first argument, a function with the path.
             seen.append(str(args[0]) if args else "")
-            return _real(*args, **kwargs)  # type: ignore[operator]
+            return real(*args, **kwargs)
 
-        monkeypatch.setattr(os, name, spy)
-    monkeypatch.setattr(Path, "iterdir", lambda self: seen.append(str(self)) or iter(()))
-    monkeypatch.setattr(Path, "open", lambda self, *_a, **_k: seen.append(str(self)))
+        return spy
+
+    for owner, name in (
+        (os, "scandir"),
+        (os, "listdir"),
+        (os, "open"),
+        (os, "stat"),
+        (os, "lstat"),
+        (Path, "iterdir"),
+        (Path, "open"),
+        (Path, "stat"),
+        (Path, "lstat"),
+        (builtins, "open"),
+        (io, "open"),
+    ):
+        monkeypatch.setattr(owner, name, spied(getattr(owner, name)))
     report(filemove_env, lock)
     assert not [p for p in seen if str(filemove_env.src) in p or str(filemove_env.mount_root) in p]
 
@@ -138,19 +159,55 @@ def test_swapped_with_markers_left(filemove_env: FileMoveEnv, lock: Path) -> Non
     assert "destroy" not in text
 
 
-def test_swap_stopped_after_source_marker_removed(filemove_env: FileMoveEnv, lock: Path) -> None:
-    """MARK_SOURCE goes first; other markers or an unmounted dataset still mean the swap is unfinished."""
-    sim = filemove_env.sim
+def swapped_env(env: FileMoveEnv) -> ZfsSim:
+    """Set up an encrypted dataset with its old copy, all markers gone, mounted."""
+    sim = env.sim
     sim.datasets |= {f"{STAGE}/old", f"{STAGE}/old/media"}
     sim.prop(DATASET, "encryption", "aes-256-gcm")
+    return sim
+
+
+def test_swap_stopped_after_source_marker_removed(filemove_env: FileMoveEnv, lock: Path) -> None:
+    """MARK_SOURCE goes first; other markers, or no mount where one is due, still mean an unfinished swap."""
+    sim = swapped_env(filemove_env)
     sim.prop(DATASET, MARK_ADMITTED, "yes")
     assert "phase: swap interrupted" in report(filemove_env, lock)
     sim.props.pop((DATASET, MARK_ADMITTED))
     sim.prop(DATASET, "mounted", "no")
-    sim.prop(DATASET, "canmount", "noauto")
+    sim.prop(DATASET, "canmount", "on")
     text = report(filemove_env, lock)
     assert "phase: swap interrupted" in text
     assert "destroy" not in text
+
+
+@pytest.mark.parametrize(("prop", "value"), [("canmount", "noauto"), ("canmount", "off"), ("mountpoint", "none")])
+def test_unmounted_by_design_is_swapped(filemove_env: FileMoveEnv, lock: Path, prop: str, value: str) -> None:
+    """A finish leaves the dataset unmounted when its canmount or mountpoint say so."""
+    sim = swapped_env(filemove_env)
+    sim.prop(DATASET, "mounted", "no")
+    sim.prop(DATASET, prop, value)
+    assert "phase: swapped\n" in report(filemove_env, lock) + "\n"
+
+
+def test_active_swap_says_wait(filemove_env: FileMoveEnv, lock: Path) -> None:
+    """With the lock held, a swap in progress says wait and gives no recovery advice."""
+    sim = swapped_env(filemove_env)
+    sim.prop(DATASET, MARK_SOURCE, DATASET)
+    with _run_lock(lock):
+        text = report(filemove_env, lock)
+    assert "phase: swapping (a run holds the lock)" in text
+    assert "next: wait for the run to finish" in text
+    assert "recovery" not in text
+
+
+def test_active_swap_with_source_name_missing(filemove_env: FileMoveEnv, lock: Path) -> None:
+    """Between the two renames the source name is missing; with the lock held that is a swap in progress."""
+    filemove_env.sim.datasets.discard(DATASET)
+    with _run_lock(lock):
+        text = report(filemove_env, lock)
+    assert "phase: swapping (a run holds the lock)" in text
+    assert "next: wait for the run to finish" in text
+    assert "recovery" not in text
 
 
 def test_already_encrypted_without_move_state(filemove_env: FileMoveEnv, lock: Path) -> None:

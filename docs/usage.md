@@ -399,8 +399,9 @@ The phase comes from state that already exists; nothing new is recorded:
 | `not started` | `STAGE/LEAF` does not exist and `DATASET` is not encrypted. |
 | `copying the tree` | `STAGE/LEAF` exists and is not yet marked `admitted`: no file was deleted yet. |
 | `moving files or finishing (file count not checked)` | `STAGE/LEAF` is marked `admitted`. |
-| `swapped` | `STAGE/LEAF` does not exist, `DATASET` is encrypted with `STAGE/old/LEAF` present, no marker property is left on it and it is mounted. |
-| `swap interrupted` | The same, but a marker property is left or `DATASET` is not mounted: the marker `zfs-encrypt-migrate:file-move` is removed first, so its absence alone proves nothing. Follow the recovery hints the run printed. |
+| `swapped` | `STAGE/LEAF` does not exist, `DATASET` is encrypted with `STAGE/old/LEAF` present and no marker property left, and it is mounted, unless `canmount` is not `on` or its mountpoint is `none` or `legacy`, which a finished move leaves unmounted. |
+| `swap interrupted` | The same, but a marker property is left, or the dataset is unmounted where a finish would have mounted it. The marker `zfs-encrypt-migrate:file-move` is removed first, so its absence alone proves nothing. Follow the recovery hints the run printed. |
+| `swapping (a run holds the lock)` | A transitional state of the swap (markers left, or `DATASET` briefly missing) while a run holds the lock: wait, give no recovery advice. |
 | `already encrypted` | `DATASET` is encrypted with no `STAGE/LEAF`, no `STAGE/old/LEAF` and no marker: no file-move state was found. |
 
 The status never lists, opens or reads anything under the source or the staged mountpoint, so it cannot hold either mount busy against the unmounts the run does.

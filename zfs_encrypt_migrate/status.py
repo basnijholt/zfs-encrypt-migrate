@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     from .zfs import Zfs
 
 _PROC_LOCKS = Path("/proc/locks")
+_NO_MOUNTPOINT = {"none", "legacy"}
 
 
 def _read_locks() -> str:
@@ -70,7 +71,9 @@ def _after_swap(zfs: Zfs, stage: str, dataset: str) -> tuple[str, list[str]]:
     if not left and not old_exists:
         return "already encrypted", ["next: already encrypted; no file-move state found"]
     # MARK_SOURCE is removed first, before canmount is restored and the dataset mounted.
-    if left or zfs.get("mounted", dataset) != "yes":
+    # Mirrors _finish: it mounts the replacement only when canmount is on and the mountpoint is real.
+    due = zfs.get("canmount", dataset) == "on" and zfs.get("mountpoint", dataset) not in _NO_MOUNTPOINT
+    if left or (due and zfs.get("mounted", dataset) != "yes"):
         return "swap interrupted", [
             (
                 "next: the swap did not finish (markers left, or the dataset is not mounted); "
@@ -92,7 +95,10 @@ def file_move_status(zfs: Zfs, stage: str, dataset: str, *, lock_path: Path = LO
     lock = _lock_state(lock_path)
     running = lock.startswith("held")
     lines = [f"file-move status of {dataset} (stage {stage})"]
+    swapping = ["phase: swapping (a run holds the lock)", f"lock: {lock}", "next: wait for the run to finish"]
     if not zfs.exists(dataset):
+        if running:
+            return [*lines, *swapping]
         lines += [
             f"{dataset}: does not exist",
             f"lock: {lock}",
@@ -127,6 +133,8 @@ def file_move_status(zfs: Zfs, stage: str, dataset: str, *, lock_path: Path = LO
         else:
             phase = "copying the tree"
             tail = ["next: rerun the same file-move command to continue; nothing was deleted yet"]
+    if running and phase == "swap interrupted":
+        return [*lines, *swapping]
     if running and (phase in {"not started", "copying the tree"} or phase.startswith("moving")):
         tail = ["next: wait; a run holds the lock and a second one would be refused"]
     lines.append(f"phase: {phase}")
