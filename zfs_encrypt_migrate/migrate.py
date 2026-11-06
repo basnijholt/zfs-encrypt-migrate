@@ -52,6 +52,9 @@ class Settings:
     min_free: int
     keyformat: str
     final_keylocation: str
+    # The operator vouches that the key file holds the passphrase they keep, so a final-key check of prompt
+    # reads that file instead of a terminal.
+    check_prompt_with_key_file: bool = False
 
 
 def leaf_of(dataset: str) -> str:

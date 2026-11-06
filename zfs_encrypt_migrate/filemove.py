@@ -424,22 +424,31 @@ def _stdin_is_terminal() -> bool:
 def _check_passphrase(zfs: Zfs, settings: Settings, staged: str) -> None:
     """Prove the final key unlocks the staged dataset before any file is deleted.
 
-    The marker records the location that was checked, so a rerun with another final location checks again.
+    The marker records the location that was checked, so a rerun with another final location checks again. Only
+    when the operator vouches for the key file is a final ``prompt`` checked against that file, never because no
+    terminal is attached. That proves the file opens the dataset, not that anyone knows the passphrase.
     """
     location = settings.final_keylocation
-    if zfs.get(MARK_KEY, staged) == location:
+    from_key_file = location == "prompt" and settings.check_prompt_with_key_file
+    check = f"file://{settings.key_file}" if from_key_file else location
+    # A passphrase typed at a terminal earlier is the stronger check, so it satisfies a run that vouches for the file.
+    if zfs.get(MARK_KEY, staged) in {location, check}:
         return
-    if location == "prompt":
+    if check == "prompt":
         if not _stdin_is_terminal():
             msg = "run file-move once from a terminal so it can check the passphrase"
-            raise MigrationError(msg)
+            hint = (
+                "or, if the key file holds the passphrase you keep, check that file instead: "
+                "rerun with --check-prompt-with-key-file"
+            )
+            raise MigrationError(msg, [hint])
         loaded = zfs.check_key(staged, "prompt", attached=True)
     else:
-        loaded = zfs.check_key(staged, location, attached=False)
+        loaded = zfs.check_key(staged, check, attached=False)
     if not loaded:
-        msg = f"the key for {staged} did not load from {location}; nothing was deleted"
+        msg = f"the key for {staged} did not load from {check}; nothing was deleted"
         raise MigrationError(msg)
-    zfs.set_prop(staged, MARK_KEY, location)
+    zfs.set_prop(staged, MARK_KEY, check)
 
 
 def _wait_for_space(zfs: Zfs, settings: Settings, needed: int, sleep: Callable[[float], None]) -> None:

@@ -865,6 +865,104 @@ def test_check_passphrase_again_for_another_location(filemove_env: FileMoveEnv, 
     assert env.sim.props[STAGED, MARK_KEY] == "file:///b"
 
 
+def test_check_passphrase_prompt_needs_terminal_names_the_key_file_check(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unattended run is told about the opt-in check against the key file; it never falls back to it."""
+    monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: False)
+    with pytest.raises(MigrationError) as info:
+        _check_passphrase(staged_env(filemove_env).zfs, settings, STAGED)
+    assert info.value.hints == (
+        (
+            "or, if the key file holds the passphrase you keep, check that file instead: "
+            "rerun with --check-prompt-with-key-file"
+        ),
+    )
+    assert not [call for call in filemove_env.runner.calls if "load-key" in call]
+
+
+def key_file_check(key_file: Path) -> tuple[str, ...]:
+    """Return the check of the final key against the key file."""
+    return ("zfs", "load-key", "-n", "-L", f"file://{key_file}", STAGED)
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_check_passphrase_prompt_with_key_file(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    key_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal: bool,  # noqa: FBT001
+) -> None:
+    """With the flag a final prompt is checked against the key file, never at the terminal, and recorded as such."""
+    monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: terminal)
+    env = staged_env(filemove_env)
+    _check_passphrase(env.zfs, replace(settings, check_prompt_with_key_file=True), STAGED)
+    assert env.runner.attached == []
+    assert [call for call in env.runner.calls if "load-key" in call] == [key_file_check(key_file)]
+    assert env.sim.props[STAGED, MARK_KEY] == f"file://{key_file}"
+
+
+def test_check_passphrase_prompt_with_key_file_wrong_key_refuses(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    key_file: Path,
+) -> None:
+    """A key file that does not open the staged dataset stops the run before anything is deleted."""
+    zfs, _ = make(staged_env(filemove_env).sim, fail_on("zfs", "load-key", "-n"))
+    with pytest.raises(MigrationError) as info:
+        _check_passphrase(zfs, replace(settings, check_prompt_with_key_file=True), STAGED)
+    assert info.value.message == f"the key for {STAGED} did not load from file://{key_file}; nothing was deleted"
+    assert (STAGED, MARK_KEY) not in filemove_env.sim.props
+
+
+@pytest.mark.parametrize("checked", ["key file", "prompt"])
+def test_check_passphrase_prompt_with_key_file_skips_when_marked(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    key_file: Path,
+    checked: str,
+) -> None:
+    """A rerun skips the check once the key file passed, and a passphrase typed at a terminal before stays recorded."""
+    marker = f"file://{key_file}" if checked == "key file" else "prompt"
+    env = staged_env(filemove_env)
+    env.sim.prop(STAGED, MARK_KEY, marker)
+    _check_passphrase(env.zfs, replace(settings, check_prompt_with_key_file=True), STAGED)
+    assert not [call for call in env.runner.calls if "load-key" in call]
+    assert env.sim.props[STAGED, MARK_KEY] == marker
+
+
+def test_check_passphrase_prompt_with_another_key_file_checks_again(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    key_file: Path,
+) -> None:
+    """Only the key file that passed counts: another one is checked before anything more is deleted."""
+    env = staged_env(filemove_env)
+    env.sim.prop(STAGED, MARK_KEY, "file:///keys/other")
+    _check_passphrase(env.zfs, replace(settings, check_prompt_with_key_file=True), STAGED)
+    assert [call for call in env.runner.calls if "load-key" in call] == [key_file_check(key_file)]
+    assert env.sim.props[STAGED, MARK_KEY] == f"file://{key_file}"
+
+
+def test_check_passphrase_prompt_after_a_key_file_check_needs_terminal(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    key_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The key file check counts only for runs that pass the flag; without it the passphrase is asked for again."""
+    monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: False)
+    env = staged_env(filemove_env)
+    env.sim.prop(STAGED, MARK_KEY, f"file://{key_file}")
+    with pytest.raises(MigrationError) as info:
+        _check_passphrase(env.zfs, settings, STAGED)
+    assert info.value.message == "run file-move once from a terminal so it can check the passphrase"
+    assert not [call for call in env.runner.calls if "load-key" in call]
+
+
 # --- move loop ---
 
 
@@ -1504,6 +1602,40 @@ def test_file_move_end_to_end(filemove_env: FileMoveEnv, settings: Settings, tmp
             ("zfs", "mount", DATASET),
         ],
     )
+
+
+@needs_rsync
+def test_file_move_unattended_ends_with_prompt(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    key_file: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a terminal, the flag checks the key file before the first delete and still ends with prompt."""
+    env = filemove_env
+    monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: False)
+    before = contents(env.src)
+
+    file_move(
+        env.zfs,
+        replace(settings, check_prompt_with_key_file=True),
+        DATASET,
+        batch_size=1,
+        delete_source=True,
+        mount_root=env.mount_root,
+        lock_path=tmp_path / "lock",
+        sleep=recorder()[1],
+    )
+
+    assert contents(staged_dir(env)) == before
+    assert env.runner.attached == []
+    assert env.sim.props[DATASET, "keylocation"] == "prompt"
+    check = ("zfs", "load-key", "-n", "-L", f"file://{key_file}", STAGED)
+    assert [call for call in env.sim.ops() if call[:3] == ("zfs", "load-key", "-n")] == [check]
+    # The move is admitted before its first delete.
+    admitted = ("zfs", "set", f"{MARK_ADMITTED}=yes", STAGED)
+    assert_in_order(env.sim.ops(), [check, admitted, ("zfs", "set", "keylocation=prompt", DATASET)])
 
 
 def test_file_move_needs_delete_source(filemove_env: FileMoveEnv, settings: Settings, tmp_path: Path) -> None:

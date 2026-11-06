@@ -141,6 +141,15 @@ FinalKeylocationOption = Annotated[
         callback=_validate_keylocation,
     ),
 ]
+# No environment variable: like --delete-source, the operator vouches for the key file on each command line.
+CheckPromptWithKeyFileOption = Annotated[
+    bool,
+    typer.Option(
+        "--check-prompt-with-key-file",
+        help="With --final-keylocation prompt, check the final key against the key file instead of at a terminal; "
+        "confirms that the key file holds the passphrase you keep",
+    ),
+]
 DatasetArgument = Annotated[str, typer.Argument(help="Dataset to migrate", callback=_validate_name, show_default=False)]
 ParentArgument = Annotated[
     str,
@@ -150,6 +159,28 @@ ChildArgument = Annotated[
     str,
     typer.Argument(help="Name of a direct child of DATASET", callback=_validate_child, show_default=False),
 ]
+
+
+def _settings(  # noqa: PLR0917
+    stage: str,
+    key_file: Path,
+    min_free: str,
+    keyformat: Keyformat,
+    final_keylocation: str,
+    check_prompt_with_key_file: bool,  # noqa: FBT001
+) -> Settings:
+    """Build the shared settings; checking against the key file is refused for a final keylocation other than prompt."""
+    if check_prompt_with_key_file and final_keylocation != "prompt":
+        msg = f"needs --final-keylocation prompt, not {final_keylocation}"
+        raise typer.BadParameter(msg, param_hint="'--check-prompt-with-key-file'")
+    return Settings(
+        stage,
+        key_file,
+        parse_size(min_free),
+        keyformat.value,
+        final_keylocation,
+        check_prompt_with_key_file=check_prompt_with_key_file,
+    )
 
 
 def _run_migration(
@@ -212,9 +243,14 @@ def seed_command(
     min_free: MinFreeOption = "1T",
     keyformat: KeyformatOption = Keyformat.passphrase,
     final_keylocation: FinalKeylocationOption = "prompt",
+    check_prompt_with_key_file: CheckPromptWithKeyFileOption = False,
 ) -> None:
     """Copy a dataset tree to an encrypted staged tree, then unload its key."""
-    _run_migration(seed, Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation), dataset)
+    _run_migration(
+        seed,
+        _settings(stage, key_file, min_free, keyformat, final_keylocation, check_prompt_with_key_file),
+        dataset,
+    )
 
 
 @app.command("catchup", rich_help_panel="Migration Commands")
@@ -226,11 +262,12 @@ def catchup_command(
     min_free: MinFreeOption = "1T",
     keyformat: KeyformatOption = Keyformat.passphrase,
     final_keylocation: FinalKeylocationOption = "prompt",
+    check_prompt_with_key_file: CheckPromptWithKeyFileOption = False,
 ) -> None:
     """Send what changed since the seed to the staged tree."""
     _run_migration(
         catchup,
-        Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation),
+        _settings(stage, key_file, min_free, keyformat, final_keylocation, check_prompt_with_key_file),
         dataset,
     )
 
@@ -244,11 +281,12 @@ def cutover_command(
     min_free: MinFreeOption = "1T",
     keyformat: KeyformatOption = Keyformat.passphrase,
     final_keylocation: FinalKeylocationOption = "prompt",
+    check_prompt_with_key_file: CheckPromptWithKeyFileOption = False,
 ) -> None:
     """Swap the staged tree into place; the original stays read-only under STAGE/old."""
     _run_migration(
         cutover,
-        Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation),
+        _settings(stage, key_file, min_free, keyformat, final_keylocation, check_prompt_with_key_file),
         dataset,
     )
 
@@ -262,11 +300,12 @@ def tree_seed_command(
     min_free: MinFreeOption = "1T",
     keyformat: KeyformatOption = Keyformat.passphrase,
     final_keylocation: FinalKeylocationOption = "prompt",
+    check_prompt_with_key_file: CheckPromptWithKeyFileOption = False,
 ) -> None:
     """Copy only the parent to an encrypted staged dataset; its children move one by one."""
     _run_migration(
         tree_seed,
-        Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation),
+        _settings(stage, key_file, min_free, keyformat, final_keylocation, check_prompt_with_key_file),
         dataset,
     )
 
@@ -281,11 +320,12 @@ def tree_move_command(
     min_free: MinFreeOption = "1T",
     keyformat: KeyformatOption = Keyformat.passphrase,
     final_keylocation: FinalKeylocationOption = "prompt",
+    check_prompt_with_key_file: CheckPromptWithKeyFileOption = False,
 ) -> None:
     """Copy one child subtree under the staged parent; the source stays until you destroy it."""
     _run_migration(
         lambda zfs, settings, parent: tree_move(zfs, settings, parent, child),
-        Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation),
+        _settings(stage, key_file, min_free, keyformat, final_keylocation, check_prompt_with_key_file),
         dataset,
     )
 
@@ -299,6 +339,7 @@ def file_move_command(
     min_free: MinFreeOption = "1T",
     keyformat: KeyformatOption = Keyformat.passphrase,
     final_keylocation: FinalKeylocationOption = "prompt",
+    check_prompt_with_key_file: CheckPromptWithKeyFileOption = False,
     batch_size: Annotated[
         str,
         typer.Option(
@@ -323,7 +364,7 @@ def file_move_command(
             batch_size=parse_size(batch_size),
             delete_source=delete_source,
         ),
-        Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation),
+        _settings(stage, key_file, min_free, keyformat, final_keylocation, check_prompt_with_key_file),
         dataset,
     )
 
@@ -337,11 +378,12 @@ def tree_finish_command(
     min_free: MinFreeOption = "1T",
     keyformat: KeyformatOption = Keyformat.passphrase,
     final_keylocation: FinalKeylocationOption = "prompt",
+    check_prompt_with_key_file: CheckPromptWithKeyFileOption = False,
 ) -> None:
     """Send the parent's last changes and swap the staged tree into place once no children remain."""
     _run_migration(
         tree_finish,
-        Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation),
+        _settings(stage, key_file, min_free, keyformat, final_keylocation, check_prompt_with_key_file),
         dataset,
     )
 

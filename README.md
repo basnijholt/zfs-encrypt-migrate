@@ -220,7 +220,8 @@ zfs-encrypt-migrate --help
 
 <!-- OUTPUT:END -->
 
-The seven migration, tree and file-move commands share these options, each with an environment variable fallback:
+The seven migration, tree and file-move commands share these options.
+Each has an environment variable fallback, except `--check-prompt-with-key-file`, which you pass on each run:
 
 ```bash
 zfs-encrypt-migrate seed --help
@@ -248,27 +249,41 @@ zfs-encrypt-migrate seed --help
 │ *    dataset      <str>  Dataset to migrate [required]                                           │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
-│ *  --stage                      <str>                 Staging dataset, e.g. tank/stage           │
-│                                                       [env var: ZFS_ENCRYPT_MIGRATE_STAGE]       │
-│                                                       [required]                                 │
-│    --key-file                   <path>                Key file for the staged tree, as an        │
-│                                                       absolute path; must have mode 600          │
-│                                                       [env var: ZFS_ENCRYPT_MIGRATE_KEY_FILE]    │
-│                                                       [default: /run/zfs-encrypt-migrate.key]    │
-│    --min-free                   SIZE                  Free space to keep on the staging pool     │
-│                                                       after the copy, e.g. 500G or 1T            │
-│                                                       [env var: ZFS_ENCRYPT_MIGRATE_MIN_FREE]    │
-│                                                       [default: 1T]                              │
-│    --keyformat                  <passphrase|hex|raw>  Key format of the key file: passphrase,    │
-│                                                       hex or raw                                 │
-│                                                       [env var: ZFS_ENCRYPT_MIGRATE_KEYFORMAT]   │
-│                                                       [default: passphrase]                      │
-│    --final-keylocation          <str>                 Keylocation set on the dataset after the   │
-│                                                       swap, e.g. prompt or file:///path          │
-│                                                       [env var:                                  │
-│                                                       ZFS_ENCRYPT_MIGRATE_FINAL_KEYLOCATION]     │
-│                                                       [default: prompt]                          │
-│    --help               -h                            Show this message and exit.                │
+│ *  --stage                               <str>                 Staging dataset, e.g. tank/stage  │
+│                                                                [env var:                         │
+│                                                                ZFS_ENCRYPT_MIGRATE_STAGE]        │
+│                                                                [required]                        │
+│    --key-file                            <path>                Key file for the staged tree, as  │
+│                                                                an absolute path; must have mode  │
+│                                                                600                               │
+│                                                                [env var:                         │
+│                                                                ZFS_ENCRYPT_MIGRATE_KEY_FILE]     │
+│                                                                [default:                         │
+│                                                                /run/zfs-encrypt-migrate.key]     │
+│    --min-free                            SIZE                  Free space to keep on the staging │
+│                                                                pool after the copy, e.g. 500G or │
+│                                                                1T                                │
+│                                                                [env var:                         │
+│                                                                ZFS_ENCRYPT_MIGRATE_MIN_FREE]     │
+│                                                                [default: 1T]                     │
+│    --keyformat                           <passphrase|hex|raw>  Key format of the key file:       │
+│                                                                passphrase, hex or raw            │
+│                                                                [env var:                         │
+│                                                                ZFS_ENCRYPT_MIGRATE_KEYFORMAT]    │
+│                                                                [default: passphrase]             │
+│    --final-keylocation                   <str>                 Keylocation set on the dataset    │
+│                                                                after the swap, e.g. prompt or    │
+│                                                                file:///path                      │
+│                                                                [env var:                         │
+│                                                                ZFS_ENCRYPT_MIGRATE_FINAL_KEYLOC… │
+│                                                                [default: prompt]                 │
+│    --check-prompt-with-key-file                                With --final-keylocation prompt,  │
+│                                                                check the final key against the   │
+│                                                                key file instead of at a          │
+│                                                                terminal; confirms that the key   │
+│                                                                file holds the passphrase you     │
+│                                                                keep                              │
+│    --help                        -h                            Show this message and exit.       │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 
 ```

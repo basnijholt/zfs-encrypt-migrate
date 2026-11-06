@@ -34,6 +34,7 @@ The seven migration, tree and file-move commands take the same options.
 | `--min-free SIZE` | `ZFS_ENCRYPT_MIGRATE_MIN_FREE` | `1T` | Free space to keep on the stage pool after the copy. |
 | `--keyformat FORMAT` | `ZFS_ENCRYPT_MIGRATE_KEYFORMAT` | `passphrase` | Key format of the key file: `passphrase`, `hex` or `raw`. |
 | `--final-keylocation LOC` | `ZFS_ENCRYPT_MIGRATE_FINAL_KEYLOCATION` | `prompt` | `keylocation` set on the dataset after the swap. |
+| `--check-prompt-with-key-file` | none | off | With `--final-keylocation prompt`, check the final key against the key file instead of at a terminal. |
 
 Encryption is always `aes-256-gcm`.
 
@@ -57,6 +58,24 @@ Plain bytes, or a number with a `K`, `M`, `G`, `T` or `P` suffix in powers of 10
 **`--final-keylocation`.**
 `prompt`, `file:///absolute/path`, or an `http://` or `https://` URL.
 It's checked up front, because `zfs` would only reject it at the very end of the swap.
+
+**`--check-prompt-with-key-file`.**
+This is for an unattended run, under systemd say, that should still end with `keylocation=prompt`.
+`file-move` checks the final key before it deletes the first file, and with `prompt` that check asks for the passphrase at a terminal.
+With this flag it runs `zfs load-key -n -L file://KEY STAGE/LEAF` instead, where `KEY` is the `--key-file`, so it needs no terminal.
+By passing it you confirm that the key file holds the passphrase you keep elsewhere.
+
+That is the trade-off: the check proves that the key file opens the encrypted dataset, not that a human knows the passphrase.
+If the key file differs from the passphrase you keep, by a typo say, the check still passes, and after a reboot the passphrase you keep won't open the dataset.
+So check it yourself while the key file still exists, before the next reboot: `zfs load-key -n -L prompt STAGE/LEAF` during the run, or `zfs load-key -n DATASET` after the swap.
+Both ask for the passphrase and only check it.
+If yours fails, the key file holds the passphrase that works: store that one instead, before you reboot.
+
+It needs `--final-keylocation prompt`; with any other location it's a usage error.
+It has no environment variable: like `--delete-source`, you pass it on each run.
+The staged dataset records the check as `file://KEY` (see [file-move](#file-move), step 6).
+Only `file-move` checks the final key.
+The other commands accept the flag and change nothing: `cutover` and `tree-finish` keep the original under `STAGE/old` and never ask for the passphrase.
 
 **Dataset names.**
 `DATASET`, `--stage` and the audit's names and pools may contain letters, digits and `_ . : -`, separated by `/`, and may not start with `-`.
@@ -294,7 +313,7 @@ It runs, in this order:
 3. Unmounts the dataset, which fails while a writer has it open, and mounts it again with `-o noatime`, so the tool's own reads never write access times. Then it checks the mount in `/proc/self/mountinfo` again, as in step 2.
 4. On the first run, creates `STAGE/LEAF` with `aes-256-gcm`, `canmount=noauto`, a private mountpoint under `/run/zfs-encrypt-migrate/` and the source's properties (`mountpoint`, `canmount`, `sharenfs`, `sharesmb`, `reservation` and `refreservation` wait until the swap). Every run loads its key and mounts it. It refuses unless the dataset is then the filesystem mounted at that mountpoint, by its device and by `/proc/self/mountinfo`.
 5. Copies the directory tree, twice: into the staged root, and into a pristine copy of the original directory attributes under `.zfs-encrypt-migrate/dirs` there.
-6. Before the first deletion, checks the final key: with `--final-keylocation prompt` it needs a terminal and runs `zfs load-key -n -L prompt STAGE/LEAF`; with another location it runs `zfs load-key -n -L LOCATION STAGE/LEAF`. The staged dataset records which location passed, so a rerun with another `--final-keylocation` checks again.
+6. Before the first deletion, checks the final key: with `--final-keylocation prompt` it needs a terminal and runs `zfs load-key -n -L prompt STAGE/LEAF`, or, with [`--check-prompt-with-key-file`](#shared-options), `zfs load-key -n -L file://KEY STAGE/LEAF` against the key file; with another location it runs `zfs load-key -n -L LOCATION STAGE/LEAF`. The staged dataset records which location passed, so a rerun with another `--final-keylocation`, or another key file, checks again. A passphrase typed at a terminal also counts for a rerun with `--check-prompt-with-key-file`, but not the other way round: a rerun without the flag asks at a terminal.
 7. Removes the partial files that an rsync stopped by a power loss or SIGKILL left in `.zfs-encrypt-migrate/tmp` of the staged dataset (nothing else there). Then repeats until no files remain. Scans the dataset, refuses if it has a snapshot, groups the names by inode, and cuts batches of at most `--batch-size`, by allocated size; each non-empty regular file counts as at least 4K, because an encrypted dataset cannot embed a tiny file in its block pointer, so its copy takes a whole sector. Once per move, after the first scan and before anything is deleted, it admits the move only if the free space above `--min-free` covers its worst case, and records that on the staged dataset (`zfs-encrypt-migrate:admitted=yes`), so reruns do not check again: the largest batch (`--batch-size`, or all the files when they take less) or, if bigger, the largest file (moving the other files first frees only what their copies take), plus the pool's block-cloned savings `bclonesaved` (a copy of a cloned file takes its full size, while deleting one reference frees nothing), plus, when the dataset's `compression` is now `off`, `logicalreferenced` minus `referenced` (old compressed data is copied uncompressed). For each batch: refuses unless the staged dataset is still the filesystem mounted at its mountpoint (after an unmount that path is a bare directory, and copies there would vanish), waits until the files without a copy yet fit above `--min-free` (`zpool sync`, up to 30 tries, 10 seconds apart; copies an earlier stopped run left need no new space), copies with `rsync -aHAXS --numeric-ids --modify-window=-1` (times compared to the nanosecond, so a copy that is off by less than a second is copied again), verifies every name against its copy (which must be on the staged dataset), runs `zpool sync`, refuses if a snapshot appeared meanwhile, and only then deletes the verified source names. It never uses `rsync --delete` or `--remove-source-files`.
 8. When only directories are left: unmounts the dataset again (refusing while it is busy), mounts it with `-o noatime`, checks the mount as in step 2 and runs `zpool sync`, so the last deletes are settled; then `zfs snapshot DATASET@enc-final`, rescan, rsync the directory attributes (restoring the original directory mtimes), unmount the dataset, `zpool sync`, and refuse if `written@enc-final` is non-zero.
 9. Removes `.zfs-encrypt-migrate` from the staged dataset and unmounts it, then swaps as `cutover` does (rename the original to `STAGE/old/LEAF`, then the staged dataset into place), and sets the source's `mountpoint`, `sharenfs`, `sharesmb`, `reservation`, `refreservation` and `canmount` on the swapped dataset, removes its marker properties and mounts it.
@@ -350,7 +369,7 @@ From the final unmount of step 8 on, the hints remount with `zfs mount -a` inste
 | `STAGE/old/LEAF already exists` | Destroy or rename the old copy of an earlier migration. |
 | `cannot unmount DATASET; a writer is probably still running` | Stop the writer and rerun. |
 | `PATH is not where DATASET is mounted (nothing is mounted there)` (or `(SOURCE of type TYPE is mounted there)`) | PATH, the mountpoint `zfs get` gives, is not where the kernel mounted DATASET (the dataset, or `STAGE/LEAF`). Usually the mountpoint ends in a space, which `zfs get` strips; `findmnt --source DATASET` shows where it is mounted. Set a mountpoint without the space, and rerun. |
-| `run file-move once from a terminal so it can check the passphrase` | Run it from a terminal (tmux), or pass `--final-keylocation file:///absolute/path`. |
+| `run file-move once from a terminal so it can check the passphrase` | Run it from a terminal (tmux). Or, if the key file holds the passphrase you keep, pass `--check-prompt-with-key-file`, which checks the key file instead. Or pass `--final-keylocation file:///absolute/path`. |
 | `the key for STAGE/LEAF did not load from LOCATION; nothing was deleted` | Fix the key or location; the first mistyped passphrase deletes nothing. |
 | `DATASET has snapshots, which keep deleted files allocated: ...` | Disable snapshot tools for the dataset, then destroy the snapshots it lists (`zfs destroy SNAPSHOT`). |
 | `PATH has N hard links but only M were found` | The dataset changed during the scan: a writer added or removed a link. Stop the writers and rerun. |
@@ -414,7 +433,7 @@ When a `zfs` or `zpool` command fails, the message is the command followed by `f
 | --- | --- |
 | `0` | Success; for `audit`, nothing unencrypted outside the allowlists. |
 | `1` | A refusal or a failed `zfs` command; for `audit`, an unencrypted dataset or a pool it couldn't list. |
-| `2` | Usage error: a missing `--stage`, an invalid name, size or keylocation, or no pool for `audit`. |
+| `2` | Usage error: a missing `--stage`, an invalid name, size or keylocation, `--check-prompt-with-key-file` without `--final-keylocation prompt`, or no pool for `audit`. |
 | `130` | A migration, tree or file-move command interrupted by Ctrl-C, SIGTERM or SIGHUP. `audit` has nothing to clean up: Ctrl-C ends it with 1, and SIGTERM or SIGHUP end it like any other process. |
 
 ## Recovery Hints
