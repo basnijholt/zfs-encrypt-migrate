@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import signal
@@ -13,12 +14,13 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
-from zfs_encrypt_migrate import cli
+from zfs_encrypt_migrate import cli, filemove
 from zfs_encrypt_migrate.constants import COMMAND_STARTUP_ERROR_RETURNCODE
 from zfs_encrypt_migrate.filemove import _probe_writers
 from zfs_encrypt_migrate.process import SubprocessRunner
 
 from .conftest import FakeRunner, fail, ok
+from .fakeproc import FakeProc
 from .zfs_sim import ZfsSim, staged_ready
 
 if TYPE_CHECKING:
@@ -27,6 +29,8 @@ if TYPE_CHECKING:
     from zfs_encrypt_migrate.migrate import Settings
     from zfs_encrypt_migrate.process import CommandResult
     from zfs_encrypt_migrate.zfs import Zfs
+
+    from .conftest import FileMoveEnv
 
 runner = CliRunner()
 # Rich styles the help whenever it believes it writes to a terminal, as it does on GitHub Actions.
@@ -520,7 +524,7 @@ def test_file_move_help_lists_options() -> None:
     listing = runner.invoke(cli.app, ["--help"])
 
     assert result.exit_code == 0
-    for text in ("--batch-size", "--delete-source", "Target size of each batch"):
+    for text in ("--batch-size", "--delete-source", "Target size of each batch", "Only report what would stop"):
         assert text in plain(result.output)
     assert "File-Move Commands" in plain(listing.output)
 
@@ -679,3 +683,85 @@ def test_check_prompt_with_key_file_is_a_file_move_flag_without_env_var() -> Non
     }
 
     assert envvars == {"file-move": None}
+
+
+# --- file-move --check ---
+
+
+@pytest.fixture
+def checked(filemove_env: FileMoveEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key_file: Path) -> FileMoveEnv:
+    """Route the CLI to the file-move environment, with a fake /proc and a private lock, never the host's."""
+    proc = FakeProc(tmp_path / "proc", filemove_env.sim.mountinfo().decode())
+    monkeypatch.setattr(cli, "_runner", lambda: filemove_env.runner)
+    monkeypatch.setattr(
+        cli,
+        "check_file_move",
+        functools.partial(filemove.check_file_move, proc=proc.root, lock_path=tmp_path / "lock"),
+    )
+    monkeypatch.setenv("ZFS_ENCRYPT_MIGRATE_KEY_FILE", str(key_file))
+    monkeypatch.setenv("ZFS_ENCRYPT_MIGRATE_MIN_FREE", "1000")
+    monkeypatch.setenv("ZFS_ENCRYPT_MIGRATE_STAGE", "tank/stage")
+    return filemove_env
+
+
+def test_file_move_check_lists_problems_and_notes_and_exits_1(checked: FileMoveEnv) -> None:
+    """Each problem with its fix, then the notes, without --delete-source; exit 1 as the run would refuse."""
+    checked.sim.prop("tank/media", "readonly", "on")
+    checked.sim.pool_props["tank", "checkpoint"] = "1052672"
+    checked.sim.quotas["tank/media", "user"] = [("1000", "1073741824", "none")]
+
+    result = runner.invoke(cli.app, ["file-move", "--check", "tank/media"])
+
+    assert result.exit_code == 1, result.output
+    assert result.stdout == (
+        "problem: tank/media is read-only; file-move must delete its files\n"
+        "  zfs set readonly=off tank/media\n"
+        "problem: pool tank has a checkpoint, which keeps deleted space allocated; discard it first: "
+        "zpool checkpoint -d tank\n"
+        "note: tank/media has per-user, per-group or per-project quotas, which file-move does not carry over\n"
+        "  set them again after the swap:\n"
+        "    zfs set userquota@1000=1073741824 tank/media\n"
+        "2 problems would stop file-move; fix them, then check again\n"
+    )
+    assert checked.sim.ops() == []
+
+
+def test_file_move_check_with_one_problem_says_so(checked: FileMoveEnv) -> None:
+    """The summary counts in the singular too."""
+    checked.sim.prop("tank/media", "mounted", "no")
+
+    result = runner.invoke(cli.app, ["file-move", "--check", "tank/media"])
+
+    assert result.exit_code == 1
+    assert result.stdout.splitlines()[-1] == "1 problem would stop file-move; fix it, then check again"
+
+
+def test_file_move_check_with_notes_only_exits_0(checked: FileMoveEnv) -> None:
+    """Notes need doing, but would not stop the run; with --delete-source it still only checks."""
+    checked.sim.quotas["tank/media", "group"] = [("100", "none", "5000")]
+
+    result = runner.invoke(cli.app, ["file-move", "--check", "--delete-source", "tank/media"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout == (
+        "note: tank/media has per-user, per-group or per-project quotas, which file-move does not carry over\n"
+        "  set them again after the swap:\n"
+        "    zfs set groupobjquota@100=5000 tank/media\n"
+        "nothing found that would stop file-move; the run still unmounts tank/media first and refuses if a writer "
+        "holds it\n"
+    )
+    assert checked.sim.ops() == []
+    assert not [call for call in checked.runner.calls if call[0] == "rsync"]
+
+
+def test_file_move_check_zfs_failure_is_one_error_line(checked: FileMoveEnv, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A zfs that cannot run ends the check with its error, never a clean result."""
+    broken = FakeRunner(lambda _args: fail("No such file or directory: 'zfs'\n", COMMAND_STARTUP_ERROR_RETURNCODE))
+    monkeypatch.setattr(cli, "_runner", lambda: broken)
+
+    result = runner.invoke(cli.app, ["file-move", "--check", "tank/media"])
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "error: zfs list -H -o name tank/media failed" in result.stderr
+    assert checked.sim.ops() == []

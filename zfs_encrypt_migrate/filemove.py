@@ -8,6 +8,7 @@ import os
 import shlex
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -55,11 +56,12 @@ from .migrate import (
     swap_into_place,
 )
 from .output import console
+from .preflight import PROC, holders, pinned_files, quota_notes
 from .props import create_props, fixups
 from .sizes import format_duration, format_size
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Mapping, Sequence
+    from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 
     from .filetree import Group
     from .migrate import AbortGuard, Settings
@@ -75,9 +77,12 @@ def _run_lock(path: Path) -> Iterator[None]:
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            msg = f"another file-move is running (lock {path})"
-            raise MigrationError(msg) from None
+            raise MigrationError(_running(path)) from None
         yield
+
+
+def _running(path: Path) -> str:
+    return f"another file-move is running (lock {path})"
 
 
 def _refuse_mounted_elsewhere(path: Path, dataset: str) -> None:
@@ -92,43 +97,78 @@ def _refuse_mounted_elsewhere(path: Path, dataset: str) -> None:
         raise MigrationError(msg)
 
 
-def _refuse_source(zfs: Zfs, dataset: str) -> Path:
-    """Refuse a source dataset file-move cannot handle; return its mountpoint."""
+def _caught(check: Callable[[], object]) -> MigrationError | None:
+    """Return the refusal ``check`` raises, or None; a failed zfs command is no refusal, so it propagates."""
+    try:
+        check()
+    except MigrationError as exc:
+        if isinstance(exc, ZfsError):
+            raise
+        return exc
+    return None
+
+
+def _hinted(problem: MigrationError, *hints: str) -> MigrationError:
+    """Add the hints that say how to fix ``problem``."""
+    problem.hints = (*problem.hints, *hints)
+    return problem
+
+
+def _movable_problems(zfs: Zfs, dataset: str) -> Generator[MigrationError, None, bool]:
+    """Yield why ``dataset`` cannot be file-moved at all; return whether it can."""
     if not zfs.exists(dataset):
-        msg = f"dataset {dataset} does not exist"
-        raise MigrationError(msg)
+        yield MigrationError(f"dataset {dataset} does not exist", ["check the name with: zfs list"])
+        return False
     if zfs.get("type", dataset) == "volume":
-        msg = f"{dataset} is a volume; file-move moves the files of a filesystem"
-        raise MigrationError(msg)
-    if zfs.children(dataset):
-        msg = f"{dataset} has child datasets; use the tree commands, or file-move each child"
-        raise MigrationError(msg)
+        yield MigrationError(
+            f"{dataset} is a volume; file-move moves the files of a filesystem",
+            ["use seed and cutover"],
+        )
+        return False
     if zfs.get("encryption", dataset) != "off":
-        msg = f"{dataset} is already encrypted"
-        raise MigrationError(msg)
+        yield MigrationError(f"{dataset} is already encrypted", ["nothing to do"])
+        return False
+    return True
+
+
+def _source_problems(zfs: Zfs, dataset: str) -> Generator[MigrationError, None, Path | None]:
+    """Yield what makes the source unfit for file-move; return its mountpoint once it is safe to read there."""
+    if zfs.children(dataset):
+        yield MigrationError(f"{dataset} has child datasets; use the tree commands, or file-move each child")
     if zfs.get("readonly", dataset) == "on":
-        msg = f"{dataset} is read-only; file-move must delete its files"
-        raise MigrationError(msg)
+        yield MigrationError(
+            f"{dataset} is read-only; file-move must delete its files",
+            [f"zfs set readonly=off {dataset}"],
+        )
     mountpoint = zfs.get("mountpoint", dataset)
     if mountpoint in _NO_MOUNTPOINT:
-        msg = f"{dataset} has mountpoint {mountpoint}; file-move needs a mounted path"
-        raise MigrationError(msg)
+        yield MigrationError(
+            f"{dataset} has mountpoint {mountpoint}; file-move needs a mounted path",
+            [f"give it a mountpoint: zfs set mountpoint=PATH {dataset}"],
+        )
+        return None
     if zfs.get("mounted", dataset) != "yes":
-        msg = f"{dataset} is not mounted"
-        raise MigrationError(msg)
+        yield MigrationError(f"{dataset} is not mounted", [f"zfs mount {dataset}"])
+        return None
+    path = Path(mountpoint)
     # Before anything reads the path: it may be another directory, or none at all.
-    _refuse_mounted_elsewhere(Path(mountpoint), dataset)
-    reserved = Path(mountpoint) / SCRATCH
+    if problem := _caught(lambda: _refuse_mounted_elsewhere(path, dataset)):
+        yield _hinted(
+            problem,
+            f"findmnt --source {dataset} shows where it is mounted; give it a mountpoint without leading or "
+            "trailing spaces",
+        )
+        return None
+    reserved = path / SCRATCH
     # The staged copy keeps its scratch files under this name, so the source must not use it, not even as a
     # dangling symlink.
     if os.path.lexists(reserved):
-        msg = f"{reserved} exists; file-move needs that name for its own files"
-        raise MigrationError(msg)
-    return Path(mountpoint)
+        yield MigrationError(f"{reserved} exists; file-move needs that name for its own files", ["rename it"])
+    return path
 
 
-def _refuse_keys_inside(settings: Settings, dataset: str, source: Path) -> None:
-    """Refuse a key file inside the source: a batch would move it into the dataset that needs it to unlock."""
+def _keys_inside_problems(settings: Settings, dataset: str, source: Path) -> Iterator[MigrationError]:
+    """Yield each key file inside the source: a batch would move it into the dataset that needs it to unlock."""
     keys = [("key file", settings.key_file)]
     scheme, _, path = settings.final_keylocation.partition("://")
     if scheme == "file":
@@ -140,12 +180,13 @@ def _refuse_keys_inside(settings: Settings, dataset: str, source: Path) -> None:
         # the mountpoint that reaches the dataset, through a bind mount; a file not there yet has none.
         on_device = device is not None and device_of(key) == device
         if key.resolve().is_relative_to(root) or on_device:
-            msg = f"{label} {key} is inside {dataset}, which file-move empties; keep the key outside the dataset"
-            raise MigrationError(msg)
+            yield MigrationError(
+                f"{label} {key} is inside {dataset}, which file-move empties; keep the key outside the dataset",
+            )
 
 
-def _refuse_pinned_space(zfs: Zfs, settings: Settings, dataset: str) -> None:
-    """Refuse when deleting the source's files would not free their space: the move would stall half-way."""
+def _pinned_space_problems(zfs: Zfs, settings: Settings, dataset: str) -> Iterator[MigrationError]:
+    """Yield what keeps deleted files from freeing their space: the move would stall half-way."""
     parts = dataset.split("/")
     for depth in range(len(parts) - 1, 0, -1):
         ancestor = "/".join(parts[:depth])
@@ -155,33 +196,29 @@ def _refuse_pinned_space(zfs: Zfs, settings: Settings, dataset: str) -> None:
         # A refreservation covers only the ancestor's own data, not what its descendants free.
         value = zfs.get("reservation", ancestor)
         if value not in {"none", "0"}:
-            msg = (
+            yield MigrationError(
                 f"{ancestor} has reservation={value}, which keeps space freed in {dataset} reserved; clear it with: "
-                f"zfs set reservation=none {ancestor} (set it again after the move)"
+                f"zfs set reservation=none {ancestor} (set it again after the move)",
             )
-            raise MigrationError(msg)
     for prop in ("reservation", "refreservation"):
         value = zfs.get(prop, dataset)
         if value not in {"none", "0"}:
-            msg = (
+            yield MigrationError(
                 f"{dataset} has {prop}={value}, which keeps deleted space reserved; clear it with: "
-                f"zfs set {prop}=none {dataset} (set it again on the new dataset after the move)"
+                f"zfs set {prop}=none {dataset} (set it again on the new dataset after the move)",
             )
-            raise MigrationError(msg)
     origin = zfs.get("origin", dataset)
     if origin != "-":
-        msg = (
+        yield MigrationError(
             f"{dataset} is a clone of {origin}; its origin keeps the space of deleted files; "
-            f"promote it first: zfs promote {dataset}"
+            f"promote it first: zfs promote {dataset}",
         )
-        raise MigrationError(msg)
     pool = pool_of(dataset)
     if zfs.pool_get("checkpoint", pool) != "-":
-        msg = (
+        yield MigrationError(
             f"pool {pool} has a checkpoint, which keeps deleted space allocated; "
-            f"discard it first: zpool checkpoint -d {pool}"
+            f"discard it first: zpool checkpoint -d {pool}",
         )
-        raise MigrationError(msg)
 
 
 def _pool_number(zfs: Zfs, pool: str, prop: str) -> int | None:
@@ -195,88 +232,139 @@ def _pool_number(zfs: Zfs, pool: str, prop: str) -> int | None:
     return int(value) if value.isdigit() else 0
 
 
-def _refuse_dedup(zfs: Zfs, dataset: str) -> None:
-    """Refuse deduplicated data: deleting a file frees nothing while another reference to its blocks remains."""
+def _dedup_problems(zfs: Zfs, dataset: str) -> Iterator[MigrationError]:
+    """Yield deduplicated data: deleting a file frees nothing while another reference to its blocks remains."""
     value = zfs.get("dedup", dataset)
     if value != "off":
-        msg = (
+        yield MigrationError(
             f"{dataset} has dedup={value}; deleting deduplicated files frees no space, so file-move cannot run; "
-            "see the docs"
+            "see the docs",
         )
-        raise MigrationError(msg)
     pool = pool_of(dataset)
     # Blocks written while dedup was on stay shared after it is off. dedupratio rounds a little deduplication
     # down to 1.00x, so the dedup table's size (OpenZFS 2.3 and later) says it first.
     table = _pool_number(zfs, pool, "dedup_table_size")
     if table:
-        msg = (
+        yield MigrationError(
             f"pool {pool} has a dedup table ({format_size(table)}); deduplicated blocks shared with {dataset} would "
-            "not be freed, so file-move cannot run; see the docs"
+            "not be freed, so file-move cannot run; see the docs",
         )
-        raise MigrationError(msg)
     if table is not None:
         return
     # zpool get -p prints the ratio without its x.
     ratio = zfs.pool_get("dedupratio", pool).removesuffix("x")
     if float(ratio) > 1:
-        msg = (
+        yield MigrationError(
             f"pool {pool} has dedupratio {ratio}x; deduplicated blocks shared with {dataset} would not be freed, "
-            "so file-move cannot run; see the docs"
+            "so file-move cannot run; see the docs",
         )
-        raise MigrationError(msg)
 
 
-def _refuse_other_stage(zfs: Zfs, dataset: str) -> None:
-    """Refuse a first run while another stage holds a file-move of ``dataset``.
+def _other_stage_problems(zfs: Zfs, dataset: str) -> Iterator[MigrationError]:
+    """Yield, on a first run, each other stage that holds a file-move of ``dataset``.
 
     Its files are split between the source and that staged dataset; a second staged dataset would get only
     the rest, and its swap would finish with half the files.
     """
     for name, value in zfs.local_values(MARK_SOURCE, pool_of(dataset)):
         if value == dataset:
-            msg = f"{name} already holds a file-move of {dataset}; rerun with --stage {name.rsplit('/', 1)[0]}"
-            raise MigrationError(msg)
+            yield MigrationError(
+                f"{name} already holds a file-move of {dataset}; rerun with --stage {name.rsplit('/', 1)[0]}",
+            )
 
 
-def _preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
-    """Refuse unless the run can start or resume; return the source mountpoint. Writes nothing."""
-    check_key_file(settings)
-    if "/" not in dataset:
-        msg = f"{dataset} is a pool root; file-move is not supported"
-        raise MigrationError(msg)
-    refuse_cross_pool(settings, dataset, "file-move")
-    refuse_nested(settings, dataset)
-    source = _refuse_source(zfs, dataset)
-    _refuse_keys_inside(settings, dataset, source)
-    # zfs get mountpoint includes the altroot, so the swap's fix-up would store it in the mountpoint.
-    pool = pool_of(dataset)
-    altroot = zfs.pool_get("altroot", pool)
-    if altroot != "-":
-        msg = f"pool {pool} is imported with altroot={altroot}; file-move needs a normal import"
-        raise MigrationError(msg)
-    _refuse_pinned_space(zfs, settings, dataset)
+def _snapshot_problems(zfs: Zfs, dataset: str, source: Path) -> Iterator[MigrationError]:
+    """Yield the snapshots of the source while files are left to move, which they would keep allocated.
+
+    Here as well as before each batch, so a snapshot stops the run before anything is written. Only while files are
+    left: then a snapshot pins nothing, and a rerun after a refused swap keeps its renamed enc-final.
+    """
+    if not zfs.snapshots(dataset):
+        return
+    try:
+        left = scan(source)
+    except MigrationError as exc:
+        yield exc
+        return
+    if left and (problem := _caught(lambda: _refuse_snapshots(zfs, dataset))):
+        yield problem
+
+
+def _stage_problems(zfs: Zfs, settings: Settings, dataset: str, source: Path | None) -> Iterator[MigrationError]:
+    """Yield what about the stage, or the state of this move, keeps the run from starting or resuming."""
     stage = settings.stage
     staged = f"{stage}/{leaf_of(dataset)}"
     staged_exists = zfs.exists(staged)
     # Checked once, before anything is created or deleted: a later run sees the space the earlier ones used.
     if not staged_exists:
-        _refuse_dedup(zfs, dataset)
-        _refuse_other_stage(zfs, dataset)
-    # Here as well as before each batch, so a snapshot stops the run before anything is written. Only while
-    # files are left: then a snapshot pins nothing, and a rerun after a refused swap keeps its renamed enc-final.
-    if zfs.snapshots(dataset) and scan(source):
-        _refuse_snapshots(zfs, dataset)
+        yield from _dedup_problems(zfs, dataset)
+        yield from _other_stage_problems(zfs, dataset)
+    if source is not None:
+        yield from _snapshot_problems(zfs, dataset, source)
     if staged_exists and zfs.get(MARK_SOURCE, staged) != dataset:
-        msg = f"{staged} exists and is not a file-move of {dataset}"
-        raise MigrationError(msg)
+        yield MigrationError(
+            f"{staged} exists and is not a file-move of {dataset}",
+            ["finish or clear the migration that owns it first"],
+        )
     if [name for name in in_flight(zfs, settings) if name != staged]:
-        msg = f"a migration is already in flight under {stage}"
-        raise MigrationError(msg)
+        yield MigrationError(
+            f"a migration is already in flight under {stage}",
+            [f"finish the migration under {stage} first"],
+        )
     old = f"{stage}/old/{leaf_of(dataset)}"
     if not staged_exists and zfs.exists(old):
-        msg = f"{old} already exists"
-        raise MigrationError(msg)
+        yield MigrationError(
+            f"{old} already exists",
+            [f"destroy it once you no longer need it (zfs destroy -r {old}), or rename it"],
+        )
+
+
+def _preflight_problems(zfs: Zfs, settings: Settings, dataset: str) -> Generator[MigrationError, None, Path | None]:
+    """Yield every reason the run cannot start or resume, in the order the run refuses them. Writes nothing.
+
+    Return the source mountpoint, or None when nothing there may be read: the dataset cannot be moved at all, or the
+    path is not its own mount. A check that means nothing once an earlier one failed is skipped.
+    """
+    key = settings.key_file
+    if problem := _caught(lambda: check_key_file(settings)):
+        yield _hinted(problem, f"chmod 600 {key}" if key.is_file() else "write the passphrase into it, with mode 600")
+    if "/" not in dataset:
+        yield MigrationError(
+            f"{dataset} is a pool root; file-move is not supported",
+            ["a pool root cannot be swapped; see Rebuilding a Whole Pool Encrypted in the guides"],
+        )
+        return None
+    if problem := _caught(lambda: refuse_cross_pool(settings, dataset, "file-move")):
+        yield _hinted(problem, f"use a stage on pool {pool_of(dataset)}")
+    if problem := _caught(lambda: refuse_nested(settings, dataset)):
+        yield _hinted(problem, f"use a stage that does not overlap {dataset}")
+    if not (yield from _movable_problems(zfs, dataset)):
+        return None
+    source = yield from _source_problems(zfs, dataset)
+    if source is not None:
+        yield from _keys_inside_problems(settings, dataset, source)
+    # zfs get mountpoint includes the altroot, so the swap's fix-up would store it in the mountpoint.
+    pool = pool_of(dataset)
+    altroot = zfs.pool_get("altroot", pool)
+    if altroot != "-":
+        yield MigrationError(
+            f"pool {pool} is imported with altroot={altroot}; file-move needs a normal import",
+            [f"export the pool and import it without -R: zpool export {pool}, then zpool import {pool}"],
+        )
+    yield from _pinned_space_problems(zfs, settings, dataset)
+    yield from _stage_problems(zfs, settings, dataset, source)
     return source
+
+
+def _preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
+    """Refuse unless the run can start or resume; return the source mountpoint. Writes nothing."""
+    problems = _preflight_problems(zfs, settings, dataset)
+    try:
+        problem = next(problems)
+    except StopIteration as done:
+        source: Path = done.value
+        return source
+    raise problem
 
 
 def _probe_writers(zfs: Zfs, dataset: str, path: Path) -> dict[str, Prop]:
@@ -495,6 +583,42 @@ def _refuse_snapshots(zfs: Zfs, dataset: str) -> None:
         raise MigrationError(msg, hints)
 
 
+def _admission_shortfall(
+    zfs: Zfs,
+    settings: Settings,
+    dataset: str,
+    groups: Sequence[Group],
+    batch_size: int,
+) -> str | None:
+    """Return why free space does not cover the worst case of the move, or None when it does. Reads only.
+
+    The worst case adds up:
+
+    - the largest batch, which never holds more than all the files, or the largest file when that is bigger:
+      moving the other files first frees only what their copies take, so it never gets more room than it has
+      now;
+    - the pool's block-cloned savings (``bclonesaved``, before OpenZFS 2.2 none): deleting one reference to a
+      cloned block frees nothing while another remains, and the copy takes the full size;
+    - with compression now off, what compressed data grows by when copied: logicalreferenced - referenced.
+    """
+    pool = pool_of(dataset)
+    total = sum(group.allocated for group in groups)
+    largest = max(min(batch_size, total), *(group.allocated for group in groups))
+    saved = _pool_number(zfs, pool, "bclonesaved") or 0
+    loss = 0
+    if zfs.get("compression", dataset) == "off":
+        loss = max(int(zfs.get("logicalreferenced", dataset)) - int(zfs.get("referenced", dataset)), 0)
+    need = largest + saved + loss
+    budget = zfs.pool_avail(pool) - settings.min_free
+    if budget >= need:
+        return None
+    return (
+        f"free space on {pool} above the floor ({format_size(max(budget, 0))}) does not cover the worst case of "
+        f"this move ({format_size(need)}: largest batch or file {format_size(largest)}, block-cloned data "
+        f"{format_size(saved)}, lost compression {format_size(loss)})"
+    )
+
+
 def _admit(
     zfs: Zfs,
     settings: Settings,
@@ -505,35 +629,15 @@ def _admit(
     """Refuse, before the move copies or deletes any file, unless free space covers its worst case; mark it admitted.
 
     Checked once per move: copies a stopped run left behind use the space counted here, so a rerun after the
-    marker is set does not check again. The worst case adds up:
-
-    - the largest batch, which never holds more than all the files, or the largest file when that is bigger:
-      moving the other files first frees only what their copies take, so it never gets more room than it has
-      now;
-    - the pool's block-cloned savings (``bclonesaved``, before OpenZFS 2.2 none): deleting one reference to a
-      cloned block frees nothing while another remains, and the copy takes the full size;
-    - with compression now off, what compressed data grows by when copied: logicalreferenced - referenced.
+    marker is set does not check again.
     """
     staged = f"{settings.stage}/{leaf_of(dataset)}"
     if zfs.get(MARK_ADMITTED, staged) == "yes":
         return
-    pool = pool_of(dataset)
-    total = sum(group.allocated for group in groups)
-    largest = max(min(batch_size, total), *(group.allocated for group in groups))
-    saved = _pool_number(zfs, pool, "bclonesaved") or 0
-    loss = 0
-    if zfs.get("compression", dataset) == "off":
-        loss = max(int(zfs.get("logicalreferenced", dataset)) - int(zfs.get("referenced", dataset)), 0)
-    need = largest + saved + loss
-    budget = zfs.pool_avail(pool) - settings.min_free
-    if budget < need:
-        msg = (
-            f"free space on {pool} above the floor ({format_size(max(budget, 0))}) does not cover the worst case of "
-            f"this move ({format_size(need)}: largest batch or file {format_size(largest)}, block-cloned data "
-            f"{format_size(saved)}, lost compression {format_size(loss)})"
-        )
+    shortfall = _admission_shortfall(zfs, settings, dataset, groups, batch_size)
+    if shortfall is not None:
         hint = f"nothing was deleted; to give up, remove the staged dataset: zfs destroy -r {staged}"
-        raise MigrationError(msg, [hint])
+        raise MigrationError(shortfall, [hint])
     zfs.set_prop(staged, MARK_ADMITTED, "yes")
 
 
@@ -801,3 +905,99 @@ def file_move(
                 guard=guard,
             )
             return _finish(zfs, settings, dataset, src, dst, guard)
+
+
+@dataclass(frozen=True)
+class CheckReport:
+    """What ``file-move --check`` found: problems that would make the run refuse or stall, and notes that would not."""
+
+    problems: list[MigrationError]
+    notes: list[MigrationError]
+
+
+@contextlib.contextmanager
+def _lock_shared(path: Path) -> Iterator[bool]:
+    """Share the run lock while the check reads, so no run starts meanwhile; yield whether a run holds it.
+
+    Never creates the lock file: without one, no run has started since boot.
+    """
+    if not path.exists():
+        yield False
+        return
+    with path.open("rb") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            running = True
+        else:
+            running = False
+        yield running
+
+
+def _gather(problems: Generator[MigrationError, None, Path | None], found: list[MigrationError]) -> Path | None:
+    """Add every one of ``problems`` to ``found``; return the source mountpoint they end with."""
+    while True:
+        try:
+            found.append(next(problems))
+        except StopIteration as done:
+            source: Path | None = done.value
+            return source
+
+
+def _admission_problems(
+    zfs: Zfs,
+    settings: Settings,
+    dataset: str,
+    source: Path,
+    batch_size: int,
+) -> list[MigrationError]:
+    """Return the refusal of the free-space admission, which the run reaches only after it created the staged copy."""
+    staged = f"{settings.stage}/{leaf_of(dataset)}"
+    if zfs.exists(staged) and zfs.get(MARK_ADMITTED, staged) == "yes":
+        return []
+    try:
+        groups = group_by_inode(scan(source), source)
+    except MigrationError as exc:
+        return [exc]
+    shortfall = _admission_shortfall(zfs, settings, dataset, groups, batch_size) if groups else None
+    if shortfall is None:
+        return []
+    pool = pool_of(dataset)
+    hint = (
+        f"free space on {pool}, lower --batch-size if the largest batch is the biggest term, or remove clones you no "
+        f"longer need (zpool get bcloneused,bclonesaved {pool})"
+    )
+    return [MigrationError(shortfall, [hint])]
+
+
+def check_file_move(
+    zfs: Zfs,
+    settings: Settings,
+    dataset: str,
+    *,
+    batch_size: int,
+    proc: Path = PROC,
+    lock_path: Path = LOCK_FILE,
+) -> CheckReport:
+    """Report everything that would make file-move refuse or stall, all at once, and change nothing.
+
+    It runs the run's own checks without stopping at the first, then what the run finds only once it is under way:
+    the free-space admission, files it cannot delete, and whatever keeps the dataset in use or mounted, in any mount
+    namespace (read from ``proc``). It does not unmount the dataset, as the run does to prove that no writer has it
+    open. It holds ``lock_path`` shared while it reads, so no run starts meanwhile, and reads nothing while a run
+    holds it.
+    """
+    with _lock_shared(lock_path) as running:
+        if running:
+            return CheckReport([MigrationError(_running(lock_path), ["check again once it has stopped"])], [])
+        problems: list[MigrationError] = []
+        notes: list[MigrationError] = []
+        source = _gather(_preflight_problems(zfs, settings, dataset), problems)
+        if source is not None:
+            problems += _admission_problems(zfs, settings, dataset, source, batch_size)
+            problems += pinned_files(source, dataset)
+            problems += holders(proc, dataset, source)
+            notes += quota_notes(zfs, dataset, source)
+    # The snapshot check and the admission both scan, so a refusal of the scan comes up twice.
+    unique = {problem.message: problem for problem in problems}
+    return CheckReport(list(unique.values()), notes)

@@ -11,7 +11,7 @@ import typer
 
 from .audit import find_unencrypted
 from .errors import Interrupted, MigrationError
-from .filemove import file_move
+from .filemove import CheckReport, check_file_move, file_move
 from .migrate import INTERRUPT_SIGNALS, Settings, catchup, cutover, seed
 from .output import console, print_error
 from .process import CommandRunner, SubprocessRunner
@@ -196,6 +196,36 @@ def _refuse_unanswerable_prompt(final_keylocation: str, keyformat: Keyformat) ->
         raise typer.BadParameter(msg, param_hint="'--check-prompt-with-key-file'")
 
 
+def _say(line: str) -> None:
+    console.print(line, markup=False, highlight=False, soft_wrap=True)
+
+
+def _report_check(dataset: str, check: Callable[[Zfs], CheckReport]) -> None:
+    """Print each problem and note with its fixes, then a summary; exit 1 when anything would stop the run."""
+    try:
+        report = check(Zfs(_runner()))
+    except MigrationError as error:
+        print_error(error.message, error.hints)
+        raise typer.Exit(1) from error
+    for label, findings in (("problem", report.problems), ("note", report.notes)):
+        for finding in findings:
+            _say(f"{label}: {finding.message}")
+            for hint in finding.hints:
+                _say(f"  {hint}")
+    count = len(report.problems)
+    if count == 1:
+        _say("1 problem would stop file-move; fix it, then check again")
+    elif count:
+        _say(f"{count} problems would stop file-move; fix them, then check again")
+    else:
+        _say(
+            f"nothing found that would stop file-move; the run still unmounts {dataset} first and refuses if a "
+            "writer holds it",
+        )
+    if count:
+        raise typer.Exit(1)
+
+
 def _validate_names(values: list[str] | None) -> list[str] | None:
     return None if values is None else [validate_name(value) for value in values]
 
@@ -333,10 +363,21 @@ def file_move_command(
             "terminal; confirms that the key file holds the passphrase you keep",
         ),
     ] = False,
+    check: Annotated[
+        bool,
+        typer.Option(
+            "--check",
+            help="Only report what would stop file-move, every problem at once with its fix; change nothing",
+        ),
+    ] = False,
 ) -> None:
     """Move a dataset's files in verified batches into an encrypted dataset, then swap it into place."""
     if check_prompt_with_key_file:
         _refuse_unanswerable_prompt(final_keylocation, keyformat)
+    if check:
+        settings = Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation)
+        _report_check(dataset, lambda zfs: check_file_move(zfs, settings, dataset, batch_size=parse_size(batch_size)))
+        return
     _run_migration(
         lambda zfs, settings, name: file_move(
             zfs,
