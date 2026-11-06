@@ -87,7 +87,8 @@ class ZfsSim:
             return self.snapshots[name]
         if prop == "type":
             return "volume" if name in self.volumes else "filesystem"
-        return self.props.get((name, prop), DEFAULTS.get(prop, "0"))
+        # Like zfs, a user property that was never set reads as "-".
+        return self.props.get((name, prop), "-" if ":" in prop else DEFAULTS.get(prop, "0"))
 
     def _get_all(self, name: str) -> str:
         """Answer ``zfs get -H -p -o property,value,source all``: local, inherited, then default properties."""

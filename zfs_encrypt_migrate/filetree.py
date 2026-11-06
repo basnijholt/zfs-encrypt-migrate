@@ -82,6 +82,51 @@ def scan(root: Path) -> list[_Entry]:
     return entries
 
 
+def has_files(root: Path) -> bool:
+    """Return whether any non-directory exists under ``root``, stopping at the first; read-only.
+
+    Directories are opened with O_NOATIME so that reading them never writes an access time. When the kernel
+    refuses that (the caller does not own the directory), it raises instead of falling back to a plain open.
+    Directories on another filesystem are not entered, and a top-level ``.zfs`` is skipped, as in ``scan``.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | getattr(os, "O_NOATIME", 0)
+
+    def search(fd: int, dev: int, *, top: bool) -> bool:
+        with os.scandir(fd) as it:
+            entries = list(it)
+        subdirs = []
+        for entry in entries:
+            if top and entry.name == ".zfs":
+                continue
+            if not entry.is_dir(follow_symlinks=False):
+                return True
+            subdirs.append(entry.name)
+        for name in subdirs:
+            try:
+                child = os.open(name, flags, dir_fd=fd)
+            except FileNotFoundError:
+                continue
+            try:
+                if os.fstat(child).st_dev == dev and search(child, dev, top=False):
+                    return True
+            finally:
+                os.close(child)
+        return False
+
+    try:
+        top = os.open(root, flags)
+    except PermissionError as error:
+        msg = f"cannot read {root} without updating access times"
+        raise MigrationError(msg) from error
+    try:
+        return search(top, os.fstat(top).st_dev, top=True)
+    except PermissionError as error:
+        msg = f"cannot read under {root} without updating access times"
+        raise MigrationError(msg) from error
+    finally:
+        os.close(top)
+
+
 def group_by_inode(entries: Iterable[_Entry], root: Path) -> list[Group]:
     """Join the names of each inode; refuse when fewer names were found than the link count (a writer changed links)."""
     by_ino: dict[int, list[_Entry]] = {}

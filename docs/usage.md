@@ -20,12 +20,13 @@ Bare `zfs-encrypt-migrate` only shows help.
 | `tree-move DATASET CHILD` | Copy one child subtree under the staged parent; the source stays until you destroy it. |
 | `tree-finish DATASET` | Send the parent's last changes and swap the staged tree into place once no children remain. |
 | `file-move DATASET --delete-source` | Move a dataset's files in verified batches into an encrypted dataset, deleting each source file once its copy is verified, then swap it into place. |
+| `file-move-status DATASET` | Report where a `file-move` stands: staged dataset, sizes, phase, lock and next step. Read-only. |
 | `audit [--exact NAME]... [--subtree NAME]... POOL...` | List unencrypted datasets outside the allowlists; exit 1 if there are any. |
 
 ## Shared Options
 
 The seven migration, tree and file-move commands take the same options.
-`audit` takes none of them.
+`file-move-status` takes only `--stage`, and `audit` takes none of them.
 
 | Option | Environment variable | Default | Description |
 | --- | --- | --- | --- |
@@ -366,6 +367,53 @@ From the final unmount of step 8 on, the hints remount with `zfs mount -a` inste
 | `PermissionError: [Errno 1] Operation not permitted: 'PATH'` | An immutable or append-only file; clear the flag (`chattr -i -a PATH`), then rerun. |
 | `STAGE/LEAF is mounted at PATH, which overlaps DATASET at PATH` | Change the staged mountpoint so it does not contain or lie inside the dataset's. |
 
+### file-move-status
+
+```bash
+zfs-encrypt-migrate file-move-status --stage tank/stage tank/media
+```
+
+Reports where a `file-move` of `DATASET` stands, while it runs or after it stopped.
+It is strictly read-only: it runs only `zfs list` and `zfs get`, so it never unmounts, mounts, loads a key, takes a snapshot or sets a property, and it is safe to run while `file-move` is active.
+Run it as root, like the other commands.
+
+```text
+file-move status of tank/media (stage tank/stage)
+tank/media: exists
+  tank/media: used 1.0M, logicalused 2.0M
+tank/stage/media: exists
+  zfs-encrypt-migrate:file-move: tank/media
+  zfs-encrypt-migrate:key-checked: prompt
+  zfs-encrypt-migrate:admitted: yes
+  zfs-encrypt-migrate:dirs: yes
+  tank/stage/media: used 2.0K, logicalused 4.0K
+phase: moving files
+lock: no run holds it
+next: rerun the same file-move command to continue; do not destroy either tank/media or tank/stage/media
+```
+
+The phase comes from state that already exists; nothing new is recorded:
+
+| Phase | How it is known |
+| --- | --- |
+| `not started` | `STAGE/LEAF` does not exist and `DATASET` is not encrypted. |
+| `copying the tree` | `STAGE/LEAF` exists and is not yet marked `admitted`: no file was deleted yet. |
+| `moving files` | Admitted, and `DATASET` still holds a file that is not a directory. |
+| `only directories left` | Admitted, and `DATASET` holds only directories. |
+| `moving files or only directories left` | Admitted, but `DATASET` is not mounted where it should be, so its files were not looked at; a note says why. |
+| `swapped` | `STAGE/LEAF` does not exist and `DATASET` is encrypted. If `zfs-encrypt-migrate:file-move` is still set on it, the phase is `swapped, final steps unfinished`. |
+
+To tell the last two moving phases apart it reads the mounted dataset, stopping at the first file it meets.
+It opens directories with `O_NOATIME` so that even this never writes an access time; if the kernel refuses that, it says the files were not counted instead of reading without it.
+
+The lock line says whether a run holds `/run/zfs-encrypt-migrate.lock`.
+`file-move` takes a `flock` lock, which `fcntl` `F_GETLK` cannot see on Linux, so the status looks for the lock file's device and inode among the `FLOCK` entries of `/proc/locks`, which lists every lock the kernel holds.
+It only calls `stat` on the lock file: it never opens, creates or locks it, so it can never make a starting run fail or wait.
+No lock file means `no run`; a file nobody holds means `no run holds it` (the file stays after a run ends); a holder shows its pid, as seen from the status's own PID namespace; if `/proc/locks` cannot be read, the state is `unknown`.
+
+The last line says what to do: `run file-move`, `wait` while a run holds the lock, `rerun the same file-move command`, or, once swapped, the steps after the swap.
+A dataset that is missing, or a `STAGE/LEAF` that belongs to something else, is reported as it is.
+
 ### What file-move does not support
 
 Each of these is checked before anything is deleted, except the last four, which are documented limits:
@@ -418,6 +466,8 @@ When a `zfs` or `zpool` command fails, the message is the command followed by `f
 | `130` | A migration, tree or file-move command interrupted by Ctrl-C, SIGTERM or SIGHUP. `audit` has nothing to clean up: Ctrl-C ends it with 1, and SIGTERM or SIGHUP end it like any other process. |
 
 ## Recovery Hints
+
+To see where a `file-move` stands, whether it runs or stopped, use [`file-move-status`](#file-move-status); it only reads.
 
 If a command fails or is interrupted after it loaded the staged key, the key is unloaded again before it exits.
 If that unload fails too, it prints:

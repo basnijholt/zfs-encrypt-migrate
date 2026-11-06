@@ -197,23 +197,26 @@ zfs-encrypt-migrate --help
 │ --help     -h        Show this message and exit.                                                 │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ Migration Commands ─────────────────────────────────────────────────────────────────────────────╮
-│ seed         Copy a dataset tree to an encrypted staged tree, then unload its key.               │
-│ catchup      Send what changed since the seed to the staged tree.                                │
-│ cutover      Swap the staged tree into place; the original stays read-only under STAGE/old.      │
+│ seed              Copy a dataset tree to an encrypted staged tree, then unload its key.          │
+│ catchup           Send what changed since the seed to the staged tree.                           │
+│ cutover           Swap the staged tree into place; the original stays read-only under STAGE/old. │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ Tree Commands ──────────────────────────────────────────────────────────────────────────────────╮
-│ tree-seed    Copy only the parent to an encrypted staged dataset; its children move one by one.  │
-│ tree-move    Copy one child subtree under the staged parent; the source stays until you destroy  │
-│              it.                                                                                 │
-│ tree-finish  Send the parent's last changes and swap the staged tree into place once no children │
-│              remain.                                                                             │
+│ tree-seed         Copy only the parent to an encrypted staged dataset; its children move one by  │
+│                   one.                                                                           │
+│ tree-move         Copy one child subtree under the staged parent; the source stays until you     │
+│                   destroy it.                                                                    │
+│ tree-finish       Send the parent's last changes and swap the staged tree into place once no     │
+│                   children remain.                                                               │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ File-Move Commands ─────────────────────────────────────────────────────────────────────────────╮
-│ file-move    Move a dataset's files in verified batches into an encrypted dataset, then swap it  │
-│              into place.                                                                         │
+│ file-move         Move a dataset's files in verified batches into an encrypted dataset, then     │
+│                   swap it into place.                                                            │
+│ file-move-status  Report where a file-move stands; only reads, so it is safe while a run is      │
+│                   active.                                                                        │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ Audit Commands ─────────────────────────────────────────────────────────────────────────────────╮
-│ audit        List unencrypted datasets outside the allowlists; exit 1 if there are any.          │
+│ audit             List unencrypted datasets outside the allowlists; exit 1 if there are any.     │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 
 ```
