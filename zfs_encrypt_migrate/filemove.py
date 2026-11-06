@@ -8,6 +8,7 @@ import os
 import shlex
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -55,7 +56,7 @@ from .migrate import (
 )
 from .output import console
 from .props import create_props, fixups
-from .sizes import format_size
+from .sizes import format_duration, format_size
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -527,6 +528,33 @@ def _split_notes(dataset: str, staged: str) -> list[str]:
     ]
 
 
+def _batch_line(  # noqa: PLR0917
+    number: int,
+    files: int,
+    done: tuple[int, int, float],
+    left: tuple[int, int],
+    run: tuple[int, float],
+    finished: float,
+) -> str:
+    """Format the progress line of a finished batch; it always starts with ``batch N:``.
+
+    ``done`` is the allocated bytes, apparent bytes and seconds of this batch, ``left`` the allocated and apparent
+    bytes still in the source, ``run`` the allocated bytes and seconds of every batch of this run so far. Rates
+    and the ETA count allocated bytes, as ``left`` and the batch size do; they are left out while there is no
+    elapsed time to divide by, and the ETA also when nothing is left.
+    """
+    moved, moved_data, seconds = done
+    text = f"batch {number}: {files} files, {format_size(moved)} moved ({format_size(moved_data)} data)"
+    text += f" in {format_duration(seconds)}"
+    if seconds > 0:
+        text += f" at {format_size(int(moved / seconds))}/s"
+    text += f", {format_size(left[0])} left ({format_size(left[1])} data)"
+    run_moved, run_seconds = run
+    if run_seconds > 0 and run_moved > 0 and left[0] > 0:
+        text += f", ETA {format_duration(left[0] / (run_moved / run_seconds))}"
+    return f"{text} [{datetime.fromtimestamp(finished).strftime('%H:%M')}]"  # noqa: DTZ006
+
+
 def _move_files(  # noqa: PLR0917
     zfs: Zfs,
     settings: Settings,
@@ -538,8 +566,11 @@ def _move_files(  # noqa: PLR0917
     *,
     device: int,
     guard: AbortGuard,
+    clock: Callable[[], float] = time.time,
 ) -> None:
     """Move every file into the copy in verified batches; delete a batch only after its copy is verified and synced.
+
+    ``clock`` returns the epoch time; it times each batch and stamps its line.
 
     ``device`` is the device of the staged dataset mounted at ``dst``; every copy must be on it. From the first
     delete on, ``guard`` says the files are split.
@@ -550,13 +581,18 @@ def _move_files(  # noqa: PLR0917
     # Before any space check, since they hold space; the run lock keeps every other run out of scratch.
     remove_partials(dst)
     batch_number = 0
+    # Of the batches finished in this run only, so the ETA does not depend on earlier runs.
+    run_moved = 0
+    run_seconds = 0.0
     while entries := scan(src):
         groups = group_by_inode(entries, src)
         # Before the first batch of the move; skipped once the staged dataset is marked admitted.
         _admit(zfs, settings, dataset, groups, batch_size)
         left = sum(group.allocated for group in groups)
+        left_data = sum(group.apparent for group in groups)
         deleted = 0
         for batch in plan_batches(groups, batch_size):
+            started = clock()
             # Before anything is written into dst: it may have become a bare directory since the last batch.
             _refuse_unmounted(zfs, staged, dst, device)
             # Created only when files remain: a rerun after finish removed scratch must not change the copy's root.
@@ -579,8 +615,23 @@ def _move_files(  # noqa: PLR0917
             deleted += delete(src, verified)
             batch_number += 1
             left -= moved
-            files = sum(len(group.entries) for group in batch)
-            console.print(f"batch {batch_number}: {files} files, {format_size(moved)} moved, {format_size(left)} left")
+            moved_data = sum(group.apparent for group in batch)
+            left_data -= moved_data
+            finished = clock()
+            seconds = max(finished - started, 0.0)
+            run_moved += moved
+            run_seconds += seconds
+            console.print(
+                _batch_line(
+                    batch_number,
+                    sum(len(group.entries) for group in batch),
+                    (moved, moved_data, seconds),
+                    (left, left_data),
+                    (run_moved, run_seconds),
+                    finished,
+                ),
+                soft_wrap=True,
+            )
         if deleted == 0:
             msg = f"{len(entries)} files kept changing during the move; stop the writers and rerun"
             raise MigrationError(msg)
@@ -676,6 +727,7 @@ def file_move(
     mount_root: Path = STAGING_MOUNT_ROOT,
     lock_path: Path = LOCK_FILE,
     sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.time,
 ) -> list[str]:
     """Move the files of ``dataset`` into an encrypted copy, then swap it into place. Rerun to continue."""
     if not delete_source:
@@ -697,5 +749,5 @@ def file_move(
                 raise MigrationError(msg)
             _copy_tree(zfs, staged, src, dst, device)
             _check_passphrase(zfs, settings, staged)
-            _move_files(zfs, settings, dataset, src, dst, batch_size, sleep, device=device, guard=guard)
+            _move_files(zfs, settings, dataset, src, dst, batch_size, sleep, device=device, guard=guard, clock=clock)
             return _finish(zfs, settings, dataset, src, dst, guard)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -38,7 +39,7 @@ from zfs_encrypt_migrate.filemove import (
 )
 from zfs_encrypt_migrate.migrate import AbortGuard
 from zfs_encrypt_migrate.process import SubprocessRunner
-from zfs_encrypt_migrate.sizes import format_size
+from zfs_encrypt_migrate.sizes import format_duration, format_size
 
 from .conftest import STAGE, FileMoveEnv, fail, needs_rsync
 from .helpers import fail_on, make
@@ -934,9 +935,67 @@ def test_moves_everything_in_batches(
     lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("batch ")]
     assert len(lines) == 5  # noqa: PLR2004
     assert lines[0].startswith("batch 1: ")
-    assert lines[-1].endswith(" left")
+    assert " left (0B data)" in lines[-1]
     assert lines[-1].startswith("batch 5: ")
     assert ("zpool", "sync", "tank") in env.sim.ops()
+
+
+def ticking_clock(*ticks: float) -> Callable[[], float]:
+    """Return a clock that hands out the given times in order."""
+    times = iter(ticks)
+    return lambda: next(times)
+
+
+@needs_rsync
+def test_batch_line_shows_pace_data_size_and_eta(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Each line has the duration, throughput, apparent sizes, ETA from the run's average rate and a timestamp."""
+    env = filemove_env
+    for path in [p for p in env.src.rglob("*") if not p.is_dir() or p.is_symlink()]:
+        path.unlink()
+    for name, size in (("a", 2048), ("b", 1024), ("c", 512)):
+        (env.src / name).write_bytes(b"x" * size)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    start = 1_700_000_000.0
+    clock = ticking_clock(start, start + 4, start + 4, start + 16, start + 16, start + 17)
+    env.sim.prop(STAGED, "mountpoint", str(dst))
+    env.sim.prop(STAGED, "mounted", "yes")
+    _move_files(
+        env.zfs,
+        settings,
+        DATASET,
+        env.src,
+        dst,
+        1,
+        recorder()[1],
+        device=dst.stat().st_dev,
+        guard=guard_for(env, settings),
+        clock=clock,
+    )
+    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("batch ")]
+
+    def stamp(offset: int) -> str:
+        return datetime.fromtimestamp(start + offset).strftime("%H:%M")  # noqa: DTZ006
+
+    assert lines == [
+        f"batch 1: 1 files, 4.0K moved (2.0K data) in 4s at 1.0K/s, 8.0K left (1.5K data), ETA 8s [{stamp(4)}]",
+        f"batch 2: 1 files, 4.0K moved (1.0K data) in 12s at 341B/s, 4.0K left (512B data), ETA 8s [{stamp(16)}]",
+        f"batch 3: 1 files, 4.0K moved (512B data) in 1s at 4.0K/s, 0B left (0B data) [{stamp(17)}]",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("seconds", "text"),
+    [(0, "0s"), (59, "59s"), (60, "1m"), (3490, "58m 10s"), (3600, "1h"), (3900, "1h 5m"), (183_600, "2d 3h")],
+)
+def test_format_duration(seconds: int, text: str) -> None:
+    """A duration shows its two most significant non-zero units."""
+    assert format_duration(seconds) == text
 
 
 @needs_rsync

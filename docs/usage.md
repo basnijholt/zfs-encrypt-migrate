@@ -302,8 +302,13 @@ It runs, in this order:
 Each batch prints one line:
 
 ```text
-batch 7: 1204 files, 99.8G moved, 4.2T left
+batch 7: 1204 files, 99.8G moved (146G data) in 58m at 29M/s, 4.2T left (6.1T data), ETA 1d 17h [14:02]
 ```
+
+It shows how many files and how much allocated space moved, with the apparent size (the sum of the file sizes, the data) in brackets, how long the batch took and its throughput, what is left, the local time, and the ETA.
+Allocated size is what the batches and the free-space checks count; on a pool where it understates the data, such as an expanded raidz, the apparent size is the real amount.
+The ETA divides the allocated space left by the average rate of the batches finished in this run, not earlier runs, so it appears from the first batch on and is left out when nothing is left.
+Every line starts with `batch N:`.
 
 On success it prints:
 
