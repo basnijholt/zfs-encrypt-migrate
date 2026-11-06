@@ -422,25 +422,53 @@ def _stdin_is_terminal() -> bool:
     return sys.stdin.isatty()
 
 
-def _check_passphrase(zfs: Zfs, settings: Settings, staged: str) -> None:
+def _raw_key(zfs: Zfs, settings: Settings, staged: str) -> bool:
+    """Return whether the staged key is raw, which zfs refuses to take typed at a terminal.
+
+    The staged dataset's own keyformat counts: a rerun may leave out the --keyformat raw that created it.
+    """
+    return settings.keyformat == "raw" or zfs.get("keyformat", staged) == "raw"
+
+
+def _check_passphrase(zfs: Zfs, settings: Settings, staged: str, *, check_prompt_with_key_file: bool = False) -> None:
     """Prove the final key unlocks the staged dataset before any file is deleted.
 
-    The marker records the location that was checked, so a rerun with another final location checks again.
+    The marker records the location that was checked, so a rerun with another final location checks again. Only
+    when the operator vouches for the key file is a final ``prompt`` checked against that file, on every run, never
+    because no terminal is attached. That proves the file opens the dataset, not that anyone knows the passphrase.
     """
     location = settings.final_keylocation
-    if zfs.get(MARK_KEY, staged) == location:
+    from_key_file = location == "prompt" and check_prompt_with_key_file
+    if from_key_file and _raw_key(zfs, settings, staged):
+        msg = (
+            f"{staged} has keyformat=raw, which can't be typed at the prompt; "
+            "--check-prompt-with-key-file needs a passphrase or hex key"
+        )
+        raise MigrationError(msg)
+    check = f"file://{settings.key_file}" if from_key_file else location
+    checked = zfs.get(MARK_KEY, staged)
+    # The key file is checked on every run: it may have changed since it passed, and the staged key a killed run
+    # left loaded would not notice before files are deleted.
+    if checked == location and not from_key_file:
         return
-    if location == "prompt":
+    if check == "prompt":
         if not _stdin_is_terminal():
             msg = "run file-move once from a terminal so it can check the passphrase"
-            raise MigrationError(msg)
+            hint = (
+                "or, if the key file holds the passphrase you keep, check that file instead: "
+                "rerun with --check-prompt-with-key-file"
+            )
+            # The flag refuses a raw key, so it is no way out for one.
+            raise MigrationError(msg, [] if _raw_key(zfs, settings, staged) else [hint])
         loaded = zfs.check_key(staged, "prompt", attached=True)
     else:
-        loaded = zfs.check_key(staged, location, attached=False)
+        loaded = zfs.check_key(staged, check, attached=False)
     if not loaded:
-        msg = f"the key for {staged} did not load from {location}; nothing was deleted"
+        msg = f"the key for {staged} did not load from {check}; nothing was deleted"
         raise MigrationError(msg)
-    zfs.set_prop(staged, MARK_KEY, location)
+    # A passphrase typed at a terminal stays the record: a later run without the flag relies on it.
+    if checked != check and not (from_key_file and checked == "prompt"):
+        zfs.set_prop(staged, MARK_KEY, check)
 
 
 def _wait_for_space(zfs: Zfs, settings: Settings, needed: int, sleep: Callable[[float], None]) -> None:
@@ -736,6 +764,7 @@ def file_move(
     *,
     batch_size: int,
     delete_source: bool,
+    check_prompt_with_key_file: bool = False,
     mount_root: Path = STAGING_MOUNT_ROOT,
     lock_path: Path = LOCK_FILE,
     sleep: Callable[[float], None] = time.sleep,
@@ -759,7 +788,7 @@ def file_move(
                 msg = f"{staged} is mounted at {dst}, which overlaps {dataset} at {src}"
                 raise MigrationError(msg)
             _copy_tree(zfs, staged, src, dst, device)
-            _check_passphrase(zfs, settings, staged)
+            _check_passphrase(zfs, settings, staged, check_prompt_with_key_file=check_prompt_with_key_file)
             _move_files(
                 zfs,
                 settings,

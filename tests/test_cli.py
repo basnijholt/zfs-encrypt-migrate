@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from zfs_encrypt_migrate import cli
@@ -23,6 +24,7 @@ from .zfs_sim import ZfsSim, staged_ready
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from zfs_encrypt_migrate.migrate import Settings
     from zfs_encrypt_migrate.process import CommandResult
     from zfs_encrypt_migrate.zfs import Zfs
 
@@ -537,7 +539,15 @@ def test_file_move_batch_size_env(monkeypatch: pytest.MonkeyPatch) -> None:
     """The env var sets the batch size; the default is 100G."""
     seen: list[tuple[int, bool]] = []
 
-    def record(_zfs: object, _settings: object, _dataset: str, *, batch_size: int, delete_source: bool) -> list[str]:
+    def record(
+        _zfs: object,
+        _settings: object,
+        _dataset: str,
+        *,
+        batch_size: int,
+        delete_source: bool,
+        **_options: object,
+    ) -> list[str]:
         seen.append((batch_size, delete_source))
         return []
 
@@ -597,3 +607,75 @@ def test_file_move_interrupt_in_writer_probe_exits_130_with_remount_hint(
 
     assert result.exit_code == 130  # noqa: PLR2004
     assert "remount it with: zfs mount tank/data" in result.output
+
+
+# --- checking a final prompt against the key file ---
+
+FILE_MOVE = ["file-move", "tank/data", "--delete-source"]
+
+
+@pytest.fixture
+def flags(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, bool]]:
+    """Replace file-move's work by a record of its key settings and flag, so nothing reaches zfs or the run lock."""
+    seen: list[tuple[str, str, bool]] = []
+
+    def record(_zfs: object, settings: Settings, _dataset: str, **options: object) -> list[str]:
+        seen.append((settings.final_keylocation, settings.keyformat, bool(options["check_prompt_with_key_file"])))
+        return []
+
+    monkeypatch.setattr(cli, "file_move", record)
+    return seen
+
+
+@pytest.mark.usefixtures("sim")
+def test_check_prompt_with_key_file_reaches_file_move(flags: list[tuple[str, str, bool]]) -> None:
+    """file-move takes the flag; it is off unless given."""
+    assert runner.invoke(cli.app, FILE_MOVE).exit_code == 0
+    assert runner.invoke(cli.app, [*FILE_MOVE, "--check-prompt-with-key-file"]).exit_code == 0
+
+    assert flags == [("prompt", "passphrase", False), ("prompt", "passphrase", True)]
+
+
+def test_check_prompt_with_key_file_needs_final_keylocation_prompt(
+    sim: ZfsSim,
+    flags: list[tuple[str, str, bool]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Another final keylocation, from the option or its env var, makes the flag a usage error before any work."""
+    flagged = [*FILE_MOVE, "--check-prompt-with-key-file"]
+    wide = {"COLUMNS": "200"}
+    from_option = runner.invoke(cli.app, [*flagged, "--final-keylocation", "file:///etc/zfs/key"], env=wide)
+    monkeypatch.setenv("ZFS_ENCRYPT_MIGRATE_FINAL_KEYLOCATION", "https://keys.example/key")
+    from_env = runner.invoke(cli.app, flagged, env=wide)
+
+    for result, value in ((from_option, "file:///etc/zfs/key"), (from_env, "https://keys.example/key")):
+        assert result.exit_code == 2  # noqa: PLR2004
+        assert f"needs --final-keylocation prompt, not {value}" in plain(result.output)
+    assert flags == []
+    assert sim.runner.calls == []  # type: ignore[attr-defined]
+
+
+def test_check_prompt_with_key_file_refuses_a_raw_key(sim: ZfsSim, flags: list[tuple[str, str, bool]]) -> None:
+    """OpenZFS takes no raw key typed at a terminal, so the prompt it ends with could not be answered; hex can."""
+    flagged = [*FILE_MOVE, "--check-prompt-with-key-file"]
+    raw = runner.invoke(cli.app, [*flagged, "--keyformat", "raw"], env={"COLUMNS": "200"})
+    hexadecimal = runner.invoke(cli.app, [*flagged, "--keyformat", "hex"])
+
+    assert raw.exit_code == 2  # noqa: PLR2004
+    assert "needs --keyformat passphrase or hex, since a raw key can't be typed at the prompt" in plain(raw.output)
+    assert hexadecimal.exit_code == 0, hexadecimal.output
+    assert flags == [("prompt", "hex", True)]
+    assert sim.runner.calls == []  # type: ignore[attr-defined]
+
+
+def test_check_prompt_with_key_file_is_a_file_move_flag_without_env_var() -> None:
+    """Only file-move checks the final key, so only it takes the flag; consent is given per run, with no env var."""
+    commands = typer.main.get_command(cli.app).commands  # type: ignore[attr-defined]
+    envvars = {
+        name: param.envvar
+        for name, command in commands.items()
+        for param in command.params
+        if param.name == "check_prompt_with_key_file"
+    }
+
+    assert envvars == {"file-move": None}

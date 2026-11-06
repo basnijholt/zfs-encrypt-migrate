@@ -67,9 +67,10 @@ The default is `/run/zfs-encrypt-migrate.key`; change it with `--key-file`.
 
 ```bash
 install -m 600 /dev/null /run/zfs-encrypt-migrate.key
-read -rs passphrase && printf '%s' "$passphrase" > /run/zfs-encrypt-migrate.key && unset passphrase
+IFS= read -rs passphrase && printf '%s' "$passphrase" > /run/zfs-encrypt-migrate.key && unset passphrase
 ```
 
+`IFS=` keeps spaces at the start and end of the passphrase, which `read` would otherwise strip.
 With the default `--keyformat passphrase`, OpenZFS wants 8 to 512 bytes.
 `--keyformat hex` (64 hex characters) and `--keyformat raw` (32 bytes) work too.
 
