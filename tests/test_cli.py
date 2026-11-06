@@ -621,7 +621,7 @@ def test_file_move_status_prints_report_with_reads_only(
 
     assert result.exit_code == 0
     assert "tank/data: exists" in result.stdout
-    assert "lock: no run" in result.stdout
+    assert "lock: not held" in result.stdout
     calls = sim.runner.calls  # type: ignore[attr-defined]
     assert calls
     assert {call[:2] for call in calls} <= {("zfs", "list"), ("zfs", "get")}

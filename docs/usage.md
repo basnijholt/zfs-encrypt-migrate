@@ -411,8 +411,8 @@ tank/media: exists
   encryption: off
   keystatus: -
   mounted: yes
-  used: 1.00T
-  logicalused: 1.02T
+  used: 1099511627776
+  logicalused: 1121501860331
   zfs-encrypt-migrate:file-move: -
   zfs-encrypt-migrate:key-checked: -
   zfs-encrypt-migrate:admitted: -
@@ -421,30 +421,29 @@ tank/stage/media: exists
   encryption: aes-256-gcm
   keystatus: available
   mounted: yes
-  used: 2.00G
-  logicalused: 2.10G
+  used: 2147483648
+  logicalused: 2254857830
   zfs-encrypt-migrate:file-move: tank/media
   zfs-encrypt-migrate:key-checked: prompt
   zfs-encrypt-migrate:admitted: yes
   zfs-encrypt-migrate:dirs: copied
 tank/stage/old/media: does not exist
-lock: no run holds it
+lock: held by pid 4242
 ```
 
 What it prints:
 
-- For `DATASET` and for `STAGE/LEAF`: whether it exists and, as `zfs get` shows them, `encryption`, `keystatus`, `mounted`, `used` and `logicalused`, then the four `zfs-encrypt-migrate:*` marker values (`-` when unset). Both datasets show their markers, because a swap that stopped part way leaves them on `DATASET`.
+- For `DATASET` and for `STAGE/LEAF`: whether it exists and, as `zfs get -p` shows them, `encryption`, `keystatus`, `mounted`, `used` and `logicalused`, then the four `zfs-encrypt-migrate:*` marker values (`-` when unset). Both datasets show their markers, because a swap that stopped part way leaves them on `DATASET`.
 - Whether `STAGE/old/LEAF` exists.
 - The lock line: whether a run holds `/run/zfs-encrypt-migrate.lock`.
 
 The status interprets nothing and gives no advice.
 The output and the recovery hints of the run itself are authoritative.
+`used` and `logicalused` are exact bytes, so progress between two checks shows.
+`zfs-encrypt-migrate:key-checked` holds the final keylocation whose key was verified, and `zfs-encrypt-migrate:dirs` is `copied` once the directory tree is copied.
 
-`file-move` takes a `flock` lock, which `fcntl` `F_GETLK` cannot see on Linux, so the status looks for the lock file's device and inode among the `FLOCK` entries of `/proc/locks`, which lists every lock the kernel holds.
-It only calls `stat` on the lock file: it never opens, creates or locks it, so it can never make a starting run fail or wait.
-No lock file means `no run`; a file nobody holds means `no run holds it` (the file stays after a run ends); a holder shows its pid; if the lock file or `/proc/locks` cannot be read, the state is `unknown`.
-"Held" means some `file-move` on this host holds the lock, not necessarily one of this dataset.
-Inside a child PID namespace, `/proc/locks` may not show the holder, and the pid is the one of the host's namespace.
+The lock line reads `/proc/locks`; the lock file is only stat'ed, never opened, so a starting run cannot be blocked.
+It says `held by pid N` (some `file-move` on this host holds the lock, not necessarily for this dataset), `not held` (also when there is no lock file), or `unknown (ERROR)`.
 
 ### What file-move does not support
 

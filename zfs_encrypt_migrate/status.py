@@ -15,10 +15,6 @@ if TYPE_CHECKING:
 _PROC_LOCKS = Path("/proc/locks")
 
 
-def _read_locks() -> str:
-    return _PROC_LOCKS.read_text()
-
-
 def _lock_state(path: Path) -> str:
     """Say whether a run holds the lock at ``path``, without opening, creating or locking the file.
 
@@ -30,11 +26,11 @@ def _lock_state(path: Path) -> str:
     try:
         st = path.stat()
     except FileNotFoundError:
-        return "no run"
+        return "not held"
     except OSError as error:
         return f"unknown ({path} cannot be read: {error.strerror or error})"
     try:
-        text = _read_locks()
+        text = _PROC_LOCKS.read_text()
     except OSError:
         return f"unknown ({_PROC_LOCKS} cannot be read)"
     for line in text.splitlines():
@@ -47,8 +43,8 @@ def _lock_state(path: Path) -> str:
         except ValueError:
             continue
         if same:
-            return f"held by a running file-move (pid {fields[4]})"
-    return "no run holds it"
+            return f"held by pid {fields[4]}"
+    return "not held"
 
 
 _PROPS = ("encryption", "keystatus", "mounted", "used", "logicalused", MARK_SOURCE, MARK_KEY, MARK_ADMITTED, MARK_DIRS)
