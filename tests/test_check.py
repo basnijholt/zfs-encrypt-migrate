@@ -10,7 +10,7 @@ import pytest
 from zfs_encrypt_migrate import preflight
 from zfs_encrypt_migrate.constants import SCRATCH
 from zfs_encrypt_migrate.filemove import _run_lock
-from zfs_encrypt_migrate.preflight import CheckReport, check_file_move
+from zfs_encrypt_migrate.preflight import check_file_move
 
 from .conftest import STAGE
 from .fakeproc import CONTAINER, FakeProc, mount_line
@@ -28,13 +28,25 @@ IMMUTABLE = 0x10
 RUNNING = ("a file-move is running; check skipped", ("check again once it has stopped",))
 
 
+@pytest.fixture(autouse=True)
+def as_root(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the check as if as root; the tests themselves are not."""
+    monkeypatch.setattr(preflight, "_is_root", lambda: True)
+
+
 @pytest.fixture
 def proc(filemove_env: FileMoveEnv, tmp_path: Path) -> FakeProc:
     """Build a fake /proc whose checking process sees the simulated mounts."""
     return FakeProc(tmp_path / "proc", filemove_env.sim.mountinfo().decode())
 
 
-def check(env: FileMoveEnv, settings: Settings, proc: FakeProc, tmp_path: Path, dataset: str = DATASET) -> CheckReport:
+def check(
+    env: FileMoveEnv,
+    settings: Settings,
+    proc: FakeProc,
+    tmp_path: Path,
+    dataset: str = DATASET,
+) -> list[MigrationError]:
     """Check the dataset with the fake /proc and a private lock file."""
     return check_file_move(env.zfs, settings, dataset, proc=proc.root, lock_path=tmp_path / "lock")
 
@@ -67,8 +79,7 @@ def test_a_ready_dataset_has_nothing_to_report(
     tmp_path: Path,
 ) -> None:
     """With nothing in the way, the check is empty and leaves everything as it was."""
-    report = check(filemove_env, settings, proc, tmp_path)
-    assert (report.problems, report.notes) == ([], [])
+    assert check(filemove_env, settings, proc, tmp_path) == []
     assert_unchanged(filemove_env, tmp_path)
 
 
@@ -79,32 +90,31 @@ def test_the_first_refusal_comes_with_what_only_the_check_finds(
     key_file: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The run's preflight stops at its first refusal; the holders, flags and quotas still come after it."""
+    """The run's preflight stops at its first refusal; the holders and flags still come after it."""
     env = filemove_env
     key_file.chmod(0o644)
     env.sim.prop(DATASET, "readonly", "on")
     env.sim.snapshot(f"{DATASET}@auto")
-    env.sim.quotas[DATASET, "user"] = [("1000", "1073741824", "none")]
     monkeypatch.setattr(preflight, "_inode_flags", lambda path: IMMUTABLE if path.endswith("a.txt") else 0)
     snap = os.path.realpath(env.src / ".zfs" / "snapshot" / "auto")
     proc = FakeProc(tmp_path / "proc", env.sim.mountinfo().decode() + mount_line(200, 100, snap, f"{DATASET}@auto"))
     proc.add(2345, comm="indexer", ns=CONTAINER, fds=[env.src / "docs" / "b.txt"])
 
-    report = check(env, settings, proc, tmp_path)
+    problems = check(env, settings, proc, tmp_path)
 
-    assert [problem.message for problem in report.problems] == [
+    assert [problem.message for problem in problems] == [
         f"key file {key_file} must have mode 600",
         (
             f"{DATASET} has files or directories with the immutable or append-only flag, which keeps file-move from "
             "deleting them or the files in them"
         ),
-        f"snapshot {DATASET}@auto is mounted at {snap}, which keeps {DATASET} busy",
+        (
+            f"snapshot {DATASET}@auto is mounted at {snap}, inside {DATASET}, "
+            "which makes file-move's unmount fail with busy"
+        ),
         f"PID 2345 (indexer) uses {DATASET} from another mount namespace: open file {env.src / 'docs' / 'b.txt'}",
     ]
-    assert report.problems[0].hints == ()
-    assert [note.message for note in report.notes] == [
-        f"{DATASET} has per-user, per-group or per-project quotas, which file-move does not carry over",
-    ]
+    assert problems[0].hints == ()
     assert_unchanged(env, tmp_path)
 
 
@@ -120,8 +130,7 @@ def test_a_path_that_is_not_the_dataset_is_never_read(
     read: list[str] = []
     monkeypatch.setattr(preflight, "_inode_flags", lambda path: read.append(path) or 0)
     proc.add(2345, ns=CONTAINER, fds=[filemove_env.src / "a.txt"])
-    report = check(filemove_env, settings, proc, tmp_path)
-    assert [problem.message for problem in report.problems] == [
+    assert [problem.message for problem in check(filemove_env, settings, proc, tmp_path)] == [
         f"{filemove_env.src} is not where {DATASET} is mounted (nothing is mounted there)",
     ]
     assert read == []
@@ -134,9 +143,9 @@ def test_a_missing_dataset_is_the_refusal_alone(
     tmp_path: Path,
 ) -> None:
     """Without the dataset there is nothing more to look at."""
-    report = check(filemove_env, settings, proc, tmp_path, "tank/nope")
-    assert found(report.problems) == [("dataset tank/nope does not exist", ())]
-    assert report.notes == []
+    assert found(check(filemove_env, settings, proc, tmp_path, "tank/nope")) == [
+        ("dataset tank/nope does not exist", ()),
+    ]
 
 
 def test_a_running_file_move_is_all_there_is_to_report(
@@ -150,8 +159,8 @@ def test_a_running_file_move_is_all_there_is_to_report(
     lock.touch()
     held(proc, lock)
     with _run_lock(lock):
-        report = check(filemove_env, settings, proc, tmp_path)
-    assert found(report.problems) == [RUNNING]
+        problems = check(filemove_env, settings, proc, tmp_path)
+    assert found(problems) == [RUNNING]
     assert filemove_env.runner.calls == []
 
 
@@ -172,7 +181,7 @@ def test_waiters_and_other_locks_are_no_run(
         locks.write(
             f"2: FLOCK  ADVISORY  WRITE 998 {os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino} 0 EOF\n",
         )
-    assert check(filemove_env, settings, proc, tmp_path).problems == []
+    assert check(filemove_env, settings, proc, tmp_path) == []
 
 
 def test_the_check_takes_no_lock(
@@ -193,7 +202,7 @@ def test_the_check_takes_no_lock(
         return 0
 
     monkeypatch.setattr(preflight, "_inode_flags", take_the_lock)
-    assert check(filemove_env, settings, proc, tmp_path).problems == []
+    assert check(filemove_env, settings, proc, tmp_path) == []
     assert taken
 
 
@@ -206,9 +215,24 @@ def test_a_reserved_name_is_refused_and_the_rest_still_checked(
     """A refusal after the mount check leaves the dataset's own mount to read."""
     (filemove_env.src / SCRATCH).mkdir()
     proc.add(3001, comm="sh", cwd=filemove_env.src / "docs")
-    report = check(filemove_env, settings, proc, tmp_path)
-    assert [problem.message for problem in report.problems] == [
+    assert [problem.message for problem in check(filemove_env, settings, proc, tmp_path)] == [
         f"{filemove_env.src / SCRATCH} exists; file-move needs that name for its own files",
         f"PID 3001 (sh) uses {DATASET}: working directory {filemove_env.src / 'docs'}",
     ]
     assert f"{STAGE}/media" not in filemove_env.sim.datasets
+
+
+def test_without_root_the_check_asks_for_root(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    proc: FakeProc,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without root, other users' processes and files stay hidden: the check says so rather than pass."""
+    monkeypatch.setattr(preflight, "_is_root", lambda: False)
+    proc.add(2345, ns=CONTAINER, fds=[filemove_env.src / "a.txt"])
+    assert found(check(filemove_env, settings, proc, tmp_path)) == [
+        ("run --check as root, like file-move: without root it cannot see every process and file", ()),
+    ]
+    assert filemove_env.runner.calls == []

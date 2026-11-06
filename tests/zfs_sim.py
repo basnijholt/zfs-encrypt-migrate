@@ -63,8 +63,6 @@ class ZfsSim:
         self.mount_order: list[str] = []
         self.volumes: set[str] = set()
         self.roots: list[str] = []
-        # (dataset, user|group|project) -> rows of (id, quota, objquota), as zfs userspace -H -p -o prints them.
-        self.quotas: dict[tuple[str, str], list[tuple[str, str, str]]] = {}
         self.log: list[tuple[str, ...]] = []
         self._sent: tuple[Sequence[str], str, str] | None = None
 
@@ -147,9 +145,6 @@ class ZfsSim:
                 default = POOL_DEFAULTS.get(args[-2], "-")
                 return ok(f"{self.pool_props.get((args[-1], args[-2]), default)}\n")
             return ok()
-        if verb in {"userspace", "groupspace", "projectspace"}:
-            rows = self.quotas.get((args[-1], verb.removesuffix("space")), [])
-            return ok("".join(f"{name}\t{quota}\t{objquota}\n" for name, quota, objquota in rows))
         if verb == "list" and "avail" in args:
             return ok(f"{self.avail}\n")
         if verb == "list" and "snapshot" in args:

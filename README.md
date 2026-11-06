@@ -48,7 +48,7 @@ flowchart LR
 
 A dataset with many large children can move child by child with `tree-seed`, `tree-move` and `tree-finish`, so you only ever need room for one child at a time.
 A single dataset bigger than its pool's free space can't be copied with `zfs send`; `file-move` encrypts it by moving its files in verified batches into a new encrypted dataset, deleting each source file only once its copy is verified (see the [guide](https://zfs-encrypt-migrate.nijho.lt/guides/#datasets-bigger-than-the-free-space)). It needs `rsync` 3.1.3 or newer, with ACL and xattr support, on `PATH`.
-`file-move --check` reports what would stop it without changing anything, including what still uses the dataset in any mount namespace.
+`file-move --check` reports what would stop it, including what still uses the dataset in any mount namespace; it changes no ZFS state, mount or lock.
 An `audit` command lists every dataset that is still unencrypted, for a timer or a CI-style check.
 
 ## Safety model

@@ -1,4 +1,4 @@
-"""Tests for the checks only file-move --check runs: holders in every mount namespace, inode flags, quotas."""
+"""Tests for what only file-move --check looks for: holders in every mount namespace, and inode flags."""
 
 from __future__ import annotations
 
@@ -10,14 +10,10 @@ from typing import TYPE_CHECKING
 import pytest
 
 from zfs_encrypt_migrate import preflight
-from zfs_encrypt_migrate.errors import ZfsError
 from zfs_encrypt_migrate.preflight import _holders as holders
 from zfs_encrypt_migrate.preflight import _pinned_files as pinned_files
-from zfs_encrypt_migrate.preflight import _quota_notes as quota_notes
 
-from .fakeproc import CONTAINER, HOST, SELF_PID, SERVICE, FakeProc, maps_line, mount_line
-from .helpers import fail_on, make
-from .zfs_sim import ZfsSim
+from .fakeproc import CONTAINER, HOST, ROOTLESS, SELF_PID, SERVICE, FakeProc, maps_line, mount_line
 
 if TYPE_CHECKING:
     from zfs_encrypt_migrate.errors import MigrationError
@@ -26,7 +22,7 @@ DATASET = "tank/media"
 STOP = (
     "stop it, and keep whatever starts it again (a unit, a container's restart policy) disabled until file-move is done"
 )
-AS_ROOT = "run the check as root, like file-move itself"
+NOT_REACHED = "in another mount namespace, which file-move's unmount does not reach"
 IMMUTABLE = 0x10
 APPEND = 0x20
 
@@ -41,8 +37,8 @@ class Host:
 
     def __init__(self, tmp_path: Path, *extra: str) -> None:
         """Create the mount points; ``extra`` lines join the checking process's mountinfo."""
-        base = Path(os.path.realpath(tmp_path))
-        self.pool = base / "pool"
+        self.base = Path(os.path.realpath(tmp_path))
+        self.pool = self.base / "pool"
         self.src = self.pool / "media"
         (self.src / "docs").mkdir(parents=True)
         (self.src / "a.mkv").write_text("a")
@@ -52,11 +48,21 @@ class Host:
             + mount_line(36, 30, self.src, DATASET, tags="shared:20")
             + "".join(extra)
         )
-        self.proc = FakeProc(base / "proc", ours)
+        self.proc = FakeProc(self.base / "proc", ours)
 
     def holders(self) -> list[MigrationError]:
         """Return what holds the dataset."""
         return holders(self.proc.root, DATASET, self.src)
+
+    def service(self, pid: int, *extra: str, userns: str | None = None) -> None:
+        """Add a process in a namespace whose mounts are slave copies of the host's, as systemd sandboxing makes."""
+        mountinfo = (
+            mount_line(501, 500, "/", "/dev/root", tags="master:1", fstype="ext4")
+            + mount_line(530, 501, self.pool, "tank", tags="master:10")
+            + mount_line(536, 530, self.src, DATASET, tags="master:20")
+            + "".join(extra)
+        )
+        self.proc.add(pid, comm="daemon", ns=SERVICE, mountinfo=mountinfo, **({"userns": userns} if userns else {}))
 
 
 @pytest.fixture
@@ -109,26 +115,29 @@ def test_the_checking_process_is_not_listed(host: Host) -> None:
     assert host.holders() == []
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root can read every process")
-def test_processes_that_cannot_be_read_fail_closed(host: Host) -> None:
-    """Without root, other users' processes stay hidden: the check says so instead of reporting a clean result."""
-    base = host.proc.add(77, comm="agent")
-    base.chmod(0)
-    try:
-        problems = host.holders()
-    finally:
-        base.chmod(0o755)
-    assert found(problems) == [("could not inspect 1 process, such as PID 77: Permission denied", (AS_ROOT,))]
-
-
-def test_a_snapshot_mounted_here_is_a_problem(tmp_path: Path) -> None:
+def test_a_snapshot_mounted_inside_the_dataset_is_a_problem(tmp_path: Path) -> None:
     """A snapshot automount under .zfs/snapshot makes the unmount fail with busy."""
     snap = Path(os.path.realpath(tmp_path)) / "pool" / "media" / ".zfs" / "snapshot" / "auto-1"
     host = Host(tmp_path, mount_line(40, 36, snap, f"{DATASET}@auto-1", tags="shared:25"))
     assert found(host.holders()) == [
         (
-            f"snapshot {DATASET}@auto-1 is mounted at {snap}, which keeps {DATASET} busy",
-            (f"unmount it, before you destroy the snapshot: umount {snap}",),
+            (
+                f"snapshot {DATASET}@auto-1 is mounted at {snap}, inside {DATASET}, "
+                "which makes file-move's unmount fail with busy"
+            ),
+            (f"unmount it: umount {snap}",),
+        ),
+    ]
+
+
+def test_a_snapshot_mounted_outside_the_dataset_blocks_its_destroy(tmp_path: Path) -> None:
+    """Mounted elsewhere, a snapshot leaves the dataset's unmount alone, but zfs destroy cannot remove it."""
+    elsewhere = Path(os.path.realpath(tmp_path)) / "old"
+    host = Host(tmp_path, mount_line(41, 1, elsewhere, f"{DATASET}@manual"))
+    assert found(host.holders()) == [
+        (
+            f"snapshot {DATASET}@manual is mounted at {elsewhere}, which keeps zfs destroy from removing it",
+            (f"unmount it: umount {elsewhere}",),
         ),
     ]
 
@@ -145,6 +154,32 @@ def test_the_dataset_mounted_a_second_time_here_is_a_problem(tmp_path: Path) -> 
     ]
 
 
+def test_another_filesystem_mounted_inside_the_dataset_is_a_problem(tmp_path: Path) -> None:
+    """A tmpfs, another dataset or a bind mount inside makes the run's unmount fail with busy."""
+    root = Path(os.path.realpath(tmp_path)) / "pool" / "media"
+    host = Host(
+        tmp_path,
+        mount_line(42, 36, root / "cache", "tmpfs", fstype="tmpfs"),
+        mount_line(43, 36, root / "docs" / "other", "tank/other", tags="shared:22"),
+    )
+    assert found(host.holders()) == [
+        (
+            (
+                f"tmpfs tmpfs is mounted at {root / 'cache'}, inside {DATASET}, which makes file-move's unmount fail "
+                "with busy"
+            ),
+            (f"unmount it: umount {root / 'cache'}",),
+        ),
+        (
+            (
+                f"zfs tank/other is mounted at {root / 'docs' / 'other'}, inside {DATASET}, which makes file-move's "
+                "unmount fail with busy"
+            ),
+            (f"unmount it: umount {root / 'docs' / 'other'}",),
+        ),
+    ]
+
+
 def test_a_private_bind_mount_in_a_container_is_a_problem(host: Host) -> None:
     """A container's bind mount of a subdirectory keeps the dataset mounted after the unmount, so writers go unseen."""
     host.proc.add(
@@ -155,40 +190,52 @@ def test_a_private_bind_mount_in_a_container_is_a_problem(host: Host) -> None:
         + mount_line(710, 700, "/data", DATASET, root="/part"),
     )
     host.proc.add(2350, comm="helper", ns=CONTAINER)
-    assert found(host.holders()) == [
-        (
-            (
-                f"PID 2345 (indexer) has {DATASET} mounted at /data in another mount namespace, "
-                "which file-move's unmount "
-                "does not reach"
-            ),
-            (STOP, "or unmount it: nsenter -t 2345 -m umount /data"),
-        ),
-    ]
+    assert found(host.holders()) == [(f"PID 2345 (indexer) has {DATASET} mounted at /data {NOT_REACHED}", (STOP,))]
 
 
 def test_copies_the_unmount_propagates_to_are_not_problems(tmp_path: Path) -> None:
     """A sandboxed service sees slave copies of the host's mounts; the unmount takes those, snapshots too, along."""
-    root = Path(os.path.realpath(tmp_path))
-    pool, src = root / "pool", root / "pool" / "media"
-    snap = src / ".zfs" / "snapshot" / "auto-1"
+    snap = Path(os.path.realpath(tmp_path)) / "pool" / "media" / ".zfs" / "snapshot" / "auto-1"
     host = Host(tmp_path, mount_line(40, 36, snap, f"{DATASET}@auto-1", tags="shared:25"))
-    host.proc.add(
-        5001,
-        comm="daemon",
-        ns=SERVICE,
-        mountinfo=mount_line(501, 500, "/", "/dev/root", tags="master:1", fstype="ext4")
-        + mount_line(530, 501, pool, "tank", tags="master:10")
-        + mount_line(536, 530, src, DATASET, tags="master:20")
-        + mount_line(540, 536, snap, f"{DATASET}@auto-1", tags="master:25"),
-    )
+    host.service(5001, mount_line(540, 536, snap, f"{DATASET}@auto-1", tags="master:25"))
     assert [problem.message for problem in host.holders()] == [
-        f"snapshot {DATASET}@auto-1 is mounted at {snap}, which keeps {DATASET} busy",
+        (
+            f"snapshot {DATASET}@auto-1 is mounted at {snap}, inside {DATASET}, which makes file-move's unmount fail "
+            "with busy"
+        ),
     ]
 
 
-def test_a_copy_of_a_copy_is_listed(host: Host) -> None:
-    """Only direct peers and slaves count as propagated; a namespace made from another one errs on the safe side."""
+def test_a_copy_with_other_mounts_on_it_stays_mounted(host: Host) -> None:
+    """The kernel does not unmount a copy that holds mounts of its own, such as a service's TemporaryFileSystem=."""
+    host.service(5001, mount_line(545, 536, host.src / "tmp", "tmpfs", fstype="tmpfs"))
+    assert found(host.holders()) == [
+        (
+            (
+                f"PID 5001 (daemon) has {DATASET} mounted at {host.src} in another mount namespace, with other mounts "
+                f"on it there that keep it mounted when file-move unmounts {DATASET}"
+            ),
+            (STOP,),
+        ),
+    ]
+
+
+def test_a_copy_in_another_user_namespace_is_locked(host: Host) -> None:
+    """Mounts copied into a namespace of another user namespace, as in a rootless container, are never unmounted."""
+    host.service(5001, userns=ROOTLESS)
+    assert found(host.holders()) == [
+        (
+            (
+                f"PID 5001 (daemon) has {DATASET} mounted at {host.src} in another user namespace, where it is locked "
+                "and file-move's unmount does not reach it"
+            ),
+            (STOP,),
+        ),
+    ]
+
+
+def test_a_copy_down_a_chain_may_still_be_reached(host: Host) -> None:
+    """A copy of a copy is not followed down the chain: it is listed, saying the unmount may still reach it."""
     host.proc.add(
         5001,
         ns=SERVICE,
@@ -201,7 +248,15 @@ def test_a_copy_of_a_copy_is_listed(host: Host) -> None:
         mountinfo=mount_line(950, 949, host.pool, "tank", tags="master:60")
         + mount_line(956, 950, host.src, DATASET, tags="master:61"),
     )
-    assert [problem.message.split(" has ")[0] for problem in host.holders()] == ["PID 5002 (worker)"]
+    assert found(host.holders()) == [
+        (
+            (
+                f"PID 5002 (worker) has {DATASET} mounted at {host.src} in another mount namespace, copied there "
+                "through another one; file-move's unmount may still reach it, but the check cannot tell"
+            ),
+            (STOP,),
+        ),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -223,11 +278,7 @@ def test_copies_the_unmount_does_not_reach_are_problems(host: Host, parent_tags:
         + mount_line(966, 960, host.src, DATASET, tags="master:20"),
     )
     assert [problem.message for problem in host.holders()] == [
-        (
-            f"PID 6001 (shell) has {DATASET} mounted at {host.src} in another mount namespace, "
-            "which file-move's unmount "
-            "does not reach"
-        ),
+        f"PID 6001 (shell) has {DATASET} mounted at {host.src} {NOT_REACHED}",
     ]
 
 
@@ -242,11 +293,27 @@ def test_a_snapshot_mounted_only_in_another_namespace_is_a_problem(host: Host) -
     )
     assert found(host.holders())[1] == (
         (
-            f"snapshot {DATASET}@auto-2 is mounted at /data/.zfs/snapshot/auto-2 in the mount namespace of PID 2345 "
-            f"(indexer), which keeps {DATASET} busy"
+            f"PID 2345 (indexer) has snapshot {DATASET}@auto-2 mounted at /data/.zfs/snapshot/auto-2 in another mount "
+            "namespace, which keeps zfs destroy from removing it"
         ),
-        ("unmount it, before you destroy the snapshot: nsenter -t 2345 -m umount /data/.zfs/snapshot/auto-2",),
+        (STOP,),
     )
+
+
+def test_paths_with_a_carriage_return_stay_whole(host: Host) -> None:
+    """The kernel escapes a newline in mountinfo but not a carriage return, and maps escapes neither."""
+    mapped = host.src / "x\ry"
+    mapped.write_text("x")
+    host.proc.add(
+        2345,
+        ns=CONTAINER,
+        mountinfo=mount_line(710, 700, "/da\rta", DATASET),
+        maps=maps_line(mapped, host.src.stat().st_dev, 77),
+    )
+    assert [problem.message for problem in host.holders()] == [
+        f"PID 2345 (worker) has {DATASET} mounted at /da\rta {NOT_REACHED}",
+        f"PID 2345 (worker) uses {DATASET} from another mount namespace: mapped file {mapped}",
+    ]
 
 
 def test_other_datasets_and_filesystems_are_ignored(host: Host) -> None:
@@ -314,8 +381,7 @@ def test_immutable_and_append_only_entries_are_problems(tmp_path: Path, monkeypa
         (
             (
                 f"{DATASET} has files or directories with the immutable or append-only flag, "
-                "which keeps file-move from "
-                "deleting them or the files in them"
+                "which keeps file-move from deleting them or the files in them"
             ),
             (
                 "clear the flags; the copies get none, so set them again after the swap:",
@@ -343,7 +409,7 @@ def test_flags_that_cannot_be_read_fail_closed(tmp_path: Path, monkeypatch: pyte
 
     def fake(path: str) -> int:
         if path.endswith("b.txt"):
-            raise PermissionError(errno.EACCES, "Permission denied", path)
+            raise OSError(errno.EIO, "Input/output error", path)
         if path.endswith("a.txt"):
             # Deleted since the directory was listed: nothing left to check.
             raise FileNotFoundError(errno.ENOENT, "No such file or directory", path)
@@ -354,16 +420,39 @@ def test_flags_that_cannot_be_read_fail_closed(tmp_path: Path, monkeypatch: pyte
         (
             (
                 f"could not read the inode flags of 1 entry in {DATASET}, such as {root / 'docs' / 'b.txt'}: "
-                "Permission denied"
+                "Input/output error"
             ),
-            (AS_ROOT,),
+            ("check them by hand with lsattr -d; the run stops at an immutable or append-only one",),
         ),
     ]
 
 
-def test_directories_of_another_filesystem_are_not_entered(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Another filesystem mounted inside is not the dataset's; the scan reports it on its own."""
+def test_a_leased_file_says_so(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An NFS delegation or a Samba oplock refuses a non-blocking open; that is not a matter of permissions."""
     root = flagged_tree(tmp_path)
+
+    def fake(path: str) -> int:
+        if path.endswith("a.txt"):
+            raise BlockingIOError(errno.EWOULDBLOCK, "Resource temporarily unavailable", path)
+        return 0
+
+    monkeypatch.setattr(preflight, "_inode_flags", fake)
+    assert found(pinned_files(root, DATASET)) == [
+        (
+            (
+                f"{DATASET} has leased files, such as {root / 'a.txt'}: an NFS client or Samba holds a delegation or "
+                "oplock on them"
+            ),
+            ("stop the NFS server and the Samba exports of the dataset; the run would wait on each leased file",),
+        ),
+    ]
+
+
+def test_another_filesystem_inside_is_reported_not_walked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The flags walk stays on the dataset; the filesystem mounted inside is a problem of its own."""
+    root = Path(os.path.realpath(tmp_path)) / "pool" / "media"
+    host = Host(tmp_path, mount_line(42, 36, root / "docs", "tmpfs", fstype="tmpfs"))
+    (host.src / "docs" / "inner.txt").write_text("i")
     real = os.lstat
 
     def lstat(path: str | os.PathLike[str], *args: object, **kwargs: object) -> os.stat_result:
@@ -377,8 +466,11 @@ def test_directories_of_another_filesystem_are_not_entered(tmp_path: Path, monke
     read: list[str] = []
     monkeypatch.setattr(os, "lstat", lstat)
     monkeypatch.setattr(preflight, "_inode_flags", lambda path: read.append(path) or 0)
-    assert pinned_files(root, DATASET) == []
+    assert pinned_files(host.src, DATASET) == []
     assert not [path for path in read if "docs" in path]
+    assert [problem.message for problem in host.holders()] == [
+        f"tmpfs tmpfs is mounted at {root / 'docs'}, inside {DATASET}, which makes file-move's unmount fail with busy",
+    ]
 
 
 def test_reads_the_flags_with_the_ioctl(tmp_path: Path) -> None:
@@ -393,50 +485,3 @@ def test_reads_the_flags_with_the_ioctl(tmp_path: Path) -> None:
         raise
     assert flags & (IMMUTABLE | APPEND) == 0
     assert preflight._inode_flags(str(tmp_path)) & (IMMUTABLE | APPEND) == 0  # noqa: SLF001
-
-
-# --- quotas ---
-
-
-def test_quotas_are_notes_with_the_commands_that_set_them_again(tmp_path: Path) -> None:
-    """User, group and project quotas are not carried over; the note says how to set each again."""
-    sim = ZfsSim(["tank", DATASET])
-    sim.quotas[DATASET, "user"] = [("1000", "10737418240", "none"), ("1001", "none", "none")]
-    sim.quotas[DATASET, "group"] = [("100", "none", "50000")]
-    sim.quotas[DATASET, "project"] = [("7", "1073741824", "-")]
-    zfs, runner = make(sim)
-    assert found(quota_notes(zfs, DATASET, tmp_path)) == [
-        (
-            f"{DATASET} has per-user, per-group or per-project quotas, which file-move does not carry over",
-            (
-                "set them again after the swap:",
-                f"  zfs set userquota@1000=10737418240 {DATASET}",
-                f"  zfs set groupobjquota@100=50000 {DATASET}",
-                f"  zfs set projectquota@7=1073741824 {DATASET}",
-                (
-                    f"rsync does not copy the project IDs of files either: note them first (zfs project -r {tmp_path}) "
-                    "and set them again after the swap"
-                ),
-            ),
-        ),
-    ]
-    assert runner.calls == [
-        ("zfs", "userspace", "-H", "-p", "-n", "-o", "name,quota,objquota", DATASET),
-        ("zfs", "groupspace", "-H", "-p", "-n", "-o", "name,quota,objquota", DATASET),
-        ("zfs", "projectspace", "-H", "-p", "-o", "name,quota,objquota", DATASET),
-    ]
-
-
-def test_no_quotas_no_note(tmp_path: Path) -> None:
-    """Usage without quotas is nothing to carry over."""
-    sim = ZfsSim(["tank", DATASET])
-    sim.quotas[DATASET, "user"] = [("0", "none", "none")]
-    zfs, _ = make(sim)
-    assert quota_notes(zfs, DATASET, tmp_path) == []
-
-
-def test_a_quota_listing_that_fails_ends_the_check(tmp_path: Path) -> None:
-    """Like any failed zfs command, it is no clean result."""
-    zfs, _ = make(ZfsSim(["tank", DATASET]), fail_on("zfs", "userspace"))
-    with pytest.raises(ZfsError, match="zfs userspace -H -p -n -o name,quota,objquota tank/media failed: injected"):
-        quota_notes(zfs, DATASET, tmp_path)

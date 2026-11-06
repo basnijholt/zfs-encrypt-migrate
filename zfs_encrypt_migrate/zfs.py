@@ -104,13 +104,6 @@ class Zfs:
         rows = (line.split("\t", 1) for line in self._run(args).stdout.splitlines() if line)
         return [(row[0], row[1]) for row in rows]
 
-    def quotas(self, kind: str, name: str) -> list[tuple[str, str, str]]:
-        """List the numeric ID, quota and object quota of each ``user``, ``group`` or ``project`` of a filesystem."""
-        numeric = [] if kind == "project" else ["-n"]
-        result = self._run(["zfs", f"{kind}space", "-H", "-p", *numeric, "-o", "name,quota,objquota", name])
-        rows = (line.split("\t") for line in result.stdout.splitlines() if line)
-        return [(row[0], row[1], row[2]) for row in rows]
-
     def snapshots(self, name: str) -> list[str]:
         """List the dataset's own snapshots by full name."""
         result = self._run(["zfs", "list", "-H", "-t", "snapshot", "-o", "name", "-d", "1", name])

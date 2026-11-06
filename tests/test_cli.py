@@ -701,16 +701,13 @@ def checked(filemove_env: FileMoveEnv, tmp_path: Path, monkeypatch: pytest.Monke
     monkeypatch.setenv("ZFS_ENCRYPT_MIGRATE_KEY_FILE", str(key_file))
     monkeypatch.setenv("ZFS_ENCRYPT_MIGRATE_MIN_FREE", "1000")
     monkeypatch.setenv("ZFS_ENCRYPT_MIGRATE_STAGE", "tank/stage")
+    monkeypatch.setattr(preflight, "_is_root", lambda: True)
     return filemove_env
 
 
-def test_file_move_check_lists_problems_and_notes_and_exits_1(
-    checked: FileMoveEnv,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Each problem with its fixes, then the notes, without --delete-source; exit 1 as the run would stop."""
+def test_file_move_check_lists_problems_and_exits_1(checked: FileMoveEnv, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each problem with its fixes, without --delete-source; exit 1 as the run would stop."""
     checked.sim.prop("tank/media", "readonly", "on")
-    checked.sim.quotas["tank/media", "user"] = [("1000", "1073741824", "none")]
     monkeypatch.setattr(preflight, "_inode_flags", lambda path: 0x10 if path.endswith("a.txt") else 0)
 
     result = runner.invoke(cli.app, ["file-move", "--check", "tank/media"])
@@ -723,9 +720,6 @@ def test_file_move_check_lists_problems_and_notes_and_exits_1(
         "from deleting them or the files in them\n"
         "  clear the flags; the copies get none, so set them again after the swap:\n"
         f"    chattr -i {flagged}  # after the swap: chattr +i {flagged}\n"
-        "note: tank/media has per-user, per-group or per-project quotas, which file-move does not carry over\n"
-        "  set them again after the swap:\n"
-        "    zfs set userquota@1000=1073741824 tank/media\n"
         "2 problems would stop file-move; fix them, then check again\n"
     )
     assert checked.sim.ops() == []
@@ -741,17 +735,12 @@ def test_file_move_check_with_one_problem_says_so(checked: FileMoveEnv) -> None:
     assert result.stdout.splitlines()[-1] == "1 problem would stop file-move; fix it, then check again"
 
 
-def test_file_move_check_with_notes_only_exits_0(checked: FileMoveEnv) -> None:
-    """Notes need doing, but would not stop the run; with --delete-source it still only checks."""
-    checked.sim.quotas["tank/media", "group"] = [("100", "none", "5000")]
-
+def test_file_move_check_with_nothing_found_exits_0(checked: FileMoveEnv) -> None:
+    """With --delete-source it still only checks; the summary says the run's unmount still decides."""
     result = runner.invoke(cli.app, ["file-move", "--check", "--delete-source", "tank/media"])
 
     assert result.exit_code == 0, result.output
     assert result.stdout == (
-        "note: tank/media has per-user, per-group or per-project quotas, which file-move does not carry over\n"
-        "  set them again after the swap:\n"
-        "    zfs set groupobjquota@100=5000 tank/media\n"
         "nothing found that would stop file-move; the run still unmounts tank/media first and refuses if a writer "
         "holds it\n"
     )

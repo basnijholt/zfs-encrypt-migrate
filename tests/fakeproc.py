@@ -12,6 +12,8 @@ if TYPE_CHECKING:
 HOST = "mnt:[4026531841]"
 CONTAINER = "mnt:[4026532500]"
 SERVICE = "mnt:[4026532600]"
+HOST_USER = "user:[4026531837]"
+ROOTLESS = "user:[4026532800]"
 SELF_PID = 4000
 
 
@@ -41,6 +43,7 @@ class FakeProc:
     def __init__(self, root: Path, mountinfo: str = "") -> None:
         """Create the checking process, which sees ``mountinfo``."""
         self.root = root
+        self.add(1, comm="init")
         self.add(SELF_PID, comm="zfs-encrypt-mig", mountinfo=mountinfo)
         # No flock held by anyone.
         (root / "locks").write_text("")
@@ -52,6 +55,7 @@ class FakeProc:
         *,
         comm: str = "worker",
         ns: str = HOST,
+        userns: str = HOST_USER,
         mountinfo: str = "",
         fds: Sequence[Path | str] = (),
         cwd: Path | None = None,
@@ -64,6 +68,7 @@ class FakeProc:
         (base / "ns").mkdir(parents=True)
         # The kernel's link names the namespace; it points nowhere a path could reach.
         (base / "ns" / "mnt").symlink_to(ns)
+        (base / "ns" / "user").symlink_to(userns)
         (base / "comm").write_text(f"{comm}\n")
         (base / "mountinfo").write_text(mountinfo)
         (base / "fd").mkdir()
