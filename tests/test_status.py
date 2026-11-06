@@ -8,11 +8,10 @@ from pathlib import Path
 
 import pytest
 
-from zfs_encrypt_migrate import filetree, status
+from zfs_encrypt_migrate import status
 from zfs_encrypt_migrate.constants import MARK_ADMITTED, MARK_DIRS, MARK_KEY, MARK_SOURCE
-from zfs_encrypt_migrate.errors import MigrationError
 from zfs_encrypt_migrate.filemove import _run_lock
-from zfs_encrypt_migrate.status import file_move_status, _lock_state
+from zfs_encrypt_migrate.status import _lock_state, file_move_status
 
 from .conftest import STAGE, FileMoveEnv
 
@@ -85,30 +84,35 @@ def test_dirs_and_key_not_done(filemove_env: FileMoveEnv, lock: Path) -> None:
     assert f"{MARK_KEY}: no" in text
 
 
-def test_moving(filemove_env: FileMoveEnv, lock: Path) -> None:
-    """Admitted with files left in the source is moving."""
+def test_admitted_phase_from_properties_only(filemove_env: FileMoveEnv, lock: Path) -> None:
+    """Admitted is reported without counting files, whatever the source holds."""
     stage(filemove_env, admitted=True, dirs=True, key="prompt")
     text = report(filemove_env, lock)
-    assert "phase: moving files" in text
+    assert "phase: moving files or finishing (file count not checked)" in text
     assert "do not destroy either" in text
 
 
-def test_only_directories_left(filemove_env: FileMoveEnv, lock: Path) -> None:
-    """Admitted with only directories left in the source."""
+def test_status_opens_nothing_on_the_mountpoints(
+    filemove_env: FileMoveEnv,
+    lock: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Status never lists, opens or reads the source or staged mountpoint, so it cannot hold a mount busy."""
     stage(filemove_env, admitted=True, dirs=True, key="prompt")
-    for name in ("a.txt", "docs/b.txt", "docs/deep/c.txt"):
-        (filemove_env.src / name).unlink()
-    text = report(filemove_env, lock)
-    assert "phase: only directories left" in text
+    filemove_env.sim.prop(STAGED, "mountpoint", str(filemove_env.mount_root))
+    seen: list[str] = []
+    for name in ("scandir", "listdir", "open"):
+        real = getattr(os, name)
 
+        def spy(*args: object, _real: object = real, **kwargs: object) -> object:
+            seen.append(str(args[0]) if args else "")
+            return _real(*args, **kwargs)  # type: ignore[operator]
 
-def test_admitted_source_unmounted(filemove_env: FileMoveEnv, lock: Path) -> None:
-    """An unmounted source is not read; the phase says so."""
-    stage(filemove_env, admitted=True)
-    filemove_env.sim.prop(DATASET, "mounted", "no")
-    text = report(filemove_env, lock)
-    assert "phase: moving files or only directories left" in text
-    assert "not mounted" in text
+        monkeypatch.setattr(os, name, spy)
+    monkeypatch.setattr(Path, "iterdir", lambda self: seen.append(str(self)) or iter(()))
+    monkeypatch.setattr(Path, "open", lambda self, *_a, **_k: seen.append(str(self)))
+    report(filemove_env, lock)
+    assert not [p for p in seen if str(filemove_env.src) in p or str(filemove_env.mount_root) in p]
 
 
 def test_swapped(filemove_env: FileMoveEnv, lock: Path) -> None:
@@ -123,13 +127,48 @@ def test_swapped(filemove_env: FileMoveEnv, lock: Path) -> None:
 
 
 def test_swapped_with_markers_left(filemove_env: FileMoveEnv, lock: Path) -> None:
-    """Marker properties left on the swapped dataset mean the final steps did not finish."""
+    """Marker properties left on the swapped dataset mean the swap was interrupted."""
     sim = filemove_env.sim
     sim.prop(DATASET, "encryption", "aes-256-gcm")
     sim.prop(DATASET, MARK_SOURCE, DATASET)
     text = report(filemove_env, lock)
-    assert "phase: swapped, final steps unfinished" in text
-    assert f"zfs inherit {MARK_SOURCE} {DATASET}" in text
+    assert "phase: swap interrupted" in text
+    assert "recovery hints" in text
+    assert "zfs inherit" not in text
+    assert "destroy" not in text
+
+
+def test_swap_stopped_after_source_marker_removed(filemove_env: FileMoveEnv, lock: Path) -> None:
+    """MARK_SOURCE goes first; other markers or an unmounted dataset still mean the swap is unfinished."""
+    sim = filemove_env.sim
+    sim.datasets |= {f"{STAGE}/old", f"{STAGE}/old/media"}
+    sim.prop(DATASET, "encryption", "aes-256-gcm")
+    sim.prop(DATASET, MARK_ADMITTED, "yes")
+    assert "phase: swap interrupted" in report(filemove_env, lock)
+    sim.props.pop((DATASET, MARK_ADMITTED))
+    sim.prop(DATASET, "mounted", "no")
+    sim.prop(DATASET, "canmount", "noauto")
+    text = report(filemove_env, lock)
+    assert "phase: swap interrupted" in text
+    assert "destroy" not in text
+
+
+def test_already_encrypted_without_move_state(filemove_env: FileMoveEnv, lock: Path) -> None:
+    """An encrypted dataset with no old copy and no markers has no file-move state."""
+    filemove_env.sim.prop(DATASET, "encryption", "aes-256-gcm")
+    text = report(filemove_env, lock)
+    assert "already encrypted; no file-move state found" in text
+    assert "destroy" not in text
+
+
+def test_lock_stat_error_is_unknown(lock: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An OSError on the lock file other than a missing file is reported as unknown."""
+
+    def broken(_self: Path, **_kw: object) -> os.stat_result:
+        raise PermissionError
+
+    monkeypatch.setattr(Path, "stat", broken)
+    assert _lock_state(lock).startswith("unknown")
 
 
 def test_staged_of_another_dataset(filemove_env: FileMoveEnv, lock: Path) -> None:
@@ -215,47 +254,6 @@ def test_held_lock_says_wait(filemove_env: FileMoveEnv, lock: Path) -> None:
     assert "lock: held by a running file-move" in text
     assert "next: wait" in text
     assert "rerun" not in text
-
-
-def test_has_files_reads_without_touching(tmp_path: Path) -> None:
-    """The early-exit scan finds files, ignores directories and .zfs, and writes nothing."""
-    (tmp_path / "d" / "e").mkdir(parents=True)
-    (tmp_path / ".zfs").mkdir()
-    (tmp_path / ".zfs" / "hidden").write_text("x")
-    assert filetree.has_files(tmp_path) is False
-    (tmp_path / "d" / "e" / "f").symlink_to("nowhere")
-    assert filetree.has_files(tmp_path) is True
-
-
-def test_has_files_does_not_cross_filesystems(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A directory on another device is not entered."""
-    (tmp_path / "d").mkdir()
-    (tmp_path / "d" / "f").write_text("x")
-    real = os.fstat
-    other_ino = (tmp_path / "d").stat().st_ino
-
-    def fstat(fd: int) -> os.stat_result:
-        st = real(fd)
-        if st.st_ino != other_ino:
-            return st
-        return os.stat_result((*st[:2], st.st_dev + 1, *st[3:]))
-
-    monkeypatch.setattr(filetree.os, "fstat", fstat)
-    assert filetree.has_files(tmp_path) is False
-
-
-def test_noatime_open_falls_back_to_unknown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """When O_NOATIME is refused the scan raises rather than update access times."""
-    real = os.open
-
-    def refuse(path: str | Path, flags: int, *args: int, **kwargs: int) -> int:
-        if flags & getattr(os, "O_NOATIME", 0):
-            raise PermissionError
-        return real(path, flags, *args, **kwargs)
-
-    monkeypatch.setattr(filetree.os, "open", refuse)
-    with pytest.raises(MigrationError):
-        filetree.has_files(tmp_path)
 
 
 def test_status_report_is_a_list_of_text(filemove_env: FileMoveEnv, lock: Path) -> None:

@@ -387,7 +387,7 @@ tank/stage/media: exists
   zfs-encrypt-migrate:admitted: yes
   zfs-encrypt-migrate:dirs: yes
   tank/stage/media: used 2.0K, logicalused 4.0K
-phase: moving files
+phase: moving files or finishing (file count not checked)
 lock: no run holds it
 next: rerun the same file-move command to continue; do not destroy either tank/media or tank/stage/media
 ```
@@ -398,18 +398,18 @@ The phase comes from state that already exists; nothing new is recorded:
 | --- | --- |
 | `not started` | `STAGE/LEAF` does not exist and `DATASET` is not encrypted. |
 | `copying the tree` | `STAGE/LEAF` exists and is not yet marked `admitted`: no file was deleted yet. |
-| `moving files` | Admitted, and `DATASET` still holds a file that is not a directory. |
-| `only directories left` | Admitted, and `DATASET` holds only directories. |
-| `moving files or only directories left` | Admitted, but `DATASET` is not mounted where it should be, so its files were not looked at; a note says why. |
-| `swapped` | `STAGE/LEAF` does not exist and `DATASET` is encrypted. If `zfs-encrypt-migrate:file-move` is still set on it, the phase is `swapped, final steps unfinished`. |
+| `moving files or finishing (file count not checked)` | `STAGE/LEAF` is marked `admitted`. |
+| `swapped` | `STAGE/LEAF` does not exist, `DATASET` is encrypted with `STAGE/old/LEAF` present, no marker property is left on it and it is mounted. |
+| `swap interrupted` | The same, but a marker property is left or `DATASET` is not mounted: the marker `zfs-encrypt-migrate:file-move` is removed first, so its absence alone proves nothing. Follow the recovery hints the run printed. |
+| `already encrypted` | `DATASET` is encrypted with no `STAGE/LEAF`, no `STAGE/old/LEAF` and no marker: no file-move state was found. |
 
-To tell the last two moving phases apart it reads the mounted dataset, stopping at the first file it meets.
-It opens directories with `O_NOATIME` so that even this never writes an access time; if the kernel refuses that, it says the files were not counted instead of reading without it.
+The status never lists, opens or reads anything under the source or the staged mountpoint, so it cannot hold either mount busy against the unmounts the run does.
+It therefore does not count the files left; it reads only zfs properties.
 
 The lock line says whether a run holds `/run/zfs-encrypt-migrate.lock`.
 `file-move` takes a `flock` lock, which `fcntl` `F_GETLK` cannot see on Linux, so the status looks for the lock file's device and inode among the `FLOCK` entries of `/proc/locks`, which lists every lock the kernel holds.
 It only calls `stat` on the lock file: it never opens, creates or locks it, so it can never make a starting run fail or wait.
-No lock file means `no run`; a file nobody holds means `no run holds it` (the file stays after a run ends); a holder shows its pid, as seen from the status's own PID namespace; if `/proc/locks` cannot be read, the state is `unknown`.
+No lock file means `no run`; a file nobody holds means `no run holds it` (the file stays after a run ends); a holder shows its pid, as seen from the status's own PID namespace; if the lock file or `/proc/locks` cannot be read, the state is `unknown`.
 
 The last line says what to do: `run file-move`, `wait` while a run holds the lock, `rerun the same file-move command`, or, once swapped, the steps after the swap.
 A dataset that is missing, or a `STAGE/LEAF` that belongs to something else, is reported as it is.
