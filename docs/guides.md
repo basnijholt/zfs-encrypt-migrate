@@ -196,7 +196,7 @@ Stopping is not enough: a reboot mid-move would start the services again on a ha
 - Stop the NFS server and Samba exports of it.
 - Disable snapshot tools (sanoid, zfs-auto-snapshot) for the dataset, then destroy its snapshots. A snapshot keeps deleted files allocated, so no space would be freed; `file-move` refuses while one exists before it changes anything, and checks again before each batch is copied and before it is deleted.
 
-**2. Run it in tmux or screen.**
+**2. Run it in tmux or screen, or [unattended](#running-unattended).**
 
 ```bash
 tmux new -s file-move
@@ -209,6 +209,7 @@ zfs-encrypt-migrate file-move tank/media --delete-source
 Every run first unmounts and remounts the dataset to prove no writer has it open.
 The first run then creates the encrypted dataset `tank/stage/media` with the source's properties, copies the directory tree, and checks the final passphrase.
 With the default `--final-keylocation prompt` it asks for the passphrase on the terminal, so start the first run from one; the passphrase must be the one in your key file.
+An [unattended run](#running-unattended) checks the key file instead.
 A rerun with a different `--final-keylocation` checks the key again, before it deletes anything more.
 Each batch then prints a line:
 
@@ -227,7 +228,7 @@ A failure or Ctrl-C stops rsync, unmounts the encrypted dataset and unloads its 
 Before the first file is deleted, they are all still in the dataset: when the free-space admission refuses the move, the hint says so and gives the `zfs destroy -r` command that removes the encrypted dataset, in case you give up.
 When the error is followed by `file-move aborted.`, the swap had begun: run the commands it prints first, rather than rerunning straight away (see [recovery hints](usage.md#recovery-hints)).
 
-- Ctrl-C, SIGTERM and SIGHUP stop the run cleanly. Use Ctrl-C.
+- Ctrl-C, SIGTERM and SIGHUP stop the run cleanly. Use Ctrl-C, or SIGTERM for an [unattended run](#running-unattended).
 - Ctrl-Z and Ctrl-\ are not caught: they stop only the CLI, while the current rsync batch finishes in the background. Don't use them.
 - After a reboot the key file under `/run` is gone. Recreate it with the same passphrase (see [Getting Started](getting-started.md)), then rerun.
 - If a batch fails because the pool is too full, free space or lower `--batch-size`, then rerun. Freed space is released asynchronously, so before refusing, the tool runs `zpool sync` and waits up to five minutes for it.
@@ -267,6 +268,42 @@ If a hard-linked file has fewer names in the dataset than its link count says, t
 - **Tiny files may each grow to one 4K sector.** An unencrypted dataset can store a file of a few bytes inside its block pointer; an encrypted one can't, so the copy takes a whole sector. The space math counts at least 4K per file.
 - **The space math is an estimate; `--min-free` is the margin.** It counts at least 4K per non-empty file (hard links once), which can undercount tiny files on pools with bigger sectors (`ashift` above 12), and it leaves out metadata: empty files, symlinks and the directory tree, which the staged dataset holds twice until the swap. With many tiny files or directories, raise `--min-free`. If space still runs short, the run stops without deleting anything of that batch: either before copying it (after waiting up to five minutes for freed space) or when rsync fails on the full pool. A rerun with more free space continues.
 - **`sharenfs`, `sharesmb`, `reservation` and `refreservation` are set only after the swap,** so a stopped run never leaves them on the encrypted dataset's private mountpoint.
+
+### Running unattended
+
+A run that takes a day or two doesn't need a terminal kept open: start it as a transient systemd unit.
+
+First create the key file in `/run`, without echoing the passphrase. Type it from where you keep it:
+
+```bash
+install -m 600 /dev/null /run/zfs-encrypt-migrate.key
+read -rs passphrase && printf '%s' "$passphrase" > /run/zfs-encrypt-migrate.key && unset passphrase
+```
+
+Then start the run, and follow its log:
+
+```bash
+systemd-run --unit=zfs-encrypt-migrate --collect \
+  --setenv=PATH="$PATH" --setenv=PYTHONUNBUFFERED=1 \
+  --property=StandardOutput=append:/var/log/zfs-encrypt-migrate.log \
+  zfs-encrypt-migrate file-move tank/media --stage tank/stage \
+  --delete-source --check-prompt-with-key-file
+tail -f /var/log/zfs-encrypt-migrate.log
+```
+
+- The unit doesn't get your shell's environment. `--setenv=PATH` gives it your `zfs`, `zpool` and `rsync`, and options like `--stage` go on the command line.
+- The output, errors included, is appended to the log. `PYTHONUNBUFFERED=1` writes each line, such as each batch line, as soon as it's printed.
+- `--collect` removes the unit when it ends, even after a failure or a stop, so you can start it again under the same name.
+- `--check-prompt-with-key-file` checks the final key against the key file, since nobody is at a terminal to type it. The dataset still ends with `keylocation=prompt`. The check proves the key file opens the encrypted dataset, not that the passphrase you keep is the same, so check that yourself before the next reboot: `zfs load-key -n -L prompt tank/stage/media` asks for it and only checks it. See [the option](usage.md#shared-options).
+
+**Stopping.**
+`systemctl stop zfs-encrypt-migrate` sends SIGTERM, which stops the run as cleanly as Ctrl-C.
+Run the same `systemd-run` command to continue.
+For a run you started yourself as `cmd &` from a script, use SIGTERM (`kill PID`) too, not `kill -INT`: a non-interactive shell starts background jobs with SIGINT ignored, and the tool keeps it ignored.
+
+**After a reboot.**
+`/run` is empty, so the key file is gone.
+Write the same passphrase to it again, as above, before you start the run again.
 
 ## Rebuilding a Whole Pool Encrypted
 

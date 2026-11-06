@@ -480,6 +480,7 @@ While it unloads the key, further signals are ignored, so a second Ctrl-C can't 
 
 A signal that was already ignored when the tool started stays ignored.
 For a long seed over SSH, `nohup zfs-encrypt-migrate seed ...` therefore survives a dropped connection instead of aborting.
+The same goes for SIGINT in a background job (`cmd &`) of a non-interactive shell, which starts with SIGINT ignored: `kill -INT` doesn't stop such a run, so use SIGTERM.
 
 ## Safety Model
 
