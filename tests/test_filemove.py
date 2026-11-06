@@ -885,6 +885,26 @@ def test_check_passphrase_prompt_needs_terminal_names_the_key_file_check(
     assert not [call for call in filemove_env.runner.calls if "load-key" in call]
 
 
+@pytest.mark.parametrize("raw", ["--keyformat", "staged dataset"])
+def test_check_passphrase_prompt_needs_terminal_offers_no_flag_for_a_raw_key(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    raw: str,
+) -> None:
+    """The flag refuses a raw key, from this run's --keyformat or the staged dataset's, so the refusal skips it."""
+    monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: False)
+    env = staged_env(filemove_env)
+    if raw == "--keyformat":
+        settings = replace(settings, keyformat="raw")
+    else:
+        env.sim.prop(STAGED, "keyformat", "raw")
+    with pytest.raises(MigrationError) as info:
+        _check_passphrase(env.zfs, settings, STAGED)
+    assert info.value.message == "run file-move once from a terminal so it can check the passphrase"
+    assert info.value.hints == ()
+
+
 def key_file_check(key_file: Path) -> tuple[str, ...]:
     """Return the check of the final key against the key file."""
     return ("zfs", "load-key", "-n", "-L", f"file://{key_file}", STAGED)
@@ -1977,6 +1997,47 @@ def test_file_move_rerun_checks_a_replaced_key_file_while_the_key_stays_loaded(
     assert source_files(env) == left
     # The loaded key was not loaded again from the file, so nothing but the check read it.
     assert ("zfs", "load-key", STAGED) not in runner.calls
+
+
+@needs_rsync
+def test_file_move_rerun_refuses_the_flag_for_a_staged_raw_key(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The staged dataset's own keyformat counts: a rerun that leaves out --keyformat raw cannot end with prompt."""
+    env = filemove_env
+    monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: False)
+    before = source_files(env)
+
+    def move(changed: Settings, *, flag: bool) -> list[str]:
+        return file_move(
+            env.zfs,
+            changed,
+            DATASET,
+            batch_size=1,
+            delete_source=True,
+            check_prompt_with_key_file=flag,
+            mount_root=env.mount_root,
+            lock_path=tmp_path / "lock",
+            sleep=recorder()[1],
+        )
+
+    # A first run with a raw key creates the staged dataset, then stops at the check: nobody is at a terminal.
+    with pytest.raises(MigrationError):
+        move(replace(settings, keyformat="raw"), flag=False)
+    assert env.sim.props[STAGED, "keyformat"] == "raw"
+
+    with pytest.raises(MigrationError) as info:
+        move(settings, flag=True)
+
+    assert info.value.message == (
+        f"{STAGED} has keyformat=raw, which can't be typed at the prompt; "
+        "--check-prompt-with-key-file needs a passphrase or hex key"
+    )
+    assert source_files(env) == before
+    assert not [call for call in env.runner.calls if call[:3] == ("zfs", "load-key", "-n")]
 
 
 def test_file_move_needs_delete_source(filemove_env: FileMoveEnv, settings: Settings, tmp_path: Path) -> None:

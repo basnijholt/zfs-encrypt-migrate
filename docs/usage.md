@@ -301,6 +301,7 @@ Both ask for the passphrase and only check it.
 If yours fails, the key file holds the passphrase that works: store that one instead, before you reboot.
 
 It needs `--final-keylocation prompt`, and `--keyformat passphrase` or `hex`: OpenZFS doesn't take a raw key typed at a prompt, so nobody could answer that one. Anything else is a usage error.
+A rerun also refuses it, before it deletes anything, when `STAGE/LEAF` has a raw key, whatever this run's `--keyformat` says.
 It has no environment variable: like `--delete-source`, you pass it on each run.
 Every run with the flag checks the key file again before it deletes anything, because the file may have changed since it last passed.
 The staged dataset records the check as `file://KEY` (step 6 below).
@@ -376,6 +377,7 @@ From the final unmount of step 8 on, the hints remount with `zfs mount -a` inste
 | `cannot unmount DATASET; a writer is probably still running` | Stop the writer and rerun. |
 | `PATH is not where DATASET is mounted (nothing is mounted there)` (or `(SOURCE of type TYPE is mounted there)`) | PATH, the mountpoint `zfs get` gives, is not where the kernel mounted DATASET (the dataset, or `STAGE/LEAF`). Usually the mountpoint ends in a space, which `zfs get` strips; `findmnt --source DATASET` shows where it is mounted. Set a mountpoint without the space, and rerun. |
 | `run file-move once from a terminal so it can check the passphrase` | Run it from a terminal (tmux). Or, if the key file holds the passphrase you keep, pass `--check-prompt-with-key-file`, which checks the key file instead. Or pass `--final-keylocation file:///absolute/path`. |
+| `STAGE/LEAF has keyformat=raw, which can't be typed at the prompt; --check-prompt-with-key-file needs a passphrase or hex key` | Nothing more was deleted. Rerun without the flag, with a `--final-keylocation` that can hold a raw key, such as `file:///absolute/path`. |
 | `the key for STAGE/LEAF did not load from LOCATION; nothing was deleted` | Fix the key or location; the first mistyped passphrase deletes nothing. |
 | `DATASET has snapshots, which keep deleted files allocated: ...` | Disable snapshot tools for the dataset, then destroy the snapshots it lists (`zfs destroy SNAPSHOT`). |
 | `PATH has N hard links but only M were found` | The dataset changed during the scan: a writer added or removed a link. Stop the writers and rerun. |

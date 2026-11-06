@@ -422,6 +422,14 @@ def _stdin_is_terminal() -> bool:
     return sys.stdin.isatty()
 
 
+def _raw_key(zfs: Zfs, settings: Settings, staged: str) -> bool:
+    """Return whether the staged key is raw, which zfs refuses to take typed at a terminal.
+
+    The staged dataset's own keyformat counts: a rerun may leave out the --keyformat raw that created it.
+    """
+    return settings.keyformat == "raw" or zfs.get("keyformat", staged) == "raw"
+
+
 def _check_passphrase(zfs: Zfs, settings: Settings, staged: str, *, check_prompt_with_key_file: bool = False) -> None:
     """Prove the final key unlocks the staged dataset before any file is deleted.
 
@@ -431,6 +439,12 @@ def _check_passphrase(zfs: Zfs, settings: Settings, staged: str, *, check_prompt
     """
     location = settings.final_keylocation
     from_key_file = location == "prompt" and check_prompt_with_key_file
+    if from_key_file and _raw_key(zfs, settings, staged):
+        msg = (
+            f"{staged} has keyformat=raw, which can't be typed at the prompt; "
+            "--check-prompt-with-key-file needs a passphrase or hex key"
+        )
+        raise MigrationError(msg)
     check = f"file://{settings.key_file}" if from_key_file else location
     checked = zfs.get(MARK_KEY, staged)
     # The key file is checked on every run: it may have changed since it passed, and the staged key a killed run
@@ -444,7 +458,8 @@ def _check_passphrase(zfs: Zfs, settings: Settings, staged: str, *, check_prompt
                 "or, if the key file holds the passphrase you keep, check that file instead: "
                 "rerun with --check-prompt-with-key-file"
             )
-            raise MigrationError(msg, [hint])
+            # The flag refuses a raw key, so it is no way out for one.
+            raise MigrationError(msg, [] if _raw_key(zfs, settings, staged) else [hint])
         loaded = zfs.check_key(staged, "prompt", attached=True)
     else:
         loaded = zfs.check_key(staged, check, attached=False)
