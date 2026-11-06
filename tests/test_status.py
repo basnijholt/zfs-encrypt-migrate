@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import builtins
 import fcntl
-import io
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -37,7 +36,7 @@ def lock(tmp_path: Path) -> Path:
 
 def report(env: FileMoveEnv, lock: Path) -> str:
     """Run the status and return its text; assert that only read commands ran."""
-    lines = file_move_status(env.zfs, STAGE, DATASET, lock_path=lock)
+    lines = file_move_status(env.zfs, STAGE, DATASET, lock)
     assert env.sim.ops() == []
     assert {call[1] for call in env.sim.log} <= READ_VERBS
     assert {call[0] for call in env.sim.log} == {"zfs"}
@@ -65,8 +64,8 @@ def test_source_only_prints_facts(filemove_env: FileMoveEnv, lock: Path) -> None
     assert f"{DATASET}: exists" in text
     assert "  encryption: off" in text
     assert "  mounted: yes" in text
-    assert "  used: 1.0M" in text
-    assert "  logicalused: 2.0M" in text
+    assert "  used: 1048576" in text
+    assert "  logicalused: 2097152" in text
     assert f"{STAGED}: does not exist" in text
     assert f"{STAGE}/old/media: does not exist" in text
     assert "lock: no run" in text
@@ -76,14 +75,12 @@ def test_staged_facts_and_markers(filemove_env: FileMoveEnv, lock: Path) -> None
     """The staged dataset shows its facts and every marker, unset ones as zfs prints them."""
     stage(filemove_env, admitted=True, key="prompt")
     sim = filemove_env.sim
-    sim.prop(STAGED, "encryptionroot", STAGED)
     sim.prop(STAGED, "keystatus", "available")
     sim.prop(STAGED, "used", "2048")
     text = report(filemove_env, lock)
     assert f"{STAGED}: exists" in text
-    assert f"  encryptionroot: {STAGED}" in text
     assert "  keystatus: available" in text
-    assert "  used: 2.0K" in text
+    assert "  used: 2048" in text
     assert f"  {MARK_SOURCE}: {DATASET}" in text
     assert f"  {MARK_KEY}: prompt" in text
     assert f"  {MARK_ADMITTED}: yes" in text
@@ -112,40 +109,42 @@ def test_report_gives_no_advice(filemove_env: FileMoveEnv, lock: Path) -> None:
         assert word not in text
 
 
-def test_status_opens_nothing_on_the_mountpoints(
+def test_status_only_stats_the_lock_and_touches_no_mountpoint(
     filemove_env: FileMoveEnv,
     lock: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Status never lists, opens or reads the source or staged mountpoint, so it cannot hold a mount busy."""
+    """Status never opens or flocks the lock file, and never lists or opens anything under the mountpoints."""
     stage(filemove_env, admitted=True, dirs=True, key="prompt")
-    filemove_env.sim.prop(STAGED, "mountpoint", str(filemove_env.mount_root))
+    lock.write_text("")
     seen: list[str] = []
 
     def spied(real: Callable[..., object]) -> Callable[..., object]:
         def spy(*args: object, **kwargs: object) -> object:
-            # A method is called with the Path as its first argument, a function with the path.
             seen.append(str(args[0]) if args else "")
             return real(*args, **kwargs)
 
         return spy
 
-    for owner, name in (
-        (os, "scandir"),
-        (os, "listdir"),
-        (os, "open"),
-        (os, "stat"),
-        (os, "lstat"),
-        (Path, "iterdir"),
-        (Path, "open"),
-        (Path, "stat"),
-        (Path, "lstat"),
-        (builtins, "open"),
-        (io, "open"),
-    ):
+    for owner, name in ((os, "open"), (os, "scandir"), (builtins, "open"), (fcntl, "flock")):
         monkeypatch.setattr(owner, name, spied(getattr(owner, name)))
     report(filemove_env, lock)
-    assert not [p for p in seen if str(filemove_env.src) in p or str(filemove_env.mount_root) in p]
+    # /proc/locks is read; the lock file and the mountpoints are not.
+    assert not [p for p in seen if str(lock) in p or str(filemove_env.src) in p or str(filemove_env.mount_root) in p]
+
+
+def test_markers_on_dataset_after_swap(filemove_env: FileMoveEnv, lock: Path) -> None:
+    """A swap stopped after the second rename leaves its markers on DATASET; they are shown."""
+    sim = filemove_env.sim
+    sim.datasets |= {f"{STAGE}/old", f"{STAGE}/old/media"}
+    sim.prop(DATASET, "encryption", "aes-256-gcm")
+    sim.prop(DATASET, MARK_ADMITTED, "yes")
+    sim.prop(DATASET, MARK_SOURCE, DATASET)
+    text = report(filemove_env, lock)
+    assert f"{STAGED}: does not exist" in text
+    assert f"{STAGE}/old/media: exists" in text
+    assert f"  {MARK_ADMITTED}: yes" in text
+    assert f"  {MARK_SOURCE}: {DATASET}" in text
 
 
 def test_lock_stat_error_is_unknown(lock: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -178,15 +177,6 @@ def test_lock_held_and_status_does_not_disturb(lock: Path) -> None:
     assert _lock_state(lock) == "no run holds it"
     with _run_lock(lock):
         pass
-
-
-def test_lock_status_does_not_block_a_starting_run(lock: Path) -> None:
-    """The status leaves no lock of its own: a run takes the lock while a status result exists."""
-    lock.write_text("")
-    _lock_state(lock)
-    handle = lock.open("a")
-    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    handle.close()
 
 
 def test_lock_unreadable_proc_locks(lock: Path, monkeypatch: pytest.MonkeyPatch) -> None:

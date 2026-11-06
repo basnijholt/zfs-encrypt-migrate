@@ -85,6 +85,11 @@ class Zfs:
         """Read one property as a parsable value."""
         return self._run(["zfs", "get", "-H", "-p", "-o", "value", prop, name]).stdout.strip()
 
+    def get_many(self, props: Sequence[str], name: str) -> list[tuple[str, str]]:
+        """Read several properties in one command, in zfs's human format; a user property that is unset reads ``-``."""
+        result = self._run(["zfs", "get", "-H", "-o", "property,value", ",".join(props), name])
+        return [(row[0], row[1]) for row in (line.split("\t", 1) for line in result.stdout.splitlines() if line)]
+
     def props(self, name: str) -> dict[str, Prop]:
         """Read every property, user properties included, with its source."""
         result = self._run(["zfs", "get", "-H", "-p", "-o", "property,value,source", "all", name])

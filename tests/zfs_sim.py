@@ -166,6 +166,8 @@ class ZfsSim:
             return ok("".join(f"{d}\n" for d in names))
         if verb == "get" and args[-2] == "all":
             return ok(self._get_all(args[-1]))
+        if verb == "get" and "property,value" in args:
+            return ok("".join(f"{p}\t{self._get(p, args[-1])}\n" for p in args[-2].split(",")))
         if verb == "get" and "-r" in args:
             return self._get_local(args[-2], args[-1])
         if verb == "get":

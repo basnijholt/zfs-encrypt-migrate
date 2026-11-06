@@ -6,9 +6,8 @@ import os
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .constants import LOCK_FILE, MARK_ADMITTED, MARK_DIRS, MARK_KEY, MARK_SOURCE
+from .constants import MARK_ADMITTED, MARK_DIRS, MARK_KEY, MARK_SOURCE
 from .migrate import leaf_of
-from .sizes import format_size
 
 if TYPE_CHECKING:
     from .zfs import Zfs
@@ -52,29 +51,23 @@ def _lock_state(path: Path) -> str:
     return "no run holds it"
 
 
-_FACTS = ("encryption", "encryptionroot", "keystatus", "mounted", "canmount", "mountpoint")
-_MARKS = (MARK_SOURCE, MARK_KEY, MARK_ADMITTED, MARK_DIRS)
+_PROPS = ("encryption", "keystatus", "mounted", "used", "logicalused", MARK_SOURCE, MARK_KEY, MARK_ADMITTED, MARK_DIRS)
 
 
-def _facts(zfs: Zfs, name: str, *, markers: bool = False) -> list[str]:
-    """List the facts of a dataset, or that it does not exist. Reads only."""
+def _facts(zfs: Zfs, name: str) -> list[str]:
+    """List the facts of a dataset, markers included, or that it does not exist. One ``zfs get``."""
     if not zfs.exists(name):
         return [f"{name}: does not exist"]
-    lines = [f"{name}: exists"]
-    lines += [f"  {prop}: {zfs.get(prop, name)}" for prop in _FACTS]
-    lines += [f"  {prop}: {format_size(int(zfs.get(prop, name)))}" for prop in ("used", "logicalused")]
-    if markers:
-        lines += [f"  {prop}: {zfs.get(prop, name)}" for prop in _MARKS]
-    return lines
+    return [f"{name}: exists", *(f"  {prop}: {value}" for prop, value in zfs.get_many(_PROPS, name))]
 
 
-def file_move_status(zfs: Zfs, stage: str, dataset: str, *, lock_path: Path = LOCK_FILE) -> list[str]:
+def file_move_status(zfs: Zfs, stage: str, dataset: str, lock_path: Path) -> list[str]:
     """Return the facts about the file-move of ``dataset`` through ``stage``; it infers and advises nothing."""
     leaf = leaf_of(dataset)
     return [
         f"file-move status of {dataset} (stage {stage})",
         *_facts(zfs, dataset),
-        *_facts(zfs, f"{stage}/{leaf}", markers=True),
+        *_facts(zfs, f"{stage}/{leaf}"),
         f"{stage}/old/{leaf}: {'exists' if zfs.exists(f'{stage}/old/{leaf}') else 'does not exist'}",
         f"lock: {_lock_state(lock_path)}",
     ]

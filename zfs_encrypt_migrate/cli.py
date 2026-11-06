@@ -357,7 +357,7 @@ def file_move_command(
 def file_move_status_command(dataset: DatasetArgument, *, stage: StageOption) -> None:
     """Print facts about a file-move; only reads, so it is safe while a run is active."""
     try:
-        lines = file_move_status(Zfs(_runner()), stage, dataset, lock_path=LOCK_FILE)
+        lines = file_move_status(Zfs(_runner()), stage, dataset, LOCK_FILE)
     except MigrationError as error:
         print_error(error.message, error.hints)
         raise typer.Exit(1) from error

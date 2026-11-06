@@ -401,31 +401,28 @@ zfs-encrypt-migrate file-move-status --stage tank/stage tank/media
 ```
 
 Prints facts about the `file-move` of `DATASET`, while it runs or after it stopped.
-It is strictly read-only: it runs only `zfs list` and `zfs get`, and reads `/proc/locks`.
+It is strictly read-only: it runs only `zfs list` and `zfs get` (one `zfs get` per dataset) and reads `/proc/locks`.
 It never unmounts, mounts, loads a key, takes a snapshot or sets a property, and it never lists, opens or reads anything under the source or the staged mountpoint, so it cannot hold either mount busy against the unmounts the run does.
 Run it as root, like the other commands.
-It infers no phase and gives no advice: the facts are yours to read, and the recovery hints the run itself printed are authoritative.
 
 ```text
 file-move status of tank/media (stage tank/stage)
 tank/media: exists
   encryption: off
-  encryptionroot: -
   keystatus: -
   mounted: yes
-  canmount: on
-  mountpoint: /mnt/media
-  used: 1.0M
-  logicalused: 2.0M
+  used: 1.00T
+  logicalused: 1.02T
+  zfs-encrypt-migrate:file-move: -
+  zfs-encrypt-migrate:key-checked: -
+  zfs-encrypt-migrate:admitted: -
+  zfs-encrypt-migrate:dirs: -
 tank/stage/media: exists
   encryption: aes-256-gcm
-  encryptionroot: tank/stage/media
   keystatus: available
   mounted: yes
-  canmount: noauto
-  mountpoint: /run/zfs-encrypt-migrate/media
-  used: 2.0K
-  logicalused: 4.0K
+  used: 2.00G
+  logicalused: 2.10G
   zfs-encrypt-migrate:file-move: tank/media
   zfs-encrypt-migrate:key-checked: prompt
   zfs-encrypt-migrate:admitted: yes
@@ -434,24 +431,20 @@ tank/stage/old/media: does not exist
 lock: no run holds it
 ```
 
-For `DATASET` and `STAGE/LEAF` it prints whether they exist, then `encryption`, `encryptionroot`, `keystatus`, `mounted`, `canmount`, `mountpoint`, `used` and `logicalused`; for `STAGE/LEAF` also the four `zfs-encrypt-migrate:*` marker values (`-` when unset).
-It also prints whether `STAGE/old/LEAF` exists.
+What it prints:
 
-The lock line says whether a run holds `/run/zfs-encrypt-migrate.lock`.
+- For `DATASET` and for `STAGE/LEAF`: whether it exists and, as `zfs get` shows them, `encryption`, `keystatus`, `mounted`, `used` and `logicalused`, then the four `zfs-encrypt-migrate:*` marker values (`-` when unset). Both datasets show their markers, because a swap that stopped part way leaves them on `DATASET`.
+- Whether `STAGE/old/LEAF` exists.
+- The lock line: whether a run holds `/run/zfs-encrypt-migrate.lock`.
+
+The status interprets nothing and gives no advice.
+The output and the recovery hints of the run itself are authoritative.
+
 `file-move` takes a `flock` lock, which `fcntl` `F_GETLK` cannot see on Linux, so the status looks for the lock file's device and inode among the `FLOCK` entries of `/proc/locks`, which lists every lock the kernel holds.
 It only calls `stat` on the lock file: it never opens, creates or locks it, so it can never make a starting run fail or wait.
-No lock file means `no run`; a file nobody holds means `no run holds it` (the file stays after a run ends); a holder shows its pid, as seen from the status's own PID namespace; if the lock file or `/proc/locks` cannot be read, the state is `unknown`.
-
-How to read the facts:
-
-| Facts | Meaning |
-| --- | --- |
-| Markers on `STAGE/LEAF` and the lock held | A run is active; wait. |
-| Markers on `STAGE/LEAF` and no lock | A run stopped; rerun the same command. |
-| No `STAGE/LEAF`, `STAGE/old/LEAF` present, no markers on `DATASET` | The swap finished; follow the post-swap steps. |
-| `DATASET` encrypted, no `STAGE/LEAF` and no `STAGE/old/LEAF` | No file-move state. |
-
-Any other combination, such as markers left on an encrypted `DATASET` or a missing `DATASET`, can be a swap in progress or one that stopped part way: follow the recovery hints the run printed, and do not act on this table.
+No lock file means `no run`; a file nobody holds means `no run holds it` (the file stays after a run ends); a holder shows its pid; if the lock file or `/proc/locks` cannot be read, the state is `unknown`.
+"Held" means some `file-move` on this host holds the lock, not necessarily one of this dataset.
+Inside a child PID namespace, `/proc/locks` may not show the holder, and the pid is the one of the host's namespace.
 
 ### What file-move does not support
 
