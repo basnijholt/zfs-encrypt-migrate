@@ -1115,14 +1115,14 @@ def test_copies_a_stopped_run_left_do_not_inflate_the_rate(
 
 
 @needs_rsync
-def test_a_stale_copy_is_progress(
+def test_a_resent_stale_copy_is_not_in_the_rate(
     filemove_env: FileMoveEnv,
     settings: Settings,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A copy that exists but fails rsync's quick check is sent again, so it counts in the rate and the ETA."""
+    """The rate counts files with no copy yet: a stale copy rsync sends again adds nothing, so that batch reads low."""
     env = filemove_env
     only_files(env, {"a": 2048, "b": 1024})
     fixed_allocation(monkeypatch)
@@ -1132,9 +1132,10 @@ def test_a_stale_copy_is_progress(
     move_timed(env, settings, dst, clock=ticking_clock(0, 4, 4, 8), wall_clock=ticking_clock(WALL, WALL))
     at = stamp(WALL)
     assert batch_lines(capsys) == [
-        f"batch 1: 1 files, 4.0K moved (2.0K data) in 4s at 1.0K/s, 4.0K left (1.0K data), ETA 4s [{at}]",
+        f"batch 1: 1 files, 4.0K moved (2.0K data) in 4s at 0B/s, 4.0K left (1.0K data) [{at}]",
         f"batch 2: 1 files, 4.0K moved (1.0K data) in 4s at 1.0K/s, 0B left (0B data) [{at}]",
     ]
+    assert (dst / "a").read_bytes() == b"x" * 2048
 
 
 @needs_rsync

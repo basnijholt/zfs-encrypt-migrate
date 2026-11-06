@@ -6,7 +6,6 @@ import contextlib
 import fcntl
 import os
 import shlex
-import stat
 import sys
 import time
 from datetime import datetime
@@ -529,24 +528,6 @@ def _split_notes(dataset: str, staged: str) -> list[str]:
     ]
 
 
-def _sent_bytes(src: Path, dst: Path, batch: Sequence[Group]) -> int:
-    """Return the allocated bytes of the groups rsync will send: no copy yet, or one that fails its quick check.
-
-    For the progress line only; the space check counts the groups without a copy, as ``missing``.
-    """
-    sent = 0
-    for group in batch:
-        source = os.lstat(src / group.first)
-        try:
-            copy = os.lstat(dst / group.first)
-        except FileNotFoundError:
-            sent += group.allocated
-            continue
-        if stat.S_ISREG(source.st_mode) and (source.st_size, source.st_mtime_ns) != (copy.st_size, copy.st_mtime_ns):
-            sent += group.allocated
-    return sent
-
-
 def _batch_line(
     *,
     number: int,
@@ -627,7 +608,6 @@ def _move_files(  # noqa: PLR0917
             # A stop between copy and delete leaves copies that need no new space; rsync skips them.
             missing = sum(group.allocated for group in batch if not os.path.lexists(dst / group.first))
             _wait_for_space(zfs, settings, missing, sleep)
-            sent = _sent_bytes(src, dst, batch)
             write_file_list(scratch / "files", batch)
             _rsync_files(zfs, src, dst, scratch / "files")
             verified, _changed = verify(src, dst, batch, device=device)
@@ -646,7 +626,7 @@ def _move_files(  # noqa: PLR0917
             left -= moved
             left_data -= moved_data
             seconds = max(clock() - started, 0.0)
-            run_copied += sent
+            run_copied += missing
             run_seconds += seconds
             console.print(
                 _batch_line(
@@ -654,7 +634,7 @@ def _move_files(  # noqa: PLR0917
                     files=sum(len(group.entries) for group in gone),
                     moved=moved,
                     moved_data=moved_data,
-                    copied=sent,
+                    copied=missing,
                     seconds=seconds,
                     left=left,
                     left_data=left_data,
