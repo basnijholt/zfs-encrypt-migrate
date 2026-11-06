@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from zfs_encrypt_migrate.sizes import format_size, parse_size
+from zfs_encrypt_migrate.sizes import format_duration, format_size, parse_size
 
 
 @pytest.mark.parametrize(
@@ -38,3 +38,22 @@ def test_parse_size_rejects_invalid_input(text: str) -> None:
 def test_format_size(size: int, expected: str) -> None:
     """Sizes print in binary units with one decimal."""
     assert format_size(size) == expected
+
+
+@pytest.mark.parametrize(
+    ("seconds", "text"),
+    [
+        (0, "0s"),
+        (59, "59s"),
+        (60, "1m 0s"),
+        (3490, "58m 10s"),
+        (3600, "1h 0m"),
+        (3601, "1h 0m"),
+        (3900, "1h 5m"),
+        (86_401, "1d 0h"),
+        (183_600, "2d 3h"),
+    ],
+)
+def test_format_duration(seconds: int, text: str) -> None:
+    """A duration shows two units, from its largest non-zero one."""
+    assert format_duration(seconds) == text

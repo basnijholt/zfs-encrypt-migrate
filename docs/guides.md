@@ -213,7 +213,7 @@ A rerun with a different `--final-keylocation` checks the key again, before it d
 Each batch then prints a line:
 
 ```text
-batch 7: 1204 files, 99.8G moved, 4.2T left
+batch 7: 1204 files, 99.8G moved (146.0G data) in 58m 10s at 29.3M/s, 4.2T left (6.1T data), ETA 1d 17h [14:02]
 ```
 
 When no files are left, it swaps the new dataset into place, and prints what to do next.

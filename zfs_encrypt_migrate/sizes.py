@@ -1,4 +1,4 @@
-"""Size parsing."""
+"""Size parsing, and size and duration formatting."""
 
 from __future__ import annotations
 
@@ -28,3 +28,17 @@ def format_size(size: int) -> str:
         if value < 1024 or unit == "P":  # noqa: PLR2004
             return f"{value:.1f}{unit}"
     raise AssertionError  # pragma: no cover
+
+
+def format_duration(seconds: float) -> str:
+    """Format a duration as its largest non-zero unit and the next one, e.g. ``2d 3h``, ``1h 0m`` or ``45s``."""
+    rest = int(max(seconds, 0))
+    units = (("d", 86400), ("h", 3600), ("m", 60), ("s", 1))
+    for index, (unit, length) in enumerate(units):
+        count, remainder = divmod(rest, length)
+        if count:
+            if unit == "s":
+                return f"{count}s"
+            next_unit, next_length = units[index + 1]
+            return f"{count}{unit} {remainder // next_length}{next_unit}"
+    return "0s"
