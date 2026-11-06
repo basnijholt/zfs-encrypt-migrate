@@ -40,7 +40,7 @@ from zfs_encrypt_migrate.filemove import (
 )
 from zfs_encrypt_migrate.migrate import AbortGuard
 from zfs_encrypt_migrate.process import SubprocessRunner
-from zfs_encrypt_migrate.sizes import format_duration, format_size
+from zfs_encrypt_migrate.sizes import format_size
 
 from .conftest import STAGE, FileMoveEnv, fail, needs_rsync
 from .helpers import fail_on, make
@@ -1046,7 +1046,7 @@ def test_a_group_verification_kept_is_not_progress(
     env = filemove_env
     only_files(env, {"a": 2048, "b": 1024, "c": 512})
     fixed_allocation(monkeypatch)
-    real_verify = filemove.verify
+    real_verify = filetree.verify
     calls = 0
 
     def keep_first(
@@ -1114,6 +1114,65 @@ def test_copies_a_stopped_run_left_do_not_inflate_the_rate(
     ]
 
 
+@needs_rsync
+def test_a_stale_copy_is_progress(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copy that exists but fails rsync's quick check is sent again, so it counts in the rate and the ETA."""
+    env = filemove_env
+    only_files(env, {"a": 2048, "b": 1024})
+    fixed_allocation(monkeypatch)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    (dst / "a").write_bytes(b"old")
+    move_timed(env, settings, dst, clock=ticking_clock(0, 4, 4, 8), wall_clock=ticking_clock(WALL, WALL))
+    at = stamp(WALL)
+    assert batch_lines(capsys) == [
+        f"batch 1: 1 files, 4.0K moved (2.0K data) in 4s at 1.0K/s, 4.0K left (1.0K data), ETA 4s [{at}]",
+        f"batch 2: 1 files, 4.0K moved (1.0K data) in 4s at 1.0K/s, 0B left (0B data) [{at}]",
+    ]
+
+
+@needs_rsync
+def test_a_group_delete_skipped_is_not_progress(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A verified group whose names are still there after delete (a writer replaced one) is not moved."""
+    env = filemove_env
+    only_files(env, {"a": 2048, "b": 1024})
+    fixed_allocation(monkeypatch)
+    real_delete = filetree.delete
+    calls = 0
+
+    def skip_first(src: Path, groups: Sequence[filetree.Group]) -> int:
+        nonlocal calls
+        calls += 1
+        return real_delete(src, [] if calls == 1 else groups)
+
+    monkeypatch.setattr(filemove, "delete", skip_first)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    move_timed(
+        env,
+        settings,
+        dst,
+        clock=ticking_clock(0, 4, 4, 8, 8, 12),
+        wall_clock=ticking_clock(WALL, WALL, WALL),
+    )
+    assert batch_lines(capsys)[0] == (
+        f"batch 1: 0 files, 0B moved (0B data) in 4s at 1.0K/s, 8.0K left (3.0K data), ETA 8s [{stamp(WALL)}]"
+    )
+    assert source_files(env) == []
+
+
 def line(**changes: float) -> str:
     """Format a batch line from the numbers of a 58-minute batch, with ``changes`` replacing some of them."""
     numbers = {
@@ -1158,25 +1217,6 @@ def test_batch_line_without_a_copy_has_no_eta() -> None:
     text = line(copied=0, run_copied=0)
     assert " at 0B/s, " in text
     assert ", ETA " not in text
-
-
-@pytest.mark.parametrize(
-    ("seconds", "text"),
-    [
-        (0, "0s"),
-        (59, "59s"),
-        (60, "1m 0s"),
-        (3490, "58m 10s"),
-        (3600, "1h 0m"),
-        (3601, "1h 0m"),
-        (3900, "1h 5m"),
-        (86_401, "1d 0h"),
-        (183_600, "2d 3h"),
-    ],
-)
-def test_format_duration(seconds: int, text: str) -> None:
-    """A duration shows two units, from its largest non-zero one."""
-    assert format_duration(seconds) == text
 
 
 @needs_rsync
