@@ -14,7 +14,7 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
-from zfs_encrypt_migrate import cli, filemove
+from zfs_encrypt_migrate import cli, preflight
 from zfs_encrypt_migrate.constants import COMMAND_STARTUP_ERROR_RETURNCODE
 from zfs_encrypt_migrate.filemove import _probe_writers
 from zfs_encrypt_migrate.process import SubprocessRunner
@@ -696,7 +696,7 @@ def checked(filemove_env: FileMoveEnv, tmp_path: Path, monkeypatch: pytest.Monke
     monkeypatch.setattr(
         cli,
         "check_file_move",
-        functools.partial(filemove.check_file_move, proc=proc.root, lock_path=tmp_path / "lock"),
+        functools.partial(preflight.check_file_move, proc=proc.root, lock_path=tmp_path / "lock"),
     )
     monkeypatch.setenv("ZFS_ENCRYPT_MIGRATE_KEY_FILE", str(key_file))
     monkeypatch.setenv("ZFS_ENCRYPT_MIGRATE_MIN_FREE", "1000")
@@ -704,20 +704,25 @@ def checked(filemove_env: FileMoveEnv, tmp_path: Path, monkeypatch: pytest.Monke
     return filemove_env
 
 
-def test_file_move_check_lists_problems_and_notes_and_exits_1(checked: FileMoveEnv) -> None:
-    """Each problem with its fix, then the notes, without --delete-source; exit 1 as the run would refuse."""
+def test_file_move_check_lists_problems_and_notes_and_exits_1(
+    checked: FileMoveEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each problem with its fixes, then the notes, without --delete-source; exit 1 as the run would stop."""
     checked.sim.prop("tank/media", "readonly", "on")
-    checked.sim.pool_props["tank", "checkpoint"] = "1052672"
     checked.sim.quotas["tank/media", "user"] = [("1000", "1073741824", "none")]
+    monkeypatch.setattr(preflight, "_inode_flags", lambda path: 0x10 if path.endswith("a.txt") else 0)
 
     result = runner.invoke(cli.app, ["file-move", "--check", "tank/media"])
 
     assert result.exit_code == 1, result.output
+    flagged = checked.src / "a.txt"
     assert result.stdout == (
         "problem: tank/media is read-only; file-move must delete its files\n"
-        "  zfs set readonly=off tank/media\n"
-        "problem: pool tank has a checkpoint, which keeps deleted space allocated; discard it first: "
-        "zpool checkpoint -d tank\n"
+        "problem: tank/media has files or directories with the immutable or append-only flag, which keeps file-move "
+        "from deleting them or the files in them\n"
+        "  clear the flags; the copies get none, so set them again after the swap:\n"
+        f"    chattr -i {flagged}  # after the swap: chattr +i {flagged}\n"
         "note: tank/media has per-user, per-group or per-project quotas, which file-move does not carry over\n"
         "  set them again after the swap:\n"
         "    zfs set userquota@1000=1073741824 tank/media\n"

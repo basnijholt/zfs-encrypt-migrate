@@ -42,6 +42,8 @@ class FakeProc:
         """Create the checking process, which sees ``mountinfo``."""
         self.root = root
         self.add(SELF_PID, comm="zfs-encrypt-mig", mountinfo=mountinfo)
+        # No flock held by anyone.
+        (root / "locks").write_text("")
         (root / "self").symlink_to(str(SELF_PID))
 
     def add(

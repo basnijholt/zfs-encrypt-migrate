@@ -168,7 +168,7 @@ At the end it swaps the new dataset into place under the same name and mountpoin
 Requirements, on top of the usual ones:
 
 - `rsync` 3.1.3 or newer, with ACL and xattr support, on `PATH`. The Nix package appends one to `PATH` for you; with pip or uv, install it from your distribution.
-- Nothing from the list below. `file-move --check` (step 1) lists what it finds of it, at once.
+- Nothing from the list below. Check before you start: `zfs get dedup,reservation,refreservation,origin DATASET`, `zpool get dedup_table_size,dedupratio,checkpoint,bcloneused,bclonesaved,altroot POOL`, and `zfs list -r DATASET` for children.
 
 **Not supported.**
 `file-move` relies on every deleted file freeing its space, so it checks for what would stop that before it creates or deletes anything:
@@ -198,7 +198,7 @@ Run the check first, with the options you'll give the real run, and again once y
 zfs-encrypt-migrate file-move tank/media --check
 ```
 
-It changes nothing, and lists every problem that would stop the run at once, each with its fix: what the run would refuse, the processes that still use the dataset and the mounts that would keep it mounted, in any mount namespace (containers too), immutable and append-only files, and the quotas the move won't carry over.
+It changes nothing. It gives the first refusal of the run, then what the run would only trip over once under way, each with its fix: the processes that still use the dataset and the mounts that would keep it mounted, in any mount namespace (containers too), immutable and append-only files, and the quotas the move won't carry over.
 It exits 0 once nothing would stop the run; see [file-move --check](usage.md#file-move-check).
 
 - Stop and disable the services that read or write it (`systemctl disable --now UNIT`), including containers that bind-mount it (turn off their restart policy, for example `docker update --restart=no CONTAINER`, then stop them). The run refuses a dataset it can't unmount, but a container's private bind mount doesn't make the unmount fail; `--check` lists it.
@@ -260,7 +260,7 @@ Before the first file moves, it refuses a dataset that is read-only, not mounted
 It refuses a key file inside the dataset, symlinks followed, or reached through a bind mount of one of its directories (the file is on the dataset's device), both `--key-file` and the file of `--final-keylocation file://...`: a batch would move it into the dataset that needs it to unlock.
 It works only on a path that `/proc/self/mountinfo` lists as the dataset's own mount point, checked before it reads anything there, for the dataset and for the encrypted copy: a mountpoint ending in a space, which `zfs get` strips, would otherwise point it at another directory.
 It also refuses everything in the **Not supported** list above that it can detect, since the move would otherwise stall half-way.
-`file-move --check` reports all of that at once, without changing anything, plus what the run only finds under way (see step 1).
+`file-move --check` reports the first of these refusals without changing anything, plus what the run only finds under way (see step 1).
 Before each batch it checks that the encrypted dataset is still mounted at its private mountpoint, and it accepts only copies that are on that dataset: after an unmount (`zfs umount -a`, say) the mountpoint is a bare directory, and copies there would vanish.
 For each batch, rsync copies the files with hard links, ACLs, xattrs and sparseness, and the tool then compares every name against its copy: type, mode, owner and group, size and mtime for regular files, the target for symlinks, and one shared inode for all names of a hard-linked file.
 A source file whose ctime changed during its batch is not deleted in that pass, and if a pass deletes nothing, the run stops and asks you to stop the writers.

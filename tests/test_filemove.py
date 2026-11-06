@@ -30,13 +30,13 @@ from zfs_encrypt_migrate.filemove import (
     _finish,
     _move_files,
     _open_staged,
-    _preflight_file_move,
     _probe_writers,
     _rsync_dirs,
     _rsync_files,
     _run_lock,
     _wait_for_space,
     file_move,
+    preflight_file_move,
 )
 from zfs_encrypt_migrate.migrate import AbortGuard
 from zfs_encrypt_migrate.process import SubprocessRunner
@@ -61,14 +61,14 @@ STAGED = f"{STAGE}/media"
 def refused(env: FileMoveEnv, settings: Settings, message: str, dataset: str = DATASET) -> None:
     """Refused."""
     with pytest.raises(MigrationError) as info:
-        _preflight_file_move(env.zfs, settings, dataset)
+        preflight_file_move(env.zfs, settings, dataset)
     assert info.value.message == message
     assert env.sim.ops() == []
 
 
 def test_preflight_returns_source_mountpoint(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Preflight returns source mountpoint."""
-    assert _preflight_file_move(filemove_env.zfs, settings, DATASET) == filemove_env.src
+    assert preflight_file_move(filemove_env.zfs, settings, DATASET) == filemove_env.src
     assert filemove_env.sim.ops() == []
 
 
@@ -162,7 +162,7 @@ def test_preflight_checks_only_the_path_of_a_final_key_file_not_there_yet(
     bound.mkdir()
     env.bound[bound] = DATASET
     changed = replace(settings, final_keylocation=f"file://{bound / 'later.key'}")
-    assert _preflight_file_move(env.zfs, changed, DATASET) == env.src
+    assert preflight_file_move(env.zfs, changed, DATASET) == env.src
 
 
 def test_preflight_allows_key_files_beside_the_dataset(
@@ -174,7 +174,7 @@ def test_preflight_allows_key_files_beside_the_dataset(
     beside = private_key(tmp_path / "src.key")
     final = f"file://{private_key(tmp_path / 'srcfinal.key')}"
     changed = replace(settings, key_file=beside, final_keylocation=final)
-    assert _preflight_file_move(filemove_env.zfs, changed, DATASET) == filemove_env.src
+    assert preflight_file_move(filemove_env.zfs, changed, DATASET) == filemove_env.src
 
 
 def test_preflight_refuses_pool_root(filemove_env: FileMoveEnv, settings: Settings) -> None:
@@ -185,14 +185,14 @@ def test_preflight_refuses_pool_root(filemove_env: FileMoveEnv, settings: Settin
 def test_preflight_refuses_other_pool(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Preflight refuses other pool."""
     with pytest.raises(MigrationError, match="cannot rename across pools"):
-        _preflight_file_move(filemove_env.zfs, settings, "other/media")
+        preflight_file_move(filemove_env.zfs, settings, "other/media")
     assert filemove_env.sim.ops() == []
 
 
 def test_preflight_refuses_nested(filemove_env: FileMoveEnv, settings: Settings) -> None:
     """Preflight refuses nested."""
     with pytest.raises(MigrationError, match="overlaps the stage"):
-        _preflight_file_move(filemove_env.zfs, settings, f"{STAGE}/x")
+        preflight_file_move(filemove_env.zfs, settings, f"{STAGE}/x")
     assert filemove_env.sim.ops() == []
 
 
@@ -297,10 +297,10 @@ def test_preflight_allows_ancestor_reservation_around_the_stage(filemove_env: Fi
     dataset = nested_source(filemove_env)
     filemove_env.sim.prop("tank/srv", "reservation", "1073741824")
     inside = replace(settings, stage="tank/srv/stage")
-    assert _preflight_file_move(filemove_env.zfs, inside, dataset) == filemove_env.src
+    assert preflight_file_move(filemove_env.zfs, inside, dataset) == filemove_env.src
     filemove_env.sim.prop("tank/srv", "reservation", "0")
     filemove_env.sim.prop("tank/srv", "refreservation", "1073741824")
-    assert _preflight_file_move(filemove_env.zfs, settings, dataset) == filemove_env.src
+    assert preflight_file_move(filemove_env.zfs, settings, dataset) == filemove_env.src
 
 
 def test_preflight_refuses_clone(filemove_env: FileMoveEnv, settings: Settings) -> None:
@@ -328,7 +328,7 @@ def test_preflight_refuses_snapshots_before_any_write(filemove_env: FileMoveEnv,
     """A snapshot is refused before the writer probe or the staged dataset changes anything."""
     filemove_env.sim.snapshot(f"{DATASET}@auto")
     with pytest.raises(MigrationError) as info:
-        _preflight_file_move(filemove_env.zfs, settings, DATASET)
+        preflight_file_move(filemove_env.zfs, settings, DATASET)
     assert info.value.message == SNAPSHOT_REFUSAL
     assert info.value.hints == SNAPSHOT_HINTS
     assert filemove_env.sim.ops() == []
@@ -342,7 +342,7 @@ def test_preflight_allows_snapshots_once_only_directories_are_left(
     for name in ("a.txt", "docs/b.txt", "docs/deep/c.txt"):
         (filemove_env.src / name).unlink()
     filemove_env.sim.snapshot(f"{DATASET}@enc-final-1")
-    assert _preflight_file_move(filemove_env.zfs, settings, DATASET) == filemove_env.src
+    assert preflight_file_move(filemove_env.zfs, settings, DATASET) == filemove_env.src
 
 
 @pytest.mark.parametrize("value", ["on", "sha256,verify"])
@@ -390,10 +390,10 @@ def test_preflight_falls_back_to_dedupratio(
     env.sim.pool_props["tank", "dedupratio"] = ratio
     zfs, _ = make(env.sim, no_dedup_table_size)
     if not refuses:
-        assert _preflight_file_move(zfs, settings, DATASET) == env.src
+        assert preflight_file_move(zfs, settings, DATASET) == env.src
         return
     with pytest.raises(MigrationError) as info:
-        _preflight_file_move(zfs, settings, DATASET)
+        preflight_file_move(zfs, settings, DATASET)
     assert info.value.message == (
         f"pool tank has dedupratio 1.50x; deduplicated blocks shared with {DATASET} would not be freed, "
         "so file-move cannot run; see the docs"
@@ -419,7 +419,7 @@ def test_preflight_allows_file_moves_of_other_datasets(filemove_env: FileMoveEnv
     env = filemove_env
     env.sim.datasets |= {"tank/elsewhere", "tank/elsewhere/music"}
     env.sim.prop("tank/elsewhere/music", MARK_SOURCE, "tank/music")
-    assert _preflight_file_move(env.zfs, settings, DATASET) == env.src
+    assert preflight_file_move(env.zfs, settings, DATASET) == env.src
 
 
 def test_preflight_refuses_foreign_staged(filemove_env: FileMoveEnv, settings: Settings) -> None:
@@ -432,7 +432,7 @@ def test_preflight_accepts_own_staged(filemove_env: FileMoveEnv, settings: Setti
     """Preflight accepts own staged."""
     filemove_env.sim.datasets.add(STAGED)
     filemove_env.sim.prop(STAGED, MARK_SOURCE, DATASET)
-    assert _preflight_file_move(filemove_env.zfs, settings, DATASET) == filemove_env.src
+    assert preflight_file_move(filemove_env.zfs, settings, DATASET) == filemove_env.src
 
 
 def test_preflight_refuses_other_in_flight(filemove_env: FileMoveEnv, settings: Settings) -> None:

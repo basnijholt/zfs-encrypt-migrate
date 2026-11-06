@@ -20,7 +20,7 @@ Bare `zfs-encrypt-migrate` only shows help.
 | `tree-move DATASET CHILD` | Copy one child subtree under the staged parent; the source stays until you destroy it. |
 | `tree-finish DATASET` | Send the parent's last changes and swap the staged tree into place once no children remain. |
 | `file-move DATASET --delete-source` | Move a dataset's files in verified batches into an encrypted dataset, deleting each source file once its copy is verified, then swap it into place. |
-| `file-move DATASET --check` | Report everything that would stop `file-move`, at once and each with its fix; change nothing. |
+| `file-move DATASET --check` | Report what would stop `file-move`, with how to fix it; change nothing. |
 | `audit [--exact NAME]... [--subtree NAME]... POOL...` | List unencrypted datasets outside the allowlists; exit 1 if there are any. |
 
 ## Shared Options
@@ -284,7 +284,7 @@ Takes the [shared options](#shared-options) and:
 | `--batch-size SIZE` | `ZFS_ENCRYPT_MIGRATE_BATCH_SIZE` | `100G` | Target bytes per batch, in the `--min-free` size syntax. A hard-linked file group bigger than this forms a batch of its own. |
 | `--delete-source` | none | off | Required. Confirms that each source file is deleted once its encrypted copy is verified. |
 | `--check-prompt-with-key-file` | none | off | With `--final-keylocation prompt`, check the final key against the key file instead of at a terminal; see below. |
-| `--check` | none | off | Only report what would stop the run, every problem at once with its fix, and change nothing; see [file-move --check](#file-move-check). It needs no `--delete-source`. |
+| `--check` | none | off | Only report what would stop the run, with how to fix it, and change nothing; see [file-move --check](#file-move-check). It needs no `--delete-source`. |
 
 One run does the whole job, and a rerun after a stop before the swap continues where it left off.
 Stop everything that uses the dataset first, and keep it stopped until the swap; [`--check`](#file-move-check) lists what still uses it.
@@ -401,17 +401,17 @@ From the final unmount of step 8 on, the hints remount with `zfs mount -a` inste
 zfs-encrypt-migrate file-move tank/media --check
 ```
 
-Reports everything that would make `file-move` refuse or stall, every problem at once and each with the command or step that fixes it, and changes nothing: it never mounts, unmounts, creates, snapshots, loads a key or sets a property.
-Give it the options of the real run (`--stage`, `--key-file`, `--batch-size` and the rest); it needs no `--delete-source`, and with `--delete-source` it still only checks.
+Reports what would make `file-move` refuse or stall, each with the command or step that fixes it, and changes nothing: it never mounts, unmounts, creates, snapshots, loads a key, sets a property or takes the run's lock.
+Give it the options of the real run (`--stage`, `--key-file` and the rest); it needs no `--delete-source`, and with `--delete-source` it still only checks.
 Run it as root on the host, like `file-move`, and again once you think everything is stopped.
 
 It reports, as problems:
 
-- Every refusal of [step 2](#file-move), not just the first, in the order the run checks them: the key file, the dataset and its mountpoint, reservations, a clone, a checkpoint or `altroot` on the pool, deduplication, snapshots while files are left, another migration in flight, an old copy in the way. Each refusal names its fix, in its message or on the lines below it; the run prints those lines too.
-- The free-space admission of step 7, which the run reaches only after it created the encrypted dataset; skipped once the move is admitted.
-- What keeps the dataset in use or mounted, read from `/proc`, in every mount namespace, containers included: each process with an open file, working directory, program or mapped file on the dataset; each snapshot of it mounted under `.zfs/snapshot`, which makes the unmount fail with `busy` and, in another namespace, never expires; and each other mount of the dataset, or of a directory of it, that the run's unmount does not take along, such as a second mount here or a container's bind mount. Copies that the unmount does reach, as in the private namespace of a sandboxed systemd service, are left out unless something there uses the dataset.
+- The first refusal of [step 2](#file-move), as the run gives it. Fix it and check again for the next.
+- What keeps the dataset in use or mounted, read from `/proc`, in every mount namespace, containers included: each process with an open file, working directory, program or mapped file on the dataset; each snapshot of it mounted under `.zfs/snapshot`, which makes the unmount fail with `busy` and, in another namespace, never expires; and each other mount of the dataset, or of a directory of it, that the run's unmount does not take along, such as a second mount here or a container's bind mount. A copy of the mount that the unmount does reach, as in the private namespace of a sandboxed systemd service, is left out unless something there uses the dataset.
 - Immutable and append-only files and directories, read with the `FS_IOC_GETFLAGS` ioctl, so `lsattr` need not be installed: the run cannot delete them, or the files in them, and would stop at the first. Each comes with the `chattr` command that clears its flags, and the one that sets them again after the swap.
 
+These come only when the kernel lists the dataset as mounted where `zfs get mountpoint` says; nothing else there is read.
 And, as notes, which need doing but don't stop the run:
 
 - Per-user, per-group and per-project quotas, which the run does not carry over, with the `zfs set` commands that set them again after the swap.
@@ -426,7 +426,7 @@ problem: tank/media has files or directories with the immutable or append-only f
     chattr -i /mnt/tank/media/a.txt  # after the swap: chattr +i /mnt/tank/media/a.txt
 problem: PID 2345 (worker) in /system.slice/app.service has tank/media mounted at /data in another mount namespace, which file-move's unmount does not reach
   stop it, and keep whatever starts it again (a unit, a container's restart policy) disabled until file-move is done
-  or unmount it there: nsenter -t 2345 -m umount /data
+  or unmount it: nsenter -t 2345 -m umount /data
 problem: PID 2345 (worker) in /system.slice/app.service uses tank/media from another mount namespace: open file /data/docs/b.txt
   stop it, and keep whatever starts it again (a unit, a container's restart policy) disabled until file-move is done
 note: tank/media has per-user, per-group or per-project quotas, which file-move does not carry over
@@ -436,15 +436,15 @@ note: tank/media has per-user, per-group or per-project quotas, which file-move 
 ```
 
 It exits 1 when anything would stop the run, and 0 otherwise, notes or not.
-It scans the dataset as a batch does, and opens each of its regular files and directories for the flags, so on a big dataset it takes a while.
-While it reads, it holds the run's lock shared, so a `file-move` started meanwhile refuses; while a `file-move` runs, it reports only that, since its reads could keep that run's unmount busy.
+It opens each regular file and directory of the dataset for its flags, so on a big dataset it takes a while; don't start the run meanwhile, as its unmount would find the check's open files.
+While a `file-move` runs, as `/proc/locks` shows, it reports only `a file-move is running; check skipped` and reads nothing else, so it can't keep that run's unmount busy.
 
 What it can't see:
 
 - A writer that starts after the check. The run's own unmount, which proves that nothing has the dataset open, still decides.
 - What it may not read: without root, other users' processes and files. It reports those as problems rather than pass.
 - What holds the dataset without a process: the kernel NFS server, a loop device, a swap file. Stop the NFS and Samba exports first.
-- The final key: checking it needs the encrypted dataset, which the run creates (step 6).
+- The free-space admission and the final key: both need the encrypted dataset, which the run creates (steps 6 and 7).
 
 ### What file-move does not support
 

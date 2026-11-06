@@ -10,7 +10,10 @@ from typing import TYPE_CHECKING
 import pytest
 
 from zfs_encrypt_migrate import preflight
-from zfs_encrypt_migrate.preflight import holders, pinned_files, quota_notes
+from zfs_encrypt_migrate.errors import ZfsError
+from zfs_encrypt_migrate.preflight import _holders as holders
+from zfs_encrypt_migrate.preflight import _pinned_files as pinned_files
+from zfs_encrypt_migrate.preflight import _quota_notes as quota_notes
 
 from .fakeproc import CONTAINER, HOST, SELF_PID, SERVICE, FakeProc, maps_line, mount_line
 from .helpers import fail_on, make
@@ -125,7 +128,7 @@ def test_a_snapshot_mounted_here_is_a_problem(tmp_path: Path) -> None:
     assert found(host.holders()) == [
         (
             f"snapshot {DATASET}@auto-1 is mounted at {snap}, which keeps {DATASET} busy",
-            (f"unmount it: umount {snap}",),
+            (f"unmount it, before you destroy the snapshot: umount {snap}",),
         ),
     ]
 
@@ -137,7 +140,7 @@ def test_the_dataset_mounted_a_second_time_here_is_a_problem(tmp_path: Path) -> 
     assert found(host.holders()) == [
         (
             f"{DATASET} is also mounted at {other}, which file-move's unmount does not reach",
-            (f"stop what uses it, then unmount it: umount {other}",),
+            (STOP, f"or unmount it: umount {other}"),
         ),
     ]
 
@@ -159,7 +162,7 @@ def test_a_private_bind_mount_in_a_container_is_a_problem(host: Host) -> None:
                 "which file-move's unmount "
                 "does not reach"
             ),
-            (STOP, "or unmount it there: nsenter -t 2345 -m umount /data"),
+            (STOP, "or unmount it: nsenter -t 2345 -m umount /data"),
         ),
     ]
 
@@ -184,8 +187,8 @@ def test_copies_the_unmount_propagates_to_are_not_problems(tmp_path: Path) -> No
     ]
 
 
-def test_copies_down_a_chain_of_slaves_are_not_problems(host: Host) -> None:
-    """A namespace made from a slave namespace still gets the unmount, through the middle one's peer group."""
+def test_a_copy_of_a_copy_is_listed(host: Host) -> None:
+    """Only direct peers and slaves count as propagated; a namespace made from another one errs on the safe side."""
     host.proc.add(
         5001,
         ns=SERVICE,
@@ -198,7 +201,7 @@ def test_copies_down_a_chain_of_slaves_are_not_problems(host: Host) -> None:
         mountinfo=mount_line(950, 949, host.pool, "tank", tags="master:60")
         + mount_line(956, 950, host.src, DATASET, tags="master:61"),
     )
-    assert host.holders() == []
+    assert [problem.message.split(" has ")[0] for problem in host.holders()] == ["PID 5002 (worker)"]
 
 
 @pytest.mark.parametrize(
@@ -240,7 +243,7 @@ def test_a_snapshot_mounted_only_in_another_namespace_is_a_problem(host: Host) -
     assert found(host.holders())[1] == (
         (
             f"snapshot {DATASET}@auto-2 is mounted at /data/.zfs/snapshot/auto-2 in the mount namespace of PID 2345 "
-            f"(indexer), where it does not expire and keeps {DATASET} busy"
+            f"(indexer), which keeps {DATASET} busy"
         ),
         ("unmount it, before you destroy the snapshot: nsenter -t 2345 -m umount /data/.zfs/snapshot/auto-2",),
     )
@@ -432,16 +435,8 @@ def test_no_quotas_no_note(tmp_path: Path) -> None:
     assert quota_notes(zfs, DATASET, tmp_path) == []
 
 
-def test_a_quota_listing_that_fails_is_a_note(tmp_path: Path) -> None:
-    """The other listings still run; the failed one is left to check by hand."""
-    sim = ZfsSim(["tank", DATASET])
-    sim.quotas[DATASET, "group"] = [("100", "2048", "none")]
-    zfs, _ = make(sim, fail_on("zfs", "userspace"))
-    assert [note.message for note in quota_notes(zfs, DATASET, tmp_path)] == [
-        (
-            f"could not list the user quotas of {DATASET}: zfs userspace -H -p -n -o name,quota,objquota {DATASET} "
-            "failed: injected"
-        ),
-        f"{DATASET} has per-user, per-group or per-project quotas, which file-move does not carry over",
-    ]
-    assert quota_notes(zfs, DATASET, tmp_path)[0].hints == (f"check them by hand: zfs userspace {DATASET}",)
+def test_a_quota_listing_that_fails_ends_the_check(tmp_path: Path) -> None:
+    """Like any failed zfs command, it is no clean result."""
+    zfs, _ = make(ZfsSim(["tank", DATASET]), fail_on("zfs", "userspace"))
+    with pytest.raises(ZfsError, match="zfs userspace -H -p -n -o name,quota,objquota tank/media failed: injected"):
+        quota_notes(zfs, DATASET, tmp_path)
