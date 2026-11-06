@@ -296,7 +296,7 @@ tail -f /var/log/zfs-encrypt-migrate.log
 - The unit doesn't get your shell's environment. `--setenv=PATH` gives it your `zfs`, `zpool` and `rsync`, and options like `--stage` go on the command line.
 - The output, errors included, is appended to the log. `PYTHONUNBUFFERED=1` writes each line, such as each batch line, as soon as it's printed.
 - `--collect` removes the unit when it ends, even after a failure or a stop, so you can start it again under the same name.
-- `--check-prompt-with-key-file` checks the final key against the key file, since nobody is at a terminal to type it. The dataset still ends with `keylocation=prompt`. The check proves the key file opens the encrypted dataset, not that the passphrase you keep is the same, so check that yourself before the next reboot: `zfs load-key -n -L prompt tank/stage/media` asks for it and only checks it. See [the option](usage.md#shared-options).
+- `--check-prompt-with-key-file` checks the final key against the key file, since nobody is at a terminal to type it. The dataset still ends with `keylocation=prompt`. The check proves the key file opens the encrypted dataset, not that the passphrase you keep is the same, so check that yourself before the next reboot: `zfs load-key -n -L prompt tank/stage/media` asks for it and only checks it. See [the option](usage.md#file-move).
 
 **Stopping.**
 `systemctl stop zfs-encrypt-migrate` sends SIGTERM, which stops the run as cleanly as Ctrl-C.

@@ -421,7 +421,7 @@ def _stdin_is_terminal() -> bool:
     return sys.stdin.isatty()
 
 
-def _check_passphrase(zfs: Zfs, settings: Settings, staged: str) -> None:
+def _check_passphrase(zfs: Zfs, settings: Settings, staged: str, *, check_prompt_with_key_file: bool = False) -> None:
     """Prove the final key unlocks the staged dataset before any file is deleted.
 
     The marker records the location that was checked, so a rerun with another final location checks again. Only
@@ -429,7 +429,7 @@ def _check_passphrase(zfs: Zfs, settings: Settings, staged: str) -> None:
     because no terminal is attached. That proves the file opens the dataset, not that anyone knows the passphrase.
     """
     location = settings.final_keylocation
-    from_key_file = location == "prompt" and settings.check_prompt_with_key_file
+    from_key_file = location == "prompt" and check_prompt_with_key_file
     check = f"file://{settings.key_file}" if from_key_file else location
     checked = zfs.get(MARK_KEY, staged)
     # The key file is checked on every run: it may have changed since it passed, and the staged key a killed run
@@ -686,6 +686,7 @@ def file_move(
     *,
     batch_size: int,
     delete_source: bool,
+    check_prompt_with_key_file: bool = False,
     mount_root: Path = STAGING_MOUNT_ROOT,
     lock_path: Path = LOCK_FILE,
     sleep: Callable[[float], None] = time.sleep,
@@ -709,6 +710,6 @@ def file_move(
                 msg = f"{staged} is mounted at {dst}, which overlaps {dataset} at {src}"
                 raise MigrationError(msg)
             _copy_tree(zfs, staged, src, dst, device)
-            _check_passphrase(zfs, settings, staged)
+            _check_passphrase(zfs, settings, staged, check_prompt_with_key_file=check_prompt_with_key_file)
             _move_files(zfs, settings, dataset, src, dst, batch_size, sleep, device=device, guard=guard)
             return _finish(zfs, settings, dataset, src, dst, guard)

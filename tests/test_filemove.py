@@ -899,7 +899,7 @@ def test_check_passphrase_prompt_with_key_file(
     """With the flag a final prompt is checked against the key file, never at the terminal, and recorded as such."""
     monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: terminal)
     env = staged_env(filemove_env)
-    _check_passphrase(env.zfs, replace(settings, check_prompt_with_key_file=True), STAGED)
+    _check_passphrase(env.zfs, settings, STAGED, check_prompt_with_key_file=True)
     assert env.runner.attached == []
     assert [call for call in env.runner.calls if "load-key" in call] == [key_file_check(key_file)]
     assert env.sim.props[STAGED, MARK_KEY] == f"file://{key_file}"
@@ -913,7 +913,7 @@ def test_check_passphrase_prompt_with_key_file_wrong_key_refuses(
     """A key file that does not open the staged dataset stops the run before anything is deleted."""
     zfs, _ = make(staged_env(filemove_env).sim, fail_on("zfs", "load-key", "-n"))
     with pytest.raises(MigrationError) as info:
-        _check_passphrase(zfs, replace(settings, check_prompt_with_key_file=True), STAGED)
+        _check_passphrase(zfs, settings, STAGED, check_prompt_with_key_file=True)
     assert info.value.message == f"the key for {STAGED} did not load from file://{key_file}; nothing was deleted"
     assert (STAGED, MARK_KEY) not in filemove_env.sim.props
 
@@ -929,7 +929,7 @@ def test_check_passphrase_prompt_with_key_file_checks_on_every_run(
     marker = f"file://{key_file}" if checked == "key file" else "prompt"
     env = staged_env(filemove_env)
     env.sim.prop(STAGED, MARK_KEY, marker)
-    _check_passphrase(env.zfs, replace(settings, check_prompt_with_key_file=True), STAGED)
+    _check_passphrase(env.zfs, settings, STAGED, check_prompt_with_key_file=True)
     assert [call for call in env.runner.calls if "load-key" in call] == [key_file_check(key_file)]
     assert env.sim.props[STAGED, MARK_KEY] == marker
 
@@ -942,7 +942,7 @@ def test_check_passphrase_prompt_with_another_key_file_checks_again(
     """Only the key file that passed counts: another one is checked before anything more is deleted."""
     env = staged_env(filemove_env)
     env.sim.prop(STAGED, MARK_KEY, "file:///keys/other")
-    _check_passphrase(env.zfs, replace(settings, check_prompt_with_key_file=True), STAGED)
+    _check_passphrase(env.zfs, settings, STAGED, check_prompt_with_key_file=True)
     assert [call for call in env.runner.calls if "load-key" in call] == [key_file_check(key_file)]
     assert env.sim.props[STAGED, MARK_KEY] == f"file://{key_file}"
 
@@ -1619,10 +1619,11 @@ def test_file_move_unattended_ends_with_prompt(
 
     file_move(
         env.zfs,
-        replace(settings, check_prompt_with_key_file=True),
+        settings,
         DATASET,
         batch_size=1,
         delete_source=True,
+        check_prompt_with_key_file=True,
         mount_root=env.mount_root,
         lock_path=tmp_path / "lock",
         sleep=recorder()[1],
@@ -1649,7 +1650,6 @@ def test_file_move_rerun_checks_a_replaced_key_file_while_the_key_stays_loaded(
     """After a kill the staged key stays loaded, so only the check notices a key file replaced since it passed."""
     env = filemove_env
     monkeypatch.setattr(filemove, "_stdin_is_terminal", lambda: False)
-    flagged = replace(settings, check_prompt_with_key_file=True)
     file_rsyncs = 0
 
     def stop_second_batch(args: Sequence[str]) -> CommandResult | None:
@@ -1668,10 +1668,11 @@ def test_file_move_rerun_checks_a_replaced_key_file_while_the_key_stays_loaded(
     def move(zfs: Zfs) -> list[str]:
         return file_move(
             zfs,
-            flagged,
+            settings,
             DATASET,
             batch_size=1,
             delete_source=True,
+            check_prompt_with_key_file=True,
             mount_root=env.mount_root,
             lock_path=tmp_path / "lock",
             sleep=recorder()[1],
