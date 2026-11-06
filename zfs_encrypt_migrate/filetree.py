@@ -30,6 +30,7 @@ class _Entry:
     nlink: int
     ctime_ns: int
     allocated: int
+    size: int
 
 
 @dataclass(frozen=True)
@@ -47,6 +48,11 @@ class Group:
     def allocated(self) -> int:
         """Return the allocated bytes of the inode, counted once."""
         return self.entries[0].allocated
+
+    @property
+    def apparent(self) -> int:
+        """Return the file size of the inode (the logical data), counted once."""
+        return self.entries[0].size
 
 
 def scan(root: Path) -> list[_Entry]:
@@ -78,7 +84,8 @@ def scan(root: Path) -> list[_Entry]:
             allocated = st.st_blocks * _BLOCK
             if stat.S_ISREG(st.st_mode) and st.st_size > 0:
                 allocated = max(allocated, _MIN_FILE)
-            entries.append(_Entry(name, st.st_ino, st.st_nlink, st.st_ctime_ns, allocated))
+            size = st.st_size if stat.S_ISREG(st.st_mode) else 0
+            entries.append(_Entry(name, st.st_ino, st.st_nlink, st.st_ctime_ns, allocated, size))
     return entries
 
 
