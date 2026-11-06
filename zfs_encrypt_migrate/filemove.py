@@ -528,31 +528,36 @@ def _split_notes(dataset: str, staged: str) -> list[str]:
     ]
 
 
-def _batch_line(  # noqa: PLR0917
+def _batch_line(
+    *,
     number: int,
     files: int,
-    done: tuple[int, int, float],
-    left: tuple[int, int],
-    run: tuple[int, float],
-    finished: float,
+    moved: int,
+    moved_data: int,
+    copied: int,
+    seconds: float,
+    left: int,
+    left_data: int,
+    run_copied: int,
+    run_seconds: float,
+    stamp: float,
 ) -> str:
     """Format the progress line of a finished batch; it always starts with ``batch N:``.
 
-    ``done`` is the allocated bytes, apparent bytes and seconds of this batch, ``left`` the allocated and apparent
-    bytes still in the source, ``run`` the allocated bytes and seconds of every batch of this run so far. Rates
-    and the ETA count allocated bytes, as ``left`` and the batch size do; they are left out while there is no
-    elapsed time to divide by, and the ETA also when nothing is left.
+    ``files``, ``moved`` and ``moved_data`` (allocated and apparent bytes) count what the batch deleted, and
+    ``left`` and ``left_data`` what is still in the source. ``copied`` is what the batch wrote into the copy
+    in ``seconds``, and ``run_copied`` in ``run_seconds`` is the same for every batch of this run so far: the rate
+    and the ETA come from those, since a copy that already existed took no time. With no elapsed time there is
+    no rate, and with nothing copied or nothing left there is no ETA. ``stamp`` is the epoch time of the line.
     """
-    moved, moved_data, seconds = done
     text = f"batch {number}: {files} files, {format_size(moved)} moved ({format_size(moved_data)} data)"
     text += f" in {format_duration(seconds)}"
     if seconds > 0:
-        text += f" at {format_size(int(moved / seconds))}/s"
-    text += f", {format_size(left[0])} left ({format_size(left[1])} data)"
-    run_moved, run_seconds = run
-    if run_seconds > 0 and run_moved > 0 and left[0] > 0:
-        text += f", ETA {format_duration(left[0] / (run_moved / run_seconds))}"
-    return f"{text} [{datetime.fromtimestamp(finished).strftime('%H:%M')}]"  # noqa: DTZ006
+        text += f" at {format_size(int(copied / seconds))}/s"
+    text += f", {format_size(left)} left ({format_size(left_data)} data)"
+    if run_seconds > 0 and run_copied > 0 and left > 0:
+        text += f", ETA {format_duration(left / (run_copied / run_seconds))}"
+    return f"{text} [{datetime.fromtimestamp(stamp).strftime('%H:%M')}]"  # noqa: DTZ006
 
 
 def _move_files(  # noqa: PLR0917
@@ -566,11 +571,12 @@ def _move_files(  # noqa: PLR0917
     *,
     device: int,
     guard: AbortGuard,
-    clock: Callable[[], float] = time.time,
+    clock: Callable[[], float] = time.monotonic,
+    wall_clock: Callable[[], float] = time.time,
 ) -> None:
     """Move every file into the copy in verified batches; delete a batch only after its copy is verified and synced.
 
-    ``clock`` returns the epoch time; it times each batch and stamps its line.
+    ``clock`` is a monotonic clock that times each batch; ``wall_clock`` returns the epoch time that stamps its line.
 
     ``device`` is the device of the staged dataset mounted at ``dst``; every copy must be on it. From the first
     delete on, ``guard`` says the files are split.
@@ -582,7 +588,7 @@ def _move_files(  # noqa: PLR0917
     remove_partials(dst)
     batch_number = 0
     # Of the batches finished in this run only, so the ETA does not depend on earlier runs.
-    run_moved = 0
+    run_copied = 0
     run_seconds = 0.0
     while entries := scan(src):
         groups = group_by_inode(entries, src)
@@ -599,7 +605,6 @@ def _move_files(  # noqa: PLR0917
             scratch.mkdir(exist_ok=True)
             # Checked before every batch: a snapshot that appears mid-run would pin the deleted files.
             _refuse_snapshots(zfs, dataset)
-            moved = sum(group.allocated for group in batch)
             # A stop between copy and delete leaves copies that need no new space; rsync skips them.
             missing = sum(group.allocated for group in batch if not os.path.lexists(dst / group.first))
             _wait_for_space(zfs, settings, missing, sleep)
@@ -614,21 +619,28 @@ def _move_files(  # noqa: PLR0917
                 guard.notes = _split_notes(dataset, staged)
             deleted += delete(src, verified)
             batch_number += 1
+            # Only names that are gone count as moved: a group verification or delete kept comes back next pass.
+            gone = [g for g in verified if not any(os.path.lexists(src / item.name) for item in g.entries)]
+            moved = sum(group.allocated for group in gone)
+            moved_data = sum(group.apparent for group in gone)
             left -= moved
-            moved_data = sum(group.apparent for group in batch)
             left_data -= moved_data
-            finished = clock()
-            seconds = max(finished - started, 0.0)
-            run_moved += moved
+            seconds = max(clock() - started, 0.0)
+            run_copied += missing
             run_seconds += seconds
             console.print(
                 _batch_line(
-                    batch_number,
-                    sum(len(group.entries) for group in batch),
-                    (moved, moved_data, seconds),
-                    (left, left_data),
-                    (run_moved, run_seconds),
-                    finished,
+                    number=batch_number,
+                    files=sum(len(group.entries) for group in gone),
+                    moved=moved,
+                    moved_data=moved_data,
+                    copied=missing,
+                    seconds=seconds,
+                    left=left,
+                    left_data=left_data,
+                    run_copied=run_copied,
+                    run_seconds=run_seconds,
+                    stamp=wall_clock(),
                 ),
                 soft_wrap=True,
             )
@@ -727,7 +739,8 @@ def file_move(
     mount_root: Path = STAGING_MOUNT_ROOT,
     lock_path: Path = LOCK_FILE,
     sleep: Callable[[float], None] = time.sleep,
-    clock: Callable[[], float] = time.time,
+    clock: Callable[[], float] = time.monotonic,
+    wall_clock: Callable[[], float] = time.time,
 ) -> list[str]:
     """Move the files of ``dataset`` into an encrypted copy, then swap it into place. Rerun to continue."""
     if not delete_source:
@@ -749,5 +762,17 @@ def file_move(
                 raise MigrationError(msg)
             _copy_tree(zfs, staged, src, dst, device)
             _check_passphrase(zfs, settings, staged)
-            _move_files(zfs, settings, dataset, src, dst, batch_size, sleep, device=device, guard=guard, clock=clock)
+            _move_files(
+                zfs,
+                settings,
+                dataset,
+                src,
+                dst,
+                batch_size,
+                sleep,
+                device=device,
+                guard=guard,
+                clock=clock,
+                wall_clock=wall_clock,
+            )
             return _finish(zfs, settings, dataset, src, dst, guard)

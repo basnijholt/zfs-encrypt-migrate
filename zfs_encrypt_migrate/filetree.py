@@ -30,7 +30,7 @@ class _Entry:
     nlink: int
     ctime_ns: int
     allocated: int
-    size: int = 0
+    size: int
 
 
 @dataclass(frozen=True)

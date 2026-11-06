@@ -1,4 +1,4 @@
-"""Size parsing."""
+"""Size parsing, and size and duration formatting."""
 
 from __future__ import annotations
 
@@ -31,11 +31,14 @@ def format_size(size: int) -> str:
 
 
 def format_duration(seconds: float) -> str:
-    """Format a duration with its two most significant non-zero units, e.g. ``2d 3h``, ``58m 10s`` or ``45s``."""
+    """Format a duration as its largest non-zero unit and the next one, e.g. ``2d 3h``, ``1h 0m`` or ``45s``."""
     rest = int(max(seconds, 0))
-    parts = []
-    for unit, length in (("d", 86400), ("h", 3600), ("m", 60), ("s", 1)):
-        count, rest = divmod(rest, length)
+    units = (("d", 86400), ("h", 3600), ("m", 60), ("s", 1))
+    for index, (unit, length) in enumerate(units):
+        count, remainder = divmod(rest, length)
         if count:
-            parts.append(f"{count}{unit}")
-    return " ".join(parts[:2]) or "0s"
+            if unit == "s":
+                return f"{count}s"
+            next_unit, next_length = units[index + 1]
+            return f"{count}{unit} {remainder // next_length}{next_unit}"
+    return "0s"

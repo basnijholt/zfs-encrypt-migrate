@@ -31,9 +31,9 @@ from zfs_encrypt_migrate.filetree import (
 BAD_NAME = os.fsdecode(b"bad\xff")
 
 
-def entry(name: str, ino: int = 1, nlink: int = 1, allocated: int = 0) -> _Entry:
+def entry(name: str, ino: int = 1, nlink: int = 1, allocated: int = 0, size: int = 0) -> _Entry:
     """Entry."""
-    return _Entry(name=name, ino=ino, nlink=nlink, ctime_ns=0, allocated=allocated)
+    return _Entry(name=name, ino=ino, nlink=nlink, ctime_ns=0, allocated=allocated, size=size)
 
 
 def group(name: str, allocated: int) -> Group:
@@ -105,6 +105,26 @@ def test_scan_counts_each_non_empty_file_as_at_least_one_sector(tmp_path: Path) 
         "empty": os.lstat(tmp_path / "empty").st_blocks * 512,
         "link": os.lstat(tmp_path / "link").st_blocks * 512,
     }
+
+
+def test_scan_records_the_file_size_of_regular_files_only(tmp_path: Path) -> None:
+    """The apparent size is st_size of a regular file; a symlink or special file holds no file data."""
+    (tmp_path / "file").write_bytes(b"x" * 10000)
+    with (tmp_path / "sparse").open("wb") as handle:
+        handle.truncate(70000)
+    (tmp_path / "empty").touch()
+    (tmp_path / "link").symlink_to("a" * 50)
+    os.mkfifo(tmp_path / "fifo")
+    sizes = {item.name: item.size for item in scan(tmp_path)}
+    assert sizes == {"file": 10000, "sparse": 70000, "empty": 0, "link": 0, "fifo": 0}
+
+
+def test_group_apparent_counts_inode_once(tmp_path: Path) -> None:
+    """Hard links share one inode, so their data counts once."""
+    (tmp_path / "a").write_bytes(b"x" * 10000)
+    os.link(tmp_path / "a", tmp_path / "b")
+    (group_,) = scanned(tmp_path)
+    assert group_.apparent == 10000  # noqa: PLR2004
 
 
 def test_scan_odd_names(tmp_path: Path) -> None:

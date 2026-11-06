@@ -24,6 +24,7 @@ from zfs_encrypt_migrate.constants import (
 from zfs_encrypt_migrate.errors import Interrupted, MigrationError, ZfsError
 from zfs_encrypt_migrate.filemove import (
     _admit,
+    _batch_line,
     _check_passphrase,
     _copy_tree,
     _finish,
@@ -946,23 +947,24 @@ def ticking_clock(*ticks: float) -> Callable[[], float]:
     return lambda: next(times)
 
 
-@needs_rsync
-def test_batch_line_shows_pace_data_size_and_eta(
-    filemove_env: FileMoveEnv,
+def fixed_allocation(monkeypatch: pytest.MonkeyPatch, allocated: int = 4096) -> None:
+    """Scan with one allocation per file: the real one depends on the filesystem and on when the pool writes it."""
+    monkeypatch.setattr(
+        filemove,
+        "scan",
+        lambda root: [replace(item, allocated=allocated) for item in filetree.scan(root)],
+    )
+
+
+def move_timed(
+    env: FileMoveEnv,
     settings: Settings,
-    tmp_path: Path,
-    capsys: pytest.CaptureFixture[str],
+    dst: Path,
+    *,
+    clock: Callable[[], float],
+    wall_clock: Callable[[], float],
 ) -> None:
-    """Each line has the duration, throughput, apparent sizes, ETA from the run's average rate and a timestamp."""
-    env = filemove_env
-    for path in [p for p in env.src.rglob("*") if not p.is_dir() or p.is_symlink()]:
-        path.unlink()
-    for name, size in (("a", 2048), ("b", 1024), ("c", 512)):
-        (env.src / name).write_bytes(b"x" * size)
-    dst = tmp_path / "dst"
-    dst.mkdir()
-    start = 1_700_000_000.0
-    clock = ticking_clock(start, start + 4, start + 4, start + 16, start + 16, start + 17)
+    """Move with batches of one file and the given clocks."""
     env.sim.prop(STAGED, "mountpoint", str(dst))
     env.sim.prop(STAGED, "mounted", "yes")
     _move_files(
@@ -976,25 +978,204 @@ def test_batch_line_shows_pace_data_size_and_eta(
         device=dst.stat().st_dev,
         guard=guard_for(env, settings),
         clock=clock,
+        wall_clock=wall_clock,
     )
-    lines = [line for line in capsys.readouterr().out.splitlines() if line.startswith("batch ")]
 
-    def stamp(offset: int) -> str:
-        return datetime.fromtimestamp(start + offset).strftime("%H:%M")  # noqa: DTZ006
 
-    assert lines == [
-        f"batch 1: 1 files, 4.0K moved (2.0K data) in 4s at 1.0K/s, 8.0K left (1.5K data), ETA 8s [{stamp(4)}]",
-        f"batch 2: 1 files, 4.0K moved (1.0K data) in 12s at 341B/s, 4.0K left (512B data), ETA 8s [{stamp(16)}]",
-        f"batch 3: 1 files, 4.0K moved (512B data) in 1s at 4.0K/s, 0B left (0B data) [{stamp(17)}]",
+def only_files(env: FileMoveEnv, sizes: dict[str, int]) -> None:
+    """Replace the source files by regular files of the given apparent sizes."""
+    for path in [p for p in env.src.rglob("*") if not p.is_dir() or p.is_symlink()]:
+        path.unlink()
+    for name, size in sizes.items():
+        (env.src / name).write_bytes(b"x" * size)
+
+
+def batch_lines(capsys: pytest.CaptureFixture[str]) -> list[str]:
+    """Return the printed batch lines."""
+    return [line for line in capsys.readouterr().out.splitlines() if line.startswith("batch ")]
+
+
+def stamp(wall: float) -> str:
+    """Return the local HH:MM of an epoch time, as a batch line shows it."""
+    return datetime.fromtimestamp(wall).strftime("%H:%M")  # noqa: DTZ006
+
+
+WALL = 1_700_000_000.0
+
+
+@needs_rsync
+def test_batch_line_shows_pace_data_size_and_eta(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each line has the duration, throughput, apparent sizes, ETA from the run's average rate and a timestamp."""
+    env = filemove_env
+    only_files(env, {"a": 2048, "b": 1024, "c": 512})
+    fixed_allocation(monkeypatch)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    move_timed(
+        env,
+        settings,
+        dst,
+        clock=ticking_clock(100, 104, 104, 116, 116, 117),
+        wall_clock=ticking_clock(WALL, WALL + 60, WALL + 3600),
+    )
+    assert batch_lines(capsys) == [
+        f"batch 1: 1 files, 4.0K moved (2.0K data) in 4s at 1.0K/s, 8.0K left (1.5K data), ETA 8s [{stamp(WALL)}]",
+        (
+            f"batch 2: 1 files, 4.0K moved (1.0K data) in 12s at 341B/s, 4.0K left (512B data), ETA 8s "
+            f"[{stamp(WALL + 60)}]"
+        ),
+        f"batch 3: 1 files, 4.0K moved (512B data) in 1s at 4.0K/s, 0B left (0B data) [{stamp(WALL + 3600)}]",
     ]
+
+
+@needs_rsync
+def test_a_group_verification_kept_is_not_progress(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A group that changed is not deleted: it adds nothing to moved or data, does not lower left, and moves later."""
+    env = filemove_env
+    only_files(env, {"a": 2048, "b": 1024, "c": 512})
+    fixed_allocation(monkeypatch)
+    real_verify = filemove.verify
+    calls = 0
+
+    def keep_first(
+        src: Path,
+        dst: Path,
+        groups: Sequence[filetree.Group],
+        *,
+        device: int,
+    ) -> tuple[list[filetree.Group], list[filetree.Group]]:
+        nonlocal calls
+        calls += 1
+        verified, changed = real_verify(src, dst, groups, device=device)
+        if calls == 1:
+            return [], [*verified, *changed]
+        return verified, changed
+
+    monkeypatch.setattr(filemove, "verify", keep_first)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    move_timed(
+        env,
+        settings,
+        dst,
+        clock=ticking_clock(*(t for batch in range(4) for t in (batch * 4, batch * 4 + 4))),
+        wall_clock=ticking_clock(WALL, WALL, WALL, WALL),
+    )
+    at = stamp(WALL)
+    assert batch_lines(capsys) == [
+        # Copied but kept: the rate counts the copy, "moved" and "left" count only deletions.
+        f"batch 1: 0 files, 0B moved (0B data) in 4s at 1.0K/s, 12.0K left (3.5K data), ETA 12s [{at}]",
+        f"batch 2: 1 files, 4.0K moved (1.0K data) in 4s at 1.0K/s, 8.0K left (2.5K data), ETA 8s [{at}]",
+        f"batch 3: 1 files, 4.0K moved (512B data) in 4s at 1.0K/s, 4.0K left (2.0K data), ETA 4s [{at}]",
+        # The retry finds the copy of a already in place: nothing is copied, so the rate is 0.
+        f"batch 4: 1 files, 4.0K moved (2.0K data) in 4s at 0B/s, 0B left (0B data) [{at}]",
+    ]
+    assert source_files(env) == []
+
+
+@needs_rsync
+def test_copies_a_stopped_run_left_do_not_inflate_the_rate(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A file whose copy exists already is moved without copying: no rate, and no ETA until something was copied."""
+    env = filemove_env
+    only_files(env, {"a": 2048, "b": 1024})
+    fixed_allocation(monkeypatch)
+    dst = tmp_path / "dst"
+    dst.mkdir()
+    shutil.copy2(env.src / "a", dst / "a")
+    move_timed(
+        env,
+        settings,
+        dst,
+        clock=ticking_clock(0, 4, 4, 8),
+        wall_clock=ticking_clock(WALL, WALL),
+    )
+    at = stamp(WALL)
+    assert batch_lines(capsys) == [
+        f"batch 1: 1 files, 4.0K moved (2.0K data) in 4s at 0B/s, 4.0K left (1.0K data) [{at}]",
+        f"batch 2: 1 files, 4.0K moved (1.0K data) in 4s at 1.0K/s, 0B left (0B data) [{at}]",
+    ]
+
+
+def line(**changes: float) -> str:
+    """Format a batch line from the numbers of a 58-minute batch, with ``changes`` replacing some of them."""
+    numbers = {
+        "number": 7,
+        "files": 1204,
+        "moved": int(99.8 * 1024**3),
+        "moved_data": 146 * 1024**3,
+        "copied": int(99.8 * 1024**3),
+        "seconds": 3490,
+        "left": int(4.2 * 1024**4),
+        "left_data": int(6.1 * 1024**4),
+        "run_copied": int(99.8 * 1024**3),
+        "run_seconds": 3490,
+        "stamp": datetime(2026, 1, 1, 14, 2).timestamp(),  # noqa: DTZ001
+        **changes,
+    }
+    return _batch_line(**numbers)  # type: ignore[arg-type]
+
+
+# The line shown in docs/usage.md and docs/guides.md: it must be what the code prints for those numbers.
+DOCUMENTED_LINE = (
+    "batch 7: 1204 files, 99.8G moved (146.0G data) in 58m 10s at 29.3M/s, 4.2T left (6.1T data), ETA 1d 17h [14:02]"
+)
+
+
+def test_documented_batch_line_is_what_the_code_prints() -> None:
+    """The example in the docs is built from the numbers it shows, so it cannot drift."""
+    assert line() == DOCUMENTED_LINE
+    for doc in ("usage.md", "guides.md"):
+        assert DOCUMENTED_LINE in (Path(__file__).parent.parent / "docs" / doc).read_text()
+
+
+def test_batch_line_without_elapsed_time_has_no_rate_and_no_eta() -> None:
+    """A batch that took no measurable time has no rate to divide by."""
+    assert " at " not in line(seconds=0)
+    assert ", ETA " not in line(seconds=0, run_seconds=0)
+    assert " in 0s, 4.2T left" in line(seconds=0, run_seconds=0)
+
+
+def test_batch_line_without_a_copy_has_no_eta() -> None:
+    """Before anything was copied in this run, the run has no rate."""
+    text = line(copied=0, run_copied=0)
+    assert " at 0B/s, " in text
+    assert ", ETA " not in text
 
 
 @pytest.mark.parametrize(
     ("seconds", "text"),
-    [(0, "0s"), (59, "59s"), (60, "1m"), (3490, "58m 10s"), (3600, "1h"), (3900, "1h 5m"), (183_600, "2d 3h")],
+    [
+        (0, "0s"),
+        (59, "59s"),
+        (60, "1m 0s"),
+        (3490, "58m 10s"),
+        (3600, "1h 0m"),
+        (3601, "1h 0m"),
+        (3900, "1h 5m"),
+        (86_401, "1d 0h"),
+        (183_600, "2d 3h"),
+    ],
 )
 def test_format_duration(seconds: int, text: str) -> None:
-    """A duration shows its two most significant non-zero units."""
+    """A duration shows two units, from its largest non-zero one."""
     assert format_duration(seconds) == text
 
 
