@@ -613,6 +613,39 @@ def test_file_move_interrupt_in_writer_probe_exits_130_with_remount_hint(
     assert "remount it with: zfs mount tank/data" in result.output
 
 
+def test_file_move_status_prints_report_with_reads_only(
+    sim: ZfsSim,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """file-move-status prints the report and runs nothing but zfs list and zfs get."""
+    monkeypatch.setattr(cli, "LOCK_FILE", tmp_path / "no-lock")
+
+    result = runner.invoke(cli.app, ["file-move-status", "--stage", "tank/stage", "tank/data"])
+
+    assert result.exit_code == 0
+    assert "tank/data: exists" in result.stdout
+    assert "lock: not held" in result.stdout
+    calls = sim.runner.calls  # type: ignore[attr-defined]
+    assert calls
+    assert {call[:2] for call in calls} <= {("zfs", "list"), ("zfs", "get")}
+
+
+def test_file_move_status_listed_in_help() -> None:
+    """The command shows under the File-Move Commands panel."""
+    assert "file-move-status" in plain(runner.invoke(cli.app, ["--help"]).output)
+
+
+def test_file_move_status_zfs_failure_exits_1(fake: FakeRunner) -> None:
+    """A failing zfs call is an error on stderr, exit 1."""
+    fake.queue.append(fail("boom\n"))
+
+    result = runner.invoke(cli.app, ["file-move-status", "--stage", "tank/stage", "tank/data"])
+
+    assert result.exit_code == 1
+    assert "error:" in result.stderr
+
+
 # --- checking a final prompt against the key file ---
 
 FILE_MOVE = ["file-move", "tank/data", "--delete-source"]

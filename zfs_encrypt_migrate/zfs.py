@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import typer
 
 from .constants import COMMAND_STARTUP_ERROR_RETURNCODE, DATASET_NAME_RE
-from .errors import ZfsError
+from .errors import MigrationError, ZfsError
 from .process import CommandResult
 
 if TYPE_CHECKING:
@@ -84,6 +84,15 @@ class Zfs:
     def get(self, prop: str, name: str) -> str:
         """Read one property as a parsable value."""
         return self._run(["zfs", "get", "-H", "-p", "-o", "value", prop, name]).stdout.strip()
+
+    def get_many(self, props: Sequence[str], name: str) -> list[tuple[str, str]]:
+        """Read several properties in one command, as parsable values; raise unless every one came back."""
+        args = ["zfs", "get", "-H", "-p", "-o", "property,value", ",".join(props), name]
+        rows = dict(line.split("\t", 1) for line in self._run(args).stdout.splitlines() if "\t" in line)
+        if missing := [prop for prop in props if prop not in rows]:
+            msg = f"zfs get {name} did not return {', '.join(missing)}"
+            raise MigrationError(msg)
+        return [(prop, rows[prop]) for prop in props]
 
     def props(self, name: str) -> dict[str, Prop]:
         """Read every property, user properties included, with its source."""

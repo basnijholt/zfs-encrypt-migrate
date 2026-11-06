@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Annotated
 import typer
 
 from .audit import find_unencrypted
+from .constants import LOCK_FILE
 from .errors import Interrupted, MigrationError
 from .filemove import file_move
 from .migrate import INTERRUPT_SIGNALS, Settings, catchup, cutover, seed
@@ -17,6 +18,7 @@ from .output import console, print_error
 from .preflight import check_file_move
 from .process import CommandRunner, SubprocessRunner
 from .sizes import parse_size
+from .status import file_move_status
 from .tree import tree_finish, tree_move, tree_seed
 from .version import __version__
 from .zfs import Zfs, validate_child, validate_name
@@ -382,6 +384,18 @@ def file_move_command(
         Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation),
         dataset,
     )
+
+
+@app.command("file-move-status", rich_help_panel="File-Move Commands")
+def file_move_status_command(dataset: DatasetArgument, *, stage: StageOption) -> None:
+    """Print facts about a file-move; only reads, so it is safe while a run is active."""
+    try:
+        lines = file_move_status(Zfs(_runner()), stage, dataset, LOCK_FILE)
+    except MigrationError as error:
+        print_error(error.message, error.hints)
+        raise typer.Exit(1) from error
+    for line in lines:
+        console.print(line, markup=False, highlight=False, soft_wrap=True)
 
 
 @app.command("tree-finish", rich_help_panel="Tree Commands")
