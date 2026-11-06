@@ -332,7 +332,7 @@ def file_move_command(
 
 @app.command("file-move-status", rich_help_panel="File-Move Commands")
 def file_move_status_command(dataset: DatasetArgument, *, stage: StageOption) -> None:
-    """Report where a file-move stands; only reads, so it is safe while a run is active."""
+    """Print facts about a file-move; only reads, so it is safe while a run is active."""
     try:
         lines = file_move_status(Zfs(_runner()), stage, dataset, lock_path=LOCK_FILE)
     except MigrationError as error:

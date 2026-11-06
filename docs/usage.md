@@ -20,7 +20,7 @@ Bare `zfs-encrypt-migrate` only shows help.
 | `tree-move DATASET CHILD` | Copy one child subtree under the staged parent; the source stays until you destroy it. |
 | `tree-finish DATASET` | Send the parent's last changes and swap the staged tree into place once no children remain. |
 | `file-move DATASET --delete-source` | Move a dataset's files in verified batches into an encrypted dataset, deleting each source file once its copy is verified, then swap it into place. |
-| `file-move-status DATASET` | Report where a `file-move` stands: staged dataset, sizes, phase, lock and next step. Read-only. |
+| `file-move-status DATASET` | Print facts about a `file-move`: both datasets, the markers, the old copy and the lock. Read-only. |
 | `audit [--exact NAME]... [--subtree NAME]... POOL...` | List unencrypted datasets outside the allowlists; exit 1 if there are any. |
 
 ## Shared Options
@@ -373,47 +373,58 @@ From the final unmount of step 8 on, the hints remount with `zfs mount -a` inste
 zfs-encrypt-migrate file-move-status --stage tank/stage tank/media
 ```
 
-Reports where a `file-move` of `DATASET` stands, while it runs or after it stopped.
-It is strictly read-only: it runs only `zfs list` and `zfs get`, so it never unmounts, mounts, loads a key, takes a snapshot or sets a property, and it is safe to run while `file-move` is active.
+Prints facts about the `file-move` of `DATASET`, while it runs or after it stopped.
+It is strictly read-only: it runs only `zfs list` and `zfs get`, and reads `/proc/locks`.
+It never unmounts, mounts, loads a key, takes a snapshot or sets a property, and it never lists, opens or reads anything under the source or the staged mountpoint, so it cannot hold either mount busy against the unmounts the run does.
 Run it as root, like the other commands.
+It infers no phase and gives no advice: the facts are yours to read, and the recovery hints the run itself printed are authoritative.
 
 ```text
 file-move status of tank/media (stage tank/stage)
 tank/media: exists
-  tank/media: used 1.0M, logicalused 2.0M
+  encryption: off
+  encryptionroot: -
+  keystatus: -
+  mounted: yes
+  canmount: on
+  mountpoint: /mnt/media
+  used: 1.0M
+  logicalused: 2.0M
 tank/stage/media: exists
+  encryption: aes-256-gcm
+  encryptionroot: tank/stage/media
+  keystatus: available
+  mounted: yes
+  canmount: noauto
+  mountpoint: /run/zfs-encrypt-migrate/media
+  used: 2.0K
+  logicalused: 4.0K
   zfs-encrypt-migrate:file-move: tank/media
   zfs-encrypt-migrate:key-checked: prompt
   zfs-encrypt-migrate:admitted: yes
-  zfs-encrypt-migrate:dirs: yes
-  tank/stage/media: used 2.0K, logicalused 4.0K
-phase: moving files or finishing (file count not checked)
+  zfs-encrypt-migrate:dirs: copied
+tank/stage/old/media: does not exist
 lock: no run holds it
-next: rerun the same file-move command to continue; do not destroy either tank/media or tank/stage/media
 ```
 
-The phase comes from state that already exists; nothing new is recorded:
-
-| Phase | How it is known |
-| --- | --- |
-| `not started` | `STAGE/LEAF` does not exist and `DATASET` is not encrypted. |
-| `copying the tree` | `STAGE/LEAF` exists and is not yet marked `admitted`: no file was deleted yet. |
-| `moving files or finishing (file count not checked)` | `STAGE/LEAF` is marked `admitted`. |
-| `swapped` | `STAGE/LEAF` does not exist, `DATASET` is encrypted with `STAGE/old/LEAF` present and no marker property left, and it is mounted, unless `canmount` is not `on` or its mountpoint is `none` or `legacy`, which a finished move leaves unmounted. |
-| `swap interrupted` | The same, but a marker property is left, or the dataset is unmounted where a finish would have mounted it. The marker `zfs-encrypt-migrate:file-move` is removed first, so its absence alone proves nothing. Follow the recovery hints the run printed. |
-| `swapping (a run holds the lock)` | A transitional state of the swap (markers left, or `DATASET` briefly missing) while a run holds the lock: wait, give no recovery advice. |
-| `already encrypted` | `DATASET` is encrypted with no `STAGE/LEAF`, no `STAGE/old/LEAF` and no marker: no file-move state was found. |
-
-The status never lists, opens or reads anything under the source or the staged mountpoint, so it cannot hold either mount busy against the unmounts the run does.
-It therefore does not count the files left; it reads only zfs properties.
+For `DATASET` and `STAGE/LEAF` it prints whether they exist, then `encryption`, `encryptionroot`, `keystatus`, `mounted`, `canmount`, `mountpoint`, `used` and `logicalused`; for `STAGE/LEAF` also the four `zfs-encrypt-migrate:*` marker values (`-` when unset).
+It also prints whether `STAGE/old/LEAF` exists.
 
 The lock line says whether a run holds `/run/zfs-encrypt-migrate.lock`.
 `file-move` takes a `flock` lock, which `fcntl` `F_GETLK` cannot see on Linux, so the status looks for the lock file's device and inode among the `FLOCK` entries of `/proc/locks`, which lists every lock the kernel holds.
 It only calls `stat` on the lock file: it never opens, creates or locks it, so it can never make a starting run fail or wait.
 No lock file means `no run`; a file nobody holds means `no run holds it` (the file stays after a run ends); a holder shows its pid, as seen from the status's own PID namespace; if the lock file or `/proc/locks` cannot be read, the state is `unknown`.
 
-The last line says what to do: `run file-move`, `wait` while a run holds the lock, `rerun the same file-move command`, or, once swapped, the steps after the swap.
-A dataset that is missing, or a `STAGE/LEAF` that belongs to something else, is reported as it is.
+How to read the facts:
+
+| Facts | Meaning |
+| --- | --- |
+| Markers on `STAGE/LEAF` and the lock held | A run is active; wait. |
+| Markers on `STAGE/LEAF` and no lock | A run stopped; rerun the same command. |
+| No `STAGE/LEAF`, `STAGE/old/LEAF` present, no markers on `DATASET` | The swap finished; follow the post-swap steps. |
+| `DATASET` encrypted, no `STAGE/LEAF` and no `STAGE/old/LEAF` | No file-move state. |
+
+Any other combination, such as markers left on an encrypted `DATASET` or a missing `DATASET`, can be a swap in progress or one that stopped part way: follow the recovery hints the run printed, and do not act on this table.
 
 ### What file-move does not support
 

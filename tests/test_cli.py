@@ -610,7 +610,7 @@ def test_file_move_status_prints_report_with_reads_only(
     result = runner.invoke(cli.app, ["file-move-status", "--stage", "tank/stage", "tank/data"])
 
     assert result.exit_code == 0
-    assert "phase: not started" in result.stdout
+    assert "tank/data: exists" in result.stdout
     assert "lock: no run" in result.stdout
     calls = sim.runner.calls  # type: ignore[attr-defined]
     assert calls

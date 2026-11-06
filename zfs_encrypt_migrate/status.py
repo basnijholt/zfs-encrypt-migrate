@@ -14,7 +14,6 @@ if TYPE_CHECKING:
     from .zfs import Zfs
 
 _PROC_LOCKS = Path("/proc/locks")
-_NO_MOUNTPOINT = {"none", "legacy"}
 
 
 def _read_locks() -> str:
@@ -53,91 +52,29 @@ def _lock_state(path: Path) -> str:
     return "no run holds it"
 
 
-def _marker(zfs: Zfs, prop: str, name: str, yes: str) -> str:
-    return "yes" if zfs.get(prop, name) == yes else "no"
+_FACTS = ("encryption", "encryptionroot", "keystatus", "mounted", "canmount", "mountpoint")
+_MARKS = (MARK_SOURCE, MARK_KEY, MARK_ADMITTED, MARK_DIRS)
 
 
-def _sizes(zfs: Zfs, name: str) -> str:
-    used, logical = (int(zfs.get(prop, name)) for prop in ("used", "logicalused"))
-    return f"  {name}: used {format_size(used)}, logicalused {format_size(logical)}"
-
-
-def _after_swap(zfs: Zfs, stage: str, dataset: str) -> tuple[str, list[str]]:
-    """Judge a dataset that is encrypted with no staged dataset left, from properties only."""
-    leaf = leaf_of(dataset)
-    markers = (MARK_SOURCE, MARK_DIRS, MARK_KEY, MARK_ADMITTED)
-    left = any(zfs.get(prop, dataset) not in {"-", ""} for prop in markers)
-    old_exists = zfs.exists(f"{stage}/old/{leaf}")
-    if not left and not old_exists:
-        return "already encrypted", ["next: already encrypted; no file-move state found"]
-    # MARK_SOURCE is removed first, before canmount is restored and the dataset mounted.
-    # Mirrors _finish: it mounts the replacement only when canmount is on and the mountpoint is real.
-    due = zfs.get("canmount", dataset) == "on" and zfs.get("mountpoint", dataset) not in _NO_MOUNTPOINT
-    if left or (due and zfs.get("mounted", dataset) != "yes"):
-        return "swap interrupted", [
-            (
-                "next: the swap did not finish (markers left, or the dataset is not mounted); "
-                "follow the recovery hints the run printed"
-            ),
-        ]
-    return "swapped", [
-        "next: no rerun needed. Finish by hand:",
-        f"  zfs load-key -n {dataset}",
-        "  remount NFS clients: the new dataset has new file handles",
-        f"  re-enable snapshot tools for {dataset}; replication restarts with a full send",
-        f"  once verified, free the old copy: zfs destroy -r {stage}/old/{leaf}",
-    ]
+def _facts(zfs: Zfs, name: str, *, markers: bool = False) -> list[str]:
+    """List the facts of a dataset, or that it does not exist. Reads only."""
+    if not zfs.exists(name):
+        return [f"{name}: does not exist"]
+    lines = [f"{name}: exists"]
+    lines += [f"  {prop}: {zfs.get(prop, name)}" for prop in _FACTS]
+    lines += [f"  {prop}: {format_size(int(zfs.get(prop, name)))}" for prop in ("used", "logicalused")]
+    if markers:
+        lines += [f"  {prop}: {zfs.get(prop, name)}" for prop in _MARKS]
+    return lines
 
 
 def file_move_status(zfs: Zfs, stage: str, dataset: str, *, lock_path: Path = LOCK_FILE) -> list[str]:
-    """Return the report lines for the file-move of ``dataset`` through ``stage``. Reads only."""
-    staged = f"{stage}/{leaf_of(dataset)}"
-    lock = _lock_state(lock_path)
-    running = lock.startswith("held")
-    lines = [f"file-move status of {dataset} (stage {stage})"]
-    swapping = ["phase: swapping (a run holds the lock)", f"lock: {lock}", "next: wait for the run to finish"]
-    if not zfs.exists(dataset):
-        if running:
-            return [*lines, *swapping]
-        lines += [
-            f"{dataset}: does not exist",
-            f"lock: {lock}",
-            f"next: if {stage}/old/{leaf_of(dataset)} exists, a swap was interrupted; follow the recovery hints",
-        ]
-        return lines
-    lines.append(f"{dataset}: exists")
-    lines.append(_sizes(zfs, dataset))
-    if not zfs.exists(staged):
-        lines.append(f"{staged}: does not exist")
-        swapped = zfs.get("encryption", dataset) != "off"
-        phase, tail = _after_swap(zfs, stage, dataset) if swapped else ("not started", [])
-        tail = tail or [f"next: run file-move --stage {stage} {dataset} --delete-source"]
-    else:
-        lines.append(f"{staged}: exists")
-        owner = zfs.get(MARK_SOURCE, staged)
-        key = zfs.get(MARK_KEY, staged)
-        lines += [
-            f"  {MARK_SOURCE}: {owner}",
-            f"  {MARK_KEY}: {key if key not in {'-', ''} else 'no'}",
-            f"  {MARK_ADMITTED}: {_marker(zfs, MARK_ADMITTED, staged, 'yes')}",
-            f"  {MARK_DIRS}: {_marker(zfs, MARK_DIRS, staged, 'copied')}",
-            _sizes(zfs, staged),
-        ]
-        if owner != dataset:
-            phase = "unknown"
-            tail = [f"next: {staged} is not a file-move of {dataset}; another migration owns that name"]
-        elif zfs.get(MARK_ADMITTED, staged) == "yes":
-            # No file is counted: reading the mounted source would hold it open against the run's own unmounts.
-            phase = "moving files or finishing (file count not checked)"
-            tail = [f"next: rerun the same file-move command to continue; do not destroy either {dataset} or {staged}"]
-        else:
-            phase = "copying the tree"
-            tail = ["next: rerun the same file-move command to continue; nothing was deleted yet"]
-    if running and phase == "swap interrupted":
-        return [*lines, *swapping]
-    if running and (phase in {"not started", "copying the tree"} or phase.startswith("moving")):
-        tail = ["next: wait; a run holds the lock and a second one would be refused"]
-    lines.append(f"phase: {phase}")
-    lines.append(f"lock: {lock}")
-    lines += tail
-    return lines
+    """Return the facts about the file-move of ``dataset`` through ``stage``; it infers and advises nothing."""
+    leaf = leaf_of(dataset)
+    return [
+        f"file-move status of {dataset} (stage {stage})",
+        *_facts(zfs, dataset),
+        *_facts(zfs, f"{stage}/{leaf}", markers=True),
+        f"{stage}/old/{leaf}: {'exists' if zfs.exists(f'{stage}/old/{leaf}') else 'does not exist'}",
+        f"lock: {_lock_state(lock_path)}",
+    ]

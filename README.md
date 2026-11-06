@@ -212,7 +212,7 @@ zfs-encrypt-migrate --help
 ╭─ File-Move Commands ─────────────────────────────────────────────────────────────────────────────╮
 │ file-move         Move a dataset's files in verified batches into an encrypted dataset, then     │
 │                   swap it into place.                                                            │
-│ file-move-status  Report where a file-move stands; only reads, so it is safe while a run is      │
+│ file-move-status  Print facts about a file-move; only reads, so it is safe while a run is        │
 │                   active.                                                                        │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭─ Audit Commands ─────────────────────────────────────────────────────────────────────────────────╮
