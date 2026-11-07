@@ -191,6 +191,8 @@ def check_file_move(
         if zfs.exists(dataset) and zfs.snapshots(dataset):
             try:
                 refuse_snapshots(zfs, dataset)
+            except ZfsError:
+                raise
             except MigrationError as refusal:
                 late = (
                     "the run refuses this while files remain; "
