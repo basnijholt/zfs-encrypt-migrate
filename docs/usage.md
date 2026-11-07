@@ -20,7 +20,7 @@ Bare `zfs-encrypt-migrate` only shows help.
 | `tree-move DATASET CHILD` | Copy one child subtree under the staged parent; the source stays until you destroy it. |
 | `tree-finish DATASET` | Send the parent's last changes and swap the staged tree into place once no children remain. |
 | `file-move DATASET --delete-source` | Move a dataset's files in verified batches into an encrypted dataset, deleting each source file once its copy is verified, then swap it into place. |
-| `file-move DATASET --check` | Report what would stop `file-move`, with how to fix it; no ZFS, mount or lock changes. |
+| `file-move DATASET --check` | Advisory: report what would stop `file-move` in the categories it checks, with fixes; makes no ZFS changes and takes no locks. |
 | `file-move-status DATASET` | Print facts about a `file-move`: both datasets, the markers, the old copy and the lock. Read-only. |
 | `audit [--exact NAME]... [--subtree NAME]... POOL...` | List unencrypted datasets outside the allowlists; exit 1 if there are any. |
 
@@ -285,7 +285,7 @@ Takes the [shared options](#shared-options) and:
 | `--batch-size SIZE` | `ZFS_ENCRYPT_MIGRATE_BATCH_SIZE` | `100G` | Target bytes per batch, in the `--min-free` size syntax. A hard-linked file group bigger than this forms a batch of its own. |
 | `--delete-source` | none | off | Required. Confirms that each source file is deleted once its encrypted copy is verified. |
 | `--check-prompt-with-key-file` | none | off | With `--final-keylocation prompt`, check the final key against the key file instead of at a terminal; see below. |
-| `--check` | none | off | Only report what would stop the run, with how to fix it; no ZFS, mount or lock changes; see [file-move --check](#file-move-check). It needs no `--delete-source`. |
+| `--check` | none | off | Only report what would stop the run, with fixes; advisory, it makes no ZFS changes and takes no locks; see [file-move --check](#file-move-check). It needs no `--delete-source`. |
 
 One run does the whole job, and a rerun after a stop before the swap continues where it left off.
 Stop everything that uses the dataset first, and keep it stopped until the swap.
@@ -403,18 +403,20 @@ zfs-encrypt-migrate file-move tank/media --check
 ```
 
 Reports what would make `file-move` refuse or stall, in the categories below, each with the command or step that fixes it.
-It changes no ZFS state, mount or lock: it never unmounts, creates, snapshots, loads a key, sets a property or takes the run's lock, and it opens files only read-only, without updating their access times, to read their flags. Opening a directory can still trigger an autofs or systemd automount point inside the dataset.
+It is advisory: a clean result does not promise that the run won't refuse, and the run itself checks again everything that matters before it deletes anything.
+It makes no ZFS changes and takes no locks. It doesn't mount or unmount anything itself, but opening a directory can trigger an autofs or systemd automount point inside the dataset. It opens files only read-only, without updating their access times, to read their flags.
 Give it the options of the real run (`--stage`, `--key-file` and the rest); it needs no `--delete-source`, and with `--delete-source` it still only checks.
 Run it as root, like `file-move`; without root it reports only that it needs root.
 
 It checks:
 
-- The first refusal of [step 2](#file-move), as the run gives it. Fix it and check again for the next.
+- The first refusal of [step 2](#file-move), as the run gives it. Fix it and check again for the next. When the dataset has snapshots, that refusal comes first, so the run's check, which would scan the dataset, is not run.
 - Snapshots of the dataset mounted in any mount namespace that has a process, found by name in the mount table of every process and thread: a mounted snapshot keeps `zfs destroy` from removing it, and one under `.zfs/snapshot` makes the run's unmount fail with `busy`.
 - Immutable and append-only files and directories, read with the `FS_IOC_GETFLAGS` ioctl, so `lsattr` need not be installed: the run cannot delete them, or the files in them, and would stop at the first. Each comes with the `chattr` command that clears its flags, and the one that sets them again after the swap. An entry it cannot read is a problem too.
 
-It reads the flags only when the kernel lists the dataset as mounted where `zfs get mountpoint` says; otherwise that is a problem too.
-Every report starts with what it does not check, then lists each problem with its fixes and ends with a summary:
+It reads the flags only when the kernel lists the dataset as mounted where `zfs get mountpoint` says; otherwise that is a problem too, as is an entry that disappears during the walk.
+The `Not checked` line comes with every report; a usage error (exit 2) prints no report at all.
+A report starts with what it does not check, then lists each problem with its fixes and ends with a summary:
 
 ```text
 Not checked: processes or containers that hold the dataset, including container bind mounts. Stop them first. The run's unmount refuses while a holder is busy, but a container's private bind mount can survive it. Nor is a snapshot mount seen that lies outside the root of every process in its mount namespace, as with a chroot.
@@ -431,7 +433,7 @@ problem: tank/media has files or directories with the immutable or append-only f
 It exits 1 on any problem. Exit 0, `no findings in the checked categories`, means only that: stop what holds the dataset first.
 While a `file-move` holds its lock, or the lock's state can't be read, it reports only `a file-move is running; check skipped` and reads nothing else.
 It opens each regular file and directory of the dataset for its flags, so on a big dataset it takes a while; don't start the run meanwhile, as its unmount would find the check's open files.
-A name that is not valid UTF-8 shows with `\x..` escapes, and its fix is left to you.
+A name that is not printable, such as one with a control character or a byte that is no UTF-8, shows with escapes, and its fix is left to you.
 It can't check the free-space admission or the final key: both need the encrypted dataset, which the run creates (steps 6 and 7).
 
 ### file-move-status

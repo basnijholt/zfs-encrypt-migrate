@@ -202,7 +202,7 @@ Then run the check, with the options you'll give the real run:
 zfs-encrypt-migrate file-move tank/media --check
 ```
 
-It changes no ZFS state, mount or lock. It reports the run's first refusal, snapshots of the dataset mounted in any mount namespace that has a process, and immutable and append-only files, each with its fix; see [file-move --check](usage.md#file-move-check).
+It is advisory, makes no ZFS changes and takes no locks. It reports the run's first refusal, snapshots of the dataset mounted in any mount namespace that has a process, and immutable and append-only files, each with its fix; see [file-move --check](usage.md#file-move-check).
 It does not check for processes or containers that hold the dataset: stop and disable those first, as above.
 
 **2. Run it in tmux or screen, or [unattended](#running-unattended).**

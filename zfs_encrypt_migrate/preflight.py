@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from .constants import LOCK_FILE
 from .errors import MigrationError, ZfsError
-from .filemove import preflight_file_move
+from .filemove import preflight_file_move, refuse_snapshots
 from .filetree import mounted_at, mountinfo_field
 from .status import lock_state
 
@@ -27,16 +27,22 @@ _PROC = Path("/proc")
 # A process or thread that ended; EINVAL is what a zombie, or a thread whose main thread exited, gives.
 _GONE = {errno.ENOENT, errno.ESRCH, errno.EINVAL}
 _FLAGS = ((0x10, "i"), (0x20, "a"))  # FS_IMMUTABLE_FL, FS_APPEND_FL
-# FS_IOC_GETFLAGS is _IOR('f', 1, long) in the generic ioctl encoding, which x86 and arm use.
-_GETFLAGS = (2 << 30) | (struct.calcsize("l") << 16) | (ord("f") << 8) | 1
+_GETFLAGS = 0x80086601  # FS_IOC_GETFLAGS, _IOR('f', 1, long) on 64-bit Linux
 # Read-only without touching access times; non-blocking, so a fifo swapped in, or a leased file, fails instead of
 # hanging the check. Root, which the check needs, may use O_NOATIME on any file.
 _OPEN = os.O_RDONLY | os.O_NOATIME | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_NOCTTY | os.O_CLOEXEC
 
 
 def _shown(name: str) -> str:
-    """Return ``name`` printable: a byte that is no UTF-8 shows as an escape instead of stopping the output."""
-    return os.fsencode(name).decode(errors="backslashreplace")
+    """Return ``name`` printable: a control character or a byte that is no UTF-8 shows as an escape."""
+    text = os.fsencode(name).decode(errors="backslashreplace")
+    return "".join(char if char.isprintable() else repr(char)[1:-1] for char in text)
+
+
+def _incomplete(what: str, first: tuple[str, OSError], hint: str) -> MigrationError:
+    """Report a scan left incomplete, naming the first entry it missed and why."""
+    name, reason = first
+    return MigrationError(f"{what}, such as {_shown(name)}: {reason.strerror or reason}", [hint])
 
 
 def _snapshots(raw: bytes, dataset: str) -> Iterator[tuple[str, str]]:
@@ -63,8 +69,7 @@ def _mountinfo(task: Path) -> bytes:
 def _snapshot_mounts(proc: Path, dataset: str) -> list[MigrationError]:
     """Return a problem for each snapshot of ``dataset`` mounted in any mount namespace that has a process.
 
-    Every thread's mountinfo is read: each leaves out mounts outside the thread's root, as in a chroot. A task that is
-    gone is skipped; one that cannot be read or listed leaves the scan incomplete, which is a problem too.
+    Every thread's mountinfo is read, as each leaves out mounts outside its root; one unreadable is a problem too.
     """
     seen: dict[tuple[str, str], str] = {}
     failed: list[tuple[str, OSError]] = []
@@ -74,7 +79,7 @@ def _snapshot_mounts(proc: Path, dataset: str) -> list[MigrationError]:
                 infos = [_mountinfo(Path(task.path)) for task in tasks]
         except OSError as error:
             if error.errno not in _GONE:
-                failed.append((pid, error))
+                failed.append((f"PID {pid}", error))
             continue
         for raw in infos:
             for mount in _snapshots(raw, dataset):
@@ -85,17 +90,15 @@ def _snapshot_mounts(proc: Path, dataset: str) -> list[MigrationError]:
         for (source, point), pid in seen.items()
     ]
     if failed:
-        (pid, reason), count = failed[0], len(failed)
-        such = f"such as PID {pid}: {reason.strerror or reason}"
-        message = f"could not read the mounts of {count} process{'es' if count > 1 else ''}, {such}"
-        problems.append(MigrationError(message, ["check again; until then, snapshots mounted there are unknown"]))
+        unknown = "check again; until then, snapshots mounted there are unknown"
+        problems.append(_incomplete("could not read the mounts of some processes", failed[0], unknown))
     return problems
 
 
 def _inode_flags(fd: int) -> int:
     """Return the inode flags of the open file ``fd``, as lsattr reads them."""
     # The kernel writes an int, though the request is declared with a long.
-    flags: int = struct.unpack_from("I", fcntl.ioctl(fd, _GETFLAGS, bytes(struct.calcsize("l"))))[0]
+    flags: int = struct.unpack_from("I", fcntl.ioctl(fd, _GETFLAGS, bytes(8)))[0]
     return flags
 
 
@@ -106,9 +109,9 @@ def _letters(path: str, top: bool, device: int, visited: set[tuple[int, int]], p
         st = os.fstat(fd)
         if st.st_dev != device or (st.st_dev, st.st_ino) in visited:
             return ""
-        visited.add((st.st_dev, st.st_ino))
         flags = _inode_flags(fd)
         if stat.S_ISDIR(st.st_mode):
+            visited.add((st.st_dev, st.st_ino))
             with os.scandir(fd) as it:
                 pending += [
                     f"{path.rstrip('/')}/{entry.name}"
@@ -124,51 +127,44 @@ def _letters(path: str, top: bool, device: int, visited: set[tuple[int, int]], p
 def _pinned_files(root: Path, dataset: str) -> list[MigrationError]:
     """Return a problem for the immutable or append-only entries under ``root``: the run would stop at the first.
 
-    Like lsattr it reads regular files and directories, never follows a symlink, stays on the dataset's device and
-    skips a top-level ``.zfs``. An entry it cannot read is a problem too.
+    Like lsattr it reads files and directories, not symlinks, on the dataset only; one unread or changed is a problem.
     """
     commands: list[tuple[str, str]] = []
     unread: list[tuple[str, OSError]] = []
+    changed: list[tuple[str, OSError]] = []
     visited: set[tuple[int, int]] = set()
     device, pending = os.lstat(root).st_dev, [str(root)]
     while pending:
         path = pending.pop()
         try:
             letters = _letters(path, path == str(root), device, visited, pending)
-        except FileNotFoundError:
+        except FileNotFoundError as error:
+            changed.append((path, error))
             continue
         except OSError as error:
             unread.append((path, error))
             continue
-        if letters and _shown(path) != path:
+        if letters and not path.isprintable():
             # Quoting the escape would name another file.
             fix = f"chattr -{letters}, and chattr +{letters} after the swap"
-            fix = f"its name is no valid UTF-8, so fix it by hand: {fix}"
-            commands.append((path, f"  {_shown(path)}: {fix}"))
+            commands.append((path, f"  {_shown(path)}: its name is not printable, so fix it by hand: {fix}"))
         elif letters:
             quoted = shlex.quote(path)
             commands.append((path, f"  chattr -{letters} {quoted}  # after the swap: chattr +{letters} {quoted}"))
     problems = []
     if commands:
         message = f"{dataset} has files or directories with the immutable or append-only flag, which keeps file-move "
-        hints = ["clear the flags; the copies get none, so set them again after the swap:"]
-        problems.append(
-            MigrationError(
-                message + "from deleting them or the files in them",
-                hints + [c for _, c in sorted(commands)],
-            ),
-        )
+        hint = "clear the flags; the copies get none, so set them again after the swap:"
+        hints = [hint, *(command for _, command in sorted(commands))]
+        problems.append(MigrationError(message + "from deleting them or the files in them", hints))
     if unread:
-        (first, reason), count = min(unread, key=lambda item: item[0]), len(unread)
-        such = f"such as {_shown(first)}: {reason.strerror or reason}"
-        message = f"could not read the inode flags of {count} entr{'ies' if count > 1 else 'y'} in {dataset}, {such}"
         hint = "check them by hand with lsattr -d; the run stops at an immutable or append-only one"
-        problems.append(MigrationError(message, [hint]))
+        what = f"could not read the inode flags of some entries in {dataset}"
+        problems.append(_incomplete(what, min(unread, key=lambda item: item[0]), hint))
+    if changed:
+        what = f"some entries in {dataset} changed during the check"
+        problems.append(_incomplete(what, min(changed, key=lambda item: item[0]), "stop the writers and check again"))
     return problems
-
-
-def _is_root() -> bool:
-    return os.geteuid() == 0
 
 
 def check_file_move(
@@ -179,12 +175,11 @@ def check_file_move(
     proc: Path = _PROC,
     lock_path: Path = LOCK_FILE,
 ) -> list[MigrationError]:
-    """Return what would make file-move refuse or stall, in the categories checked; change no ZFS state, mount or lock.
+    """Return what would make file-move refuse or stall, in the categories checked; advisory, the run checks again.
 
-    The run's preflight gives its first refusal; then come snapshot mounts and the files the run cannot delete. While
-    a run holds, or may hold, its lock, it reads nothing else.
+    It makes no ZFS changes and takes no locks, and reads nothing else while a run holds, or may hold, its lock.
     """
-    if not _is_root():
+    if os.geteuid() != 0:
         return [MigrationError("run --check as root, like file-move: without root it cannot see every mount and file")]
     state = lock_state(lock_path)
     if state != "not held":
@@ -192,6 +187,9 @@ def check_file_move(
         return [MigrationError("a file-move is running; check skipped", [hint])]
     problems: list[MigrationError] = []
     try:
+        # With snapshots the preflight would scan the dataset, which can update directory access times.
+        if zfs.exists(dataset) and zfs.snapshots(dataset):
+            refuse_snapshots(zfs, dataset)
         preflight_file_move(zfs, settings, dataset)
     except MigrationError as refusal:
         if isinstance(refusal, ZfsError):

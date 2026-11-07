@@ -1,4 +1,4 @@
-"""Tests for what only file-move --check looks for: snapshot mounts, mounts inside the dataset, inode flags."""
+"""Tests for what only file-move --check looks for: snapshot mounts in any namespace, and inode flags."""
 
 from __future__ import annotations
 
@@ -156,18 +156,21 @@ def test_tasks_that_cannot_be_read_or_listed_leave_the_scan_incomplete(
     stuck, hidden = host.proc.add(77), host.proc.add(78)
     failing(monkeypatch, {stuck / "task" / "77" / "mountinfo": errno.ENOTCONN, hidden / "task": errno.EACCES})
     assert found(host.snapshots()) == [
-        ("could not read the mounts of 2 processes, such as PID 77: Transport endpoint is not connected", (UNKNOWN,)),
+        (
+            "could not read the mounts of some processes, such as PID 77: Transport endpoint is not connected",
+            (UNKNOWN,),
+        ),
     ]
 
 
 def test_odd_bytes_in_names_neither_crash_nor_split_the_report(host: Host) -> None:
-    """A carriage return stays in its path, and a byte that is no UTF-8 shows as an escape."""
+    """A carriage return stays in its path, but shows as an escape, as does a byte that is no UTF-8."""
     host.proc.add(
         2345,
         mountinfo=mount_line(720, 710, "/da\rta", f"{DATASET}@a") + mount_line(721, 710, "/x\udcff", f"{DATASET}@b"),
     )
     assert [problem.message for problem in host.snapshots()] == [
-        f"snapshot {DATASET}@a is mounted at /da\rta, as seen by PID 2345",
+        f"snapshot {DATASET}@a is mounted at /da\\rta, as seen by PID 2345",
         f"snapshot {DATASET}@b is mounted at /x\\xff, as seen by PID 2345",
     ]
 
@@ -244,17 +247,21 @@ def test_no_flags_no_problem(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
 
 
 def test_unreadable_entries_fail_closed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """An entry whose flags stay unknown may be one the run cannot delete; one that vanished is no concern."""
+    """An entry whose flags stay unknown may be one the run cannot delete; one that vanished means a writer is busy."""
     root = flagged_tree(tmp_path)
     error = BlockingIOError(errno.EWOULDBLOCK, "Resource temporarily unavailable")
     flags_by_name(monkeypatch, root, {"docs/b.txt": error, "a.txt": FileNotFoundError(errno.ENOENT, "gone")})
     assert found(pinned_files(root, DATASET)) == [
         (
             (
-                f"could not read the inode flags of 1 entry in {DATASET}, such as {root / 'docs' / 'b.txt'}: "
+                f"could not read the inode flags of some entries in {DATASET}, such as {root / 'docs' / 'b.txt'}: "
                 "Resource temporarily unavailable"
             ),
             ("check them by hand with lsattr -d; the run stops at an immutable or append-only one",),
+        ),
+        (
+            f"some entries in {DATASET} changed during the check, such as {root / 'a.txt'}: gone",
+            ("stop the writers and check again",),
         ),
     ]
 
@@ -285,15 +292,22 @@ def test_each_directory_is_entered_once_and_never_another_device(
     assert not [name for name in read if name.startswith(("docs/deep", "other"))]
 
 
-def test_names_that_are_no_utf8_show_as_escapes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """A file name with a byte that is no UTF-8 neither crashes the report nor stops it halfway."""
+@pytest.mark.parametrize(("name", "shown"), [(os.fsdecode(b"bad\xff"), "bad\\xff"), ("a\tb", "a\\tb")])
+def test_names_that_are_not_printable_are_left_to_fix_by_hand(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    shown: str,
+) -> None:
+    """A name with a byte that is no UTF-8, or a control character, shows as an escape and gets no shell command.
+
+    Quoting the escape would name another file.
+    """
     root = flagged_tree(tmp_path)
-    bad = root / os.fsdecode(b"bad\xff")
-    bad.write_text("x")
-    flags_by_name(monkeypatch, root, {os.fsdecode(b"bad\xff"): IMMUTABLE})
-    # Quoting the escape would name another file: the hint names it, and leaves the chattr to a person.
+    (root / name).write_text("x")
+    flags_by_name(monkeypatch, root, {name: IMMUTABLE})
     assert pinned_files(root, DATASET)[0].hints[1] == (
-        f"  {root}/bad\\xff: its name is no valid UTF-8, so fix it by hand: chattr -i, and chattr +i after the swap"
+        f"  {root}/{shown}: its name is not printable, so fix it by hand: chattr -i, and chattr +i after the swap"
     )
 
 

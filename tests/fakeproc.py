@@ -27,19 +27,17 @@ def mount_line(
 
 
 class FakeProc:
-    """Lay out ``root`` like /proc, with ``self`` the checking process."""
+    """Lay out ``root`` like /proc, with the checking process in it."""
 
     def __init__(self, root: Path, mountinfo: str = "") -> None:
         """Create the checking process, which sees ``mountinfo``."""
         self.root = root
         self.add(SELF_PID, mountinfo=mountinfo)
-        (root / "self").symlink_to(str(SELF_PID))
 
     def add(self, pid: int, *, mountinfo: str = "", threads: Mapping[int, str] = {}) -> Path:
         """Add a process and return its directory; ``threads`` maps more thread IDs to the mounts each sees."""
         base = self.root / str(pid)
         base.mkdir(parents=True)
-        (base / "mountinfo").write_bytes(mountinfo.encode("utf-8", "surrogateescape"))
         for tid, mounts in {pid: mountinfo, **threads}.items():
             (base / "task" / str(tid)).mkdir(parents=True)
             (base / "task" / str(tid) / "mountinfo").write_bytes(mounts.encode("utf-8", "surrogateescape"))

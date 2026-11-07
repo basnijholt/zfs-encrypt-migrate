@@ -367,7 +367,7 @@ def file_move_command(
         bool,
         typer.Option(
             "--check",
-            help="Only report what would stop file-move, and how to fix it; no ZFS, mount or lock changes",
+            help="Only report what would stop file-move, with fixes; advisory: makes no ZFS changes, takes no locks",
         ),
     ] = False,
 ) -> None:

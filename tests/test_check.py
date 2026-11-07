@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from zfs_encrypt_migrate import preflight, status
+from zfs_encrypt_migrate import filemove, preflight, status
 from zfs_encrypt_migrate.constants import SCRATCH
 from zfs_encrypt_migrate.filemove import _run_lock
 from zfs_encrypt_migrate.preflight import check_file_move
@@ -29,7 +29,7 @@ IMMUTABLE = 0x10
 @pytest.fixture(autouse=True)
 def as_root(monkeypatch: pytest.MonkeyPatch) -> None:
     """Run the check as if as root; the tests themselves are not."""
-    monkeypatch.setattr(preflight, "_is_root", lambda: True)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
 
 
 @pytest.fixture
@@ -234,8 +234,28 @@ def test_without_root_the_check_asks_for_root(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Without root, other users' mounts and files stay hidden: the check says so rather than pass."""
-    monkeypatch.setattr(preflight, "_is_root", lambda: False)
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
     assert found(check(filemove_env, settings, proc, tmp_path)) == [
         ("run --check as root, like file-move: without root it cannot see every mount and file", ()),
     ]
     assert filemove_env.runner.calls == []
+
+
+def test_with_snapshots_the_run_s_snapshot_refusal_comes_without_a_scan(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    proc: FakeProc,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The run's preflight scans the dataset when it has snapshots, which could update directory access times."""
+    filemove_env.sim.snapshot(f"{DATASET}@auto")
+    scanned: list[Path] = []
+    monkeypatch.setattr(filemove, "scan", scanned.append)
+    assert found(check(filemove_env, settings, proc, tmp_path)) == [
+        (
+            f"{DATASET} has snapshots, which keep deleted files allocated: {DATASET}@auto",
+            (f"disable snapshot tools for {DATASET}, then remove them: zfs destroy {DATASET}@auto",),
+        ),
+    ]
+    assert scanned == []

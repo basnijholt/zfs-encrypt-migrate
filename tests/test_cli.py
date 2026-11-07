@@ -734,7 +734,7 @@ def checked(filemove_env: FileMoveEnv, tmp_path: Path, monkeypatch: pytest.Monke
     monkeypatch.setenv("ZFS_ENCRYPT_MIGRATE_KEY_FILE", str(key_file))
     monkeypatch.setenv("ZFS_ENCRYPT_MIGRATE_MIN_FREE", "1000")
     monkeypatch.setenv("ZFS_ENCRYPT_MIGRATE_STAGE", "tank/stage")
-    monkeypatch.setattr(preflight, "_is_root", lambda: True)
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
     return filemove_env
 
 
@@ -801,7 +801,7 @@ def test_file_move_check_prints_names_that_are_no_utf8(checked: FileMoveEnv, mon
     result = runner.invoke(cli.app, ["file-move", "--check", "tank/media"])
 
     assert result.exit_code == 1, result.output
-    assert f"    {checked.src}/bad\\xff: its name is no valid UTF-8, so fix it by hand" in result.stdout
+    assert f"    {checked.src}/bad\\xff: its name is not printable, so fix it by hand" in result.stdout
     assert result.stdout.endswith("1 problem would stop file-move\n")
 
 
