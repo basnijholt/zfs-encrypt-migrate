@@ -15,6 +15,7 @@ from .errors import Interrupted, MigrationError
 from .filemove import file_move
 from .migrate import INTERRUPT_SIGNALS, Settings, catchup, cutover, seed
 from .output import console, print_error
+from .preflight import check_file_move
 from .process import CommandRunner, SubprocessRunner
 from .sizes import parse_size
 from .status import file_move_status
@@ -198,6 +199,35 @@ def _refuse_unanswerable_prompt(final_keylocation: str, keyformat: Keyformat) ->
         raise typer.BadParameter(msg, param_hint="'--check-prompt-with-key-file'")
 
 
+_NOT_CHECKED = (
+    "Not checked: processes or containers that hold the dataset, including container bind mounts. Stop them first. "
+    "The run's unmount refuses while a holder is busy, but a container's private bind mount can survive it. "
+    "Nor is a snapshot mount seen that lies outside the root of every process in its mount namespace, as with a chroot."
+)
+
+
+def _report_check(settings: Settings, dataset: str) -> None:
+    """Print what is not checked, each problem with its fixes, and a summary; exit 1 on any problem."""
+    console.print(_NOT_CHECKED, markup=False, highlight=False, soft_wrap=True)
+    try:
+        problems = check_file_move(Zfs(_runner()), settings, dataset)
+    except MigrationError as error:
+        print_error(error.message, error.hints)
+        raise typer.Exit(1) from error
+    count = len(problems)
+    for problem in problems:
+        for line in (f"problem: {problem.message}", *(f"  {hint}" for hint in problem.hints)):
+            console.print(line, markup=False, highlight=False, soft_wrap=True)
+    summary = (
+        f"{count} problem{'s' * (count > 1)} found; the run checks again before it deletes anything"
+        if count
+        else "no findings in the checked categories"
+    )
+    console.print(summary, markup=False, highlight=False, soft_wrap=True)
+    if count:
+        raise typer.Exit(1)
+
+
 def _validate_names(values: list[str] | None) -> list[str] | None:
     return None if values is None else [validate_name(value) for value in values]
 
@@ -335,10 +365,20 @@ def file_move_command(
             "terminal; confirms that the key file holds the passphrase you keep",
         ),
     ] = False,
+    check: Annotated[
+        bool,
+        typer.Option(
+            "--check",
+            help="Only report what may stop file-move, with fixes; advisory: makes no ZFS changes, takes no locks",
+        ),
+    ] = False,
 ) -> None:
     """Move a dataset's files in verified batches into an encrypted dataset, then swap it into place."""
     if check_prompt_with_key_file:
         _refuse_unanswerable_prompt(final_keylocation, keyformat)
+    if check:
+        _report_check(Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation), dataset)
+        return
     _run_migration(
         lambda zfs, settings, name: file_move(
             zfs,

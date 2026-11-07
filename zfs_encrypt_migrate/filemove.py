@@ -238,7 +238,7 @@ def _refuse_other_stage(zfs: Zfs, dataset: str) -> None:
             raise MigrationError(msg)
 
 
-def _preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
+def preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
     """Refuse unless the run can start or resume; return the source mountpoint. Writes nothing."""
     check_key_file(settings)
     if "/" not in dataset:
@@ -265,7 +265,7 @@ def _preflight_file_move(zfs: Zfs, settings: Settings, dataset: str) -> Path:
     # Here as well as before each batch, so a snapshot stops the run before anything is written. Only while
     # files are left: then a snapshot pins nothing, and a rerun after a refused swap keeps its renamed enc-final.
     if zfs.snapshots(dataset) and scan(source):
-        _refuse_snapshots(zfs, dataset)
+        refuse_snapshots(zfs, dataset)
     if staged_exists and zfs.get(MARK_SOURCE, staged) != dataset:
         msg = f"{staged} exists and is not a file-move of {dataset}"
         raise MigrationError(msg)
@@ -487,7 +487,8 @@ def _wait_for_space(zfs: Zfs, settings: Settings, needed: int, sleep: Callable[[
     raise MigrationError(msg)
 
 
-def _refuse_snapshots(zfs: Zfs, dataset: str) -> None:
+def refuse_snapshots(zfs: Zfs, dataset: str) -> None:
+    """Refuse while the dataset has snapshots, which keep deleted files allocated."""
     snaps = zfs.snapshots(dataset)
     if snaps:
         msg = f"{dataset} has snapshots, which keep deleted files allocated: {', '.join(snaps)}"
@@ -632,7 +633,7 @@ def _move_files(  # noqa: PLR0917
             # Created only when files remain: a rerun after finish removed scratch must not change the copy's root.
             scratch.mkdir(exist_ok=True)
             # Checked before every batch: a snapshot that appears mid-run would pin the deleted files.
-            _refuse_snapshots(zfs, dataset)
+            refuse_snapshots(zfs, dataset)
             # A stop between copy and delete leaves copies that need no new space; rsync skips them.
             missing = sum(group.allocated for group in batch if not os.path.lexists(dst / group.first))
             _wait_for_space(zfs, settings, missing, sleep)
@@ -641,7 +642,7 @@ def _move_files(  # noqa: PLR0917
             verified, _changed = verify(src, dst, batch, device=device)
             zfs.pool_sync(pool)
             # And again right before deleting: a snapshot taken while the batch copied would pin it.
-            _refuse_snapshots(zfs, dataset)
+            refuse_snapshots(zfs, dataset)
             if verified:
                 # Set before the first unlink, so a stop part-way through it already gives the note.
                 guard.notes = _split_notes(dataset, staged)
@@ -775,7 +776,7 @@ def file_move(
         raise MigrationError(msg)
     staged = f"{settings.stage}/{leaf_of(dataset)}"
     with _run_lock(lock_path):
-        src = _preflight_file_move(zfs, settings, dataset)
+        src = preflight_file_move(zfs, settings, dataset)
         source_props = _probe_writers(zfs, dataset, src)
         with abort_guard(zfs, settings, staged, label="file-move") as guard:
             # Until the first delete every file is still in the source. Files only ever get deleted once the

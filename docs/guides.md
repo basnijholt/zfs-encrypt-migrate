@@ -181,7 +181,7 @@ Requirements, on top of the usual ones:
 - **A move whose worst case does not fit.** Before it deletes the first file, `file-move` needs free space above `--min-free` for the largest batch (`--batch-size`, or all the data when that is less; or the largest file, if bigger: moving the others first frees only what their copies take), plus the pool's block-cloned savings `bclonesaved` (a copy of a cloned file takes its full size), plus, with `compression` now `off`, what old compressed data grows by when copied (`logicalreferenced` minus `referenced`). Refused otherwise; checked once per move.
 - **Child datasets and volumes.** Refused: for a parent with children, use the [tree commands](#moving-a-big-tree), and `file-move` for a big child on its own; for a volume, `seed` and `cutover`.
 - **Per-user, per-group and per-project quotas and project IDs.** A documented limit, not checked: `userquota@`, `groupquota@` and `projectquota@` (and their `objquota@` forms) are not in `zfs get all`, and rsync doesn't copy a file's project ID, so they are not carried over (`seed` and `cutover` keep both). Note them before the move with `zfs userspace`, `zfs groupspace`, `zfs projectspace` and `zfs project -r`, and set them again on the new dataset after the swap.
-- **Inode flags.** A documented limit, not checked: rsync doesn't copy `chattr` flags (`+i`, `+a` and the others), so the copies have none. An immutable or append-only file can't be deleted, so the run stops at it until you clear the flag (`chattr -i -a FILE`) and rerun. Note the flags first with `lsattr -R` and set them again after the swap.
+- **Inode flags.** A documented limit, not checked by the run (`file-move --check` lists the immutable and append-only files and directories): rsync doesn't copy `chattr` flags (`+i`, `+a` and the others), so the copies have none. An immutable or append-only file can't be deleted, so the run stops at it until you clear the flag (`chattr -i -a FILE`) and rerun. Note the flags first with `lsattr -R` and set them again after the swap.
 - **Quotas on the dataset or the stage.** A documented limit, not checked: the dataset's own `quota` or `refquota` is copied to the encrypted dataset, which holds the directory tree twice (the pristine copy too) besides the files, and one on the stage or a parent of it covers the encrypted dataset as it grows to the full size of the data. Either can stop a run with `Disk quota exceeded`. Raise the one on the encrypted dataset (`zfs set quota=SIZE tank/stage/media`, or `refquota`, and set it back after the swap), or raise or remove the other, then rerun.
 - **Data written under other settings.** A documented limit: the copies are written with the current `copies`, `recordsize` and `compression`, so data written with fewer `copies`, with a smaller `recordsize` while `compression` is `off` (each file's last block is padded to a whole record), or under a stronger compression may grow. The admission check counts only what compression saved, and only when `compression` is now `off`; keep spare room above `--min-free` for the rest. Growth beyond that first uses up the `--min-free` floor; then the space check before a batch refuses, with nothing of that batch deleted: free space and rerun.
 
@@ -195,6 +195,15 @@ Stopping is not enough: a reboot mid-move would start the services again on a ha
 - Stop and disable the services that read or write it (`systemctl disable --now UNIT`), including containers that bind-mount it (turn off their restart policy, for example `docker update --restart=no CONTAINER`, then stop them). The tool refuses a dataset it can't unmount, but a container's bind mount is not detected.
 - Stop the NFS server and Samba exports of it.
 - Disable snapshot tools (sanoid, zfs-auto-snapshot) for the dataset, then destroy its snapshots. A snapshot keeps deleted files allocated, so no space would be freed; `file-move` refuses while one exists before it changes anything, and checks again before each batch is copied and before it is deleted.
+
+Then run the check, with the options you'll give the real run:
+
+```bash
+zfs-encrypt-migrate file-move tank/media --check
+```
+
+It is advisory, makes no ZFS changes and takes no locks. It reports the run's first refusal, snapshots of the dataset mounted in any mount namespace that has a process, and immutable and append-only files, each with its fix; see [file-move --check](usage.md#file-move-check).
+It does not check for processes or containers that hold the dataset: stop and disable those first, as above.
 
 **2. Run it in tmux or screen, or [unattended](#running-unattended).**
 
@@ -251,6 +260,7 @@ Before the first file moves, it refuses a dataset that is read-only, not mounted
 It refuses a key file inside the dataset, symlinks followed, or reached through a bind mount of one of its directories (the file is on the dataset's device), both `--key-file` and the file of `--final-keylocation file://...`: a batch would move it into the dataset that needs it to unlock.
 It works only on a path that `/proc/self/mountinfo` lists as the dataset's own mount point, checked before it reads anything there, for the dataset and for the encrypted copy: a mountpoint ending in a space, which `zfs get` strips, would otherwise point it at another directory.
 It also refuses everything in the **Not supported** list above that it can detect, since the move would otherwise stall half-way.
+`file-move --check` reports the first of these refusals, plus what the run only finds under way (see step 1).
 Before each batch it checks that the encrypted dataset is still mounted at its private mountpoint, and it accepts only copies that are on that dataset: after an unmount (`zfs umount -a`, say) the mountpoint is a bare directory, and copies there would vanish.
 For each batch, rsync copies the files with hard links, ACLs, xattrs and sparseness, and the tool then compares every name against its copy: type, mode, owner and group, size and mtime for regular files, the target for symlinks, and one shared inode for all names of a hard-linked file.
 A source file whose ctime changed during its batch is not deleted in that pass, and if a pass deletes nothing, the run stops and asks you to stop the writers.

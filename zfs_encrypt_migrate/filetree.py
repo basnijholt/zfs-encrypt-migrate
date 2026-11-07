@@ -245,7 +245,8 @@ def _read_mountinfo() -> bytes:
     return _MOUNTINFO.read_bytes()
 
 
-def _field(raw: bytes) -> str:
+def mountinfo_field(raw: bytes) -> str:
+    """Decode one field of a mountinfo line."""
     return os.fsdecode(_ESCAPE.sub(lambda match: bytes([int(match[1], 8)]), raw))
 
 
@@ -260,9 +261,9 @@ def mounted_at(path: Path) -> tuple[str, str] | None:
     for line in _read_mountinfo().splitlines():
         # ID, parent ID, device, root, mount point, options, optional fields, "-", type, source, options.
         fields = line.split(b" ")
-        if _field(fields[4]) == target:
+        if mountinfo_field(fields[4]) == target:
             separator = fields.index(b"-", 6)
-            found = (_field(fields[separator + 2]), _field(fields[separator + 1]))
+            found = (mountinfo_field(fields[separator + 2]), mountinfo_field(fields[separator + 1]))
     return found
 
 

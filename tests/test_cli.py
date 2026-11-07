@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import signal
@@ -13,12 +14,13 @@ import pytest
 import typer
 from typer.testing import CliRunner
 
-from zfs_encrypt_migrate import cli
+from zfs_encrypt_migrate import cli, preflight
 from zfs_encrypt_migrate.constants import COMMAND_STARTUP_ERROR_RETURNCODE
 from zfs_encrypt_migrate.filemove import _probe_writers
 from zfs_encrypt_migrate.process import SubprocessRunner
 
 from .conftest import FakeRunner, fail, ok
+from .fakeproc import FakeProc
 from .zfs_sim import ZfsSim, staged_ready
 
 if TYPE_CHECKING:
@@ -27,6 +29,8 @@ if TYPE_CHECKING:
     from zfs_encrypt_migrate.migrate import Settings
     from zfs_encrypt_migrate.process import CommandResult
     from zfs_encrypt_migrate.zfs import Zfs
+
+    from .conftest import FileMoveEnv
 
 runner = CliRunner()
 # Rich styles the help whenever it believes it writes to a terminal, as it does on GitHub Actions.
@@ -520,7 +524,7 @@ def test_file_move_help_lists_options() -> None:
     listing = runner.invoke(cli.app, ["--help"])
 
     assert result.exit_code == 0
-    for text in ("--batch-size", "--delete-source", "Target size of each batch"):
+    for text in ("--batch-size", "--delete-source", "Target size of each batch", "Only report what may stop"):
         assert text in plain(result.output)
     assert "File-Move Commands" in plain(listing.output)
 
@@ -712,3 +716,103 @@ def test_check_prompt_with_key_file_is_a_file_move_flag_without_env_var() -> Non
     }
 
     assert envvars == {"file-move": None}
+
+
+# --- file-move --check ---
+
+
+@pytest.fixture
+def checked(filemove_env: FileMoveEnv, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key_file: Path) -> FileMoveEnv:
+    """Route the CLI to the file-move environment, with a fake /proc and a private lock, never the host's."""
+    proc = FakeProc(tmp_path / "proc", filemove_env.sim.mountinfo().decode())
+    monkeypatch.setattr(cli, "_runner", lambda: filemove_env.runner)
+    monkeypatch.setattr(
+        cli,
+        "check_file_move",
+        functools.partial(preflight.check_file_move, proc=proc.root, lock_path=tmp_path / "lock"),
+    )
+    monkeypatch.setenv("ZFS_ENCRYPT_MIGRATE_KEY_FILE", str(key_file))
+    monkeypatch.setenv("ZFS_ENCRYPT_MIGRATE_MIN_FREE", "1000")
+    monkeypatch.setenv("ZFS_ENCRYPT_MIGRATE_STAGE", "tank/stage")
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    return filemove_env
+
+
+NOT_CHECKED = (
+    "Not checked: processes or containers that hold the dataset, including container bind mounts. Stop them first. "
+    "The run's unmount refuses while a holder is busy, but a container's private bind mount can survive it. "
+    "Nor is a snapshot mount seen that lies outside the root of every process in its mount namespace, "
+    "as with a chroot.\n"
+)
+
+
+def immutable(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    """Make the file at ``path`` immutable to the check."""
+    inode = os.lstat(path).st_ino
+    monkeypatch.setattr(preflight, "_inode_flags", lambda fd: 0x10 if os.fstat(fd).st_ino == inode else 0)
+
+
+def test_file_move_check_lists_problems_and_exits_1(checked: FileMoveEnv, monkeypatch: pytest.MonkeyPatch) -> None:
+    """What is not checked, then each problem with its fixes, without --delete-source; exit 1 as the run would stop."""
+    checked.sim.prop("tank/media", "readonly", "on")
+    immutable(monkeypatch, checked.src / "a.txt")
+
+    result = runner.invoke(cli.app, ["file-move", "--check", "tank/media"])
+
+    assert result.exit_code == 1, result.output
+    flagged = checked.src / "a.txt"
+    assert result.stdout == (
+        NOT_CHECKED + "problem: tank/media is read-only; file-move must delete its files\n"
+        "problem: tank/media has files or directories with the immutable or append-only flag, which keeps file-move "
+        "from deleting them or the files in them\n"
+        "  clear the flags; the copies get none, so set them again after the swap:\n"
+        f"    chattr -i {flagged}  # after the swap: chattr +i {flagged}\n"
+        "2 problems found; the run checks again before it deletes anything\n"
+    )
+    assert checked.sim.ops() == []
+
+
+def test_file_move_check_with_one_problem_says_so(checked: FileMoveEnv) -> None:
+    """The summary counts in the singular too."""
+    checked.sim.prop("tank/media", "readonly", "on")
+
+    result = runner.invoke(cli.app, ["file-move", "--check", "tank/media"])
+
+    assert result.exit_code == 1
+    assert result.stdout.splitlines()[-1] == "1 problem found; the run checks again before it deletes anything"
+
+
+def test_file_move_check_with_nothing_found_exits_0(checked: FileMoveEnv) -> None:
+    """Exit 0 means no findings in the checked categories, and the narrow promise is printed all the same."""
+    result = runner.invoke(cli.app, ["file-move", "--check", "--delete-source", "tank/media"])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout == NOT_CHECKED + "no findings in the checked categories\n"
+    assert checked.sim.ops() == []
+    assert not [call for call in checked.runner.calls if call[0] == "rsync"]
+
+
+def test_file_move_check_prints_names_that_are_no_utf8(checked: FileMoveEnv, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A file name with a byte that is no UTF-8 shows as an escape; the report goes on to its end."""
+    bad = checked.src / os.fsdecode(b"bad\xff")
+    bad.write_text("x")
+    immutable(monkeypatch, bad)
+
+    result = runner.invoke(cli.app, ["file-move", "--check", "tank/media"])
+
+    assert result.exit_code == 1, result.output
+    assert f"    {checked.src}/bad\\xff: its name is not printable, so fix it by hand" in result.stdout
+    assert result.stdout.endswith("1 problem found; the run checks again before it deletes anything\n")
+
+
+def test_file_move_check_zfs_failure_is_one_error_line(checked: FileMoveEnv, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A zfs that cannot run ends the check with its error, never a clean result."""
+    broken = FakeRunner(lambda _args: fail("No such file or directory: 'zfs'\n", COMMAND_STARTUP_ERROR_RETURNCODE))
+    monkeypatch.setattr(cli, "_runner", lambda: broken)
+
+    result = runner.invoke(cli.app, ["file-move", "--check", "tank/media"])
+
+    assert result.exit_code == 1
+    assert result.stdout == NOT_CHECKED
+    assert "error: zfs list -H -o name tank/media failed" in result.stderr
+    assert checked.sim.ops() == []

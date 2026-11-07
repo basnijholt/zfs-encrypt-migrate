@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 _PROC_LOCKS = Path("/proc/locks")
 
 
-def _lock_state(path: Path) -> str:
+def lock_state(path: Path) -> str:
     """Say whether a run holds the lock at ``path``, without opening, creating or locking the file.
 
     ``file-move`` takes a ``flock`` lock. ``fcntl`` F_GETLK cannot see those on Linux, so this finds the file's
@@ -68,5 +68,5 @@ def file_move_status(zfs: Zfs, stage: str, dataset: str, lock_path: Path) -> lis
         *_facts(zfs, dataset),
         *_facts(zfs, f"{stage}/{leaf}"),
         f"{stage}/old/{leaf}: {'exists' if zfs.exists(f'{stage}/old/{leaf}') else 'does not exist'}",
-        f"lock: {_lock_state(lock_path)}",
+        f"lock: {lock_state(lock_path)}",
     ]

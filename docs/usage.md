@@ -20,6 +20,7 @@ Bare `zfs-encrypt-migrate` only shows help.
 | `tree-move DATASET CHILD` | Copy one child subtree under the staged parent; the source stays until you destroy it. |
 | `tree-finish DATASET` | Send the parent's last changes and swap the staged tree into place once no children remain. |
 | `file-move DATASET --delete-source` | Move a dataset's files in verified batches into an encrypted dataset, deleting each source file once its copy is verified, then swap it into place. |
+| `file-move DATASET --check` | Advisory: report what would stop `file-move` in the categories it checks, with fixes; makes no ZFS changes and takes no locks. |
 | `file-move-status DATASET` | Print facts about a `file-move`: both datasets, the markers, the old copy and the lock. Read-only. |
 | `audit [--exact NAME]... [--subtree NAME]... POOL...` | List unencrypted datasets outside the allowlists; exit 1 if there are any. |
 
@@ -284,6 +285,7 @@ Takes the [shared options](#shared-options) and:
 | `--batch-size SIZE` | `ZFS_ENCRYPT_MIGRATE_BATCH_SIZE` | `100G` | Target bytes per batch, in the `--min-free` size syntax. A hard-linked file group bigger than this forms a batch of its own. |
 | `--delete-source` | none | off | Required. Confirms that each source file is deleted once its encrypted copy is verified. |
 | `--check-prompt-with-key-file` | none | off | With `--final-keylocation prompt`, check the final key against the key file instead of at a terminal; see below. |
+| `--check` | none | off | Only report what would stop the run, with fixes; advisory, it makes no ZFS changes and takes no locks; see [file-move --check](#file-move-check). It needs no `--delete-source`. |
 
 One run does the whole job, and a rerun after a stop before the swap continues where it left off.
 Stop everything that uses the dataset first, and keep it stopped until the swap.
@@ -391,8 +393,49 @@ From the final unmount of step 8 on, the hints remount with `zfs mount -a` inste
 | `N files appeared in DATASET during the swap; stop the writers and rerun` | Stop the writers and rerun. |
 | `DATASET was written after the final scan` | Rename `@enc-final` aside with the commands it prints, then rerun. |
 | `rsync ... failed: ... Disk quota exceeded ...` | A `quota` or `refquota` is full. The dataset's own was copied to `STAGE/LEAF`: raise it there (`zfs set quota=SIZE STAGE/LEAF`, or `refquota`), and set it back after the swap. One on the stage or a parent of it: raise or remove it. Then rerun. |
-| `PermissionError: [Errno 1] Operation not permitted: 'PATH'` | An immutable or append-only file; clear the flag (`chattr -i -a PATH`), then rerun. |
+| `PermissionError: [Errno 1] Operation not permitted: 'PATH'` | An immutable or append-only file; clear the flag (`chattr -i -a PATH`), then rerun. [`file-move --check`](#file-move-check) lists all of them. |
 | `STAGE/LEAF is mounted at PATH, which overlaps DATASET at PATH` | Change the staged mountpoint so it does not contain or lie inside the dataset's. |
+
+### file-move --check
+
+```bash
+zfs-encrypt-migrate file-move tank/media --check
+```
+
+Reports what would make `file-move` refuse or stall, in the categories below, each with the command or step that fixes it.
+It is advisory: a clean result does not promise that the run won't refuse, and the run itself checks again everything that matters before it deletes anything.
+It makes no ZFS changes and takes no locks. It doesn't mount or unmount anything itself, but opening a directory can trigger an autofs or systemd automount point inside the dataset. It opens files only read-only, without updating their access times, to read their flags.
+Give it the options of the real run (`--stage`, `--key-file` and the rest); it needs no `--delete-source`, and with `--delete-source` it still only checks.
+Run it as root, like `file-move`; without root it reports only that it needs root.
+
+It checks:
+
+- The first refusal of [step 2](#file-move), as the run gives it. Fix it and check again for the next. When the dataset has snapshots, that refusal comes first, so the run's check, which would scan the dataset, is not run.
+- Snapshots of the dataset mounted in any mount namespace that has a process, found by name in the mount table of every process and thread: a mounted snapshot keeps `zfs destroy` from removing it, and one under `.zfs/snapshot` makes the run's unmount fail with `busy`.
+- Immutable and append-only files and directories, read with the `FS_IOC_GETFLAGS` ioctl, so `lsattr` need not be installed: the run cannot delete them, or the files in them, and would stop at the first. Each comes with the `chattr` command that clears its flags, and the one that sets them again after the swap. An entry it cannot read is a problem too.
+
+It reads the flags only when the kernel lists the dataset as mounted where `zfs get mountpoint` says; otherwise that is a problem too, as is an entry that disappears during the walk.
+The `Not checked` line comes with every report; a usage error (exit 2) prints no report at all.
+A report starts with what it does not check, then lists each problem with its fixes and ends with a summary:
+
+```text
+Not checked: processes or containers that hold the dataset, including container bind mounts. Stop them first. The run's unmount refuses while a holder is busy, but a container's private bind mount can survive it. Nor is a snapshot mount seen that lies outside the root of every process in its mount namespace, as with a chroot.
+problem: tank/media has snapshots, which keep deleted files allocated: tank/media@daily-1
+  disable snapshot tools for tank/media, then remove them: zfs destroy tank/media@daily-1
+  the run refuses this while files remain; once only directories are left, after a stopped swap, it allows it
+problem: snapshot tank/media@daily-1 is mounted at /data/.zfs/snapshot/daily-1, as seen by PID 2345
+  unmount it, or stop the processes or containers that hold it: zfs destroy cannot remove a mounted snapshot
+problem: tank/media has files or directories with the immutable or append-only flag, which keeps file-move from deleting them or the files in them
+  clear the flags; the copies get none, so set them again after the swap:
+    chattr -i /mnt/tank/media/a.txt  # after the swap: chattr +i /mnt/tank/media/a.txt
+3 problems found; the run checks again before it deletes anything
+```
+
+It exits 1 on any problem. Exit 0, `no findings in the checked categories`, means only that: stop what holds the dataset first.
+While a `file-move` holds its lock, or the lock's state can't be read, it reports only `a file-move is running; check skipped` and reads nothing else.
+It opens each regular file and directory of the dataset for its flags, so on a big dataset it takes a while; don't start the run meanwhile, as its unmount would find the check's open files.
+A name that is not printable, such as one with a control character or a byte that is no UTF-8, shows with escapes, and its fix is left to you.
+It can't check the free-space admission or the final key: both need the encrypted dataset, which the run creates (steps 6 and 7).
 
 ### file-move-status
 
@@ -447,7 +490,7 @@ It says `held by pid N` (some `file-move` on this host holds the lock, not neces
 
 ### What file-move does not support
 
-Each of these is checked before anything is deleted, except the last four, which are documented limits:
+Each of these is checked before anything is deleted, except the last four, which are documented limits; [`file-move --check`](#file-move-check) also lists the immutable and append-only files:
 
 | Not supported | What `file-move` does |
 | --- | --- |
@@ -461,7 +504,7 @@ Each of these is checked before anything is deleted, except the last four, which
 | Child datasets | Refuses: use the [tree commands](#tree-commands), or `file-move` each child. |
 | Volumes | Refuses: use `seed` and `cutover`. |
 | Per-user, per-group and per-project quotas (`userquota@`, `groupquota@`, `projectquota@` and their `objquota@` forms) and file project IDs | Documented limit, not checked: they are not carried over (`zfs get all` does not list those quotas, rsync does not copy project IDs; `seed` and `cutover` keep both). Note them before the move (`zfs userspace`, `zfs groupspace`, `zfs projectspace`, `zfs project -r`) and set them again on the swapped dataset. |
-| Inode flags (`chattr +i`, `+a` and the others) | Documented limit, not checked: rsync does not copy them, so the copies have none. An immutable or append-only source file cannot be deleted, so the run stops at it (`PermissionError: [Errno 1] Operation not permitted`) until you clear the flag (`chattr -i -a FILE`) and rerun. Note the flags first (`lsattr -R`) and set them again after the swap. |
+| Inode flags (`chattr +i`, `+a` and the others) | Documented limit, not checked by the run: rsync does not copy them, so the copies have none. An immutable or append-only source file cannot be deleted, so the run stops at it (`PermissionError: [Errno 1] Operation not permitted`) until you clear the flag (`chattr -i -a FILE`) and rerun. `file-move --check` lists the immutable and append-only files and directories, with the `chattr` commands that clear the flags and set them again after the swap; note any other flags yourself (`lsattr -R`). |
 | A `quota` or `refquota` on the dataset, or on the stage or a parent of it | Documented limit, not checked: the dataset's own is copied to `STAGE/LEAF`, which holds the directory tree twice (the pristine copy too) besides the files, and a quota on the stage or a parent of it covers `STAGE/LEAF` as it grows to the dataset's full size. Either can stop a run with `Disk quota exceeded`. Raise the one on `STAGE/LEAF` (and set it back after the swap), or raise or remove the other, then rerun. |
 | Data written under other `copies`, `recordsize` or `compression` settings than the current ones | Documented limit: the copies are written with the current settings, so data written with fewer `copies`, with a smaller `recordsize` while `compression` is `off` (each file's last block is padded to a whole record), or under a stronger compression may take more space as copies. The admission check counts only what compression saved (`logicalreferenced` minus `referenced`), and only when `compression` is now `off`; keep spare room above `--min-free` for the rest. Growth beyond that first uses up `--min-free`; then the space check before a batch refuses, with nothing of that batch deleted: free space and rerun. |
 
@@ -492,9 +535,9 @@ When a `zfs` or `zpool` command fails, the message is the command followed by `f
 | Exit status | Meaning |
 | --- | --- |
 | `0` | Success; for `audit`, nothing unencrypted outside the allowlists. |
-| `1` | A refusal or a failed `zfs` command; for `audit`, an unencrypted dataset or a pool it couldn't list. |
+| `1` | A refusal or a failed `zfs` command; for `audit`, an unencrypted dataset or a pool it couldn't list; for `file-move --check`, a problem that would stop the run. |
 | `2` | Usage error: a missing `--stage`, an invalid name, size or keylocation, or no pool for `audit`. |
-| `130` | A migration, tree or file-move command interrupted by Ctrl-C, SIGTERM or SIGHUP. `audit` has nothing to clean up: Ctrl-C ends it with 1, and SIGTERM or SIGHUP end it like any other process. |
+| `130` | A migration, tree or file-move command interrupted by Ctrl-C, SIGTERM or SIGHUP. `audit` and `file-move --check` have nothing to clean up: Ctrl-C ends them with 1, and SIGTERM or SIGHUP end them like any other process. |
 
 ## Recovery Hints
 
