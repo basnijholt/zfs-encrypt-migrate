@@ -20,7 +20,7 @@ Bare `zfs-encrypt-migrate` only shows help.
 | `tree-move DATASET CHILD` | Copy one child subtree under the staged parent; the source stays until you destroy it. |
 | `tree-finish DATASET` | Send the parent's last changes and swap the staged tree into place once no children remain. |
 | `file-move DATASET --delete-source` | Move a dataset's files in verified batches into an encrypted dataset, deleting each source file once its copy is verified, then swap it into place. |
-| `file-move DATASET --check` | Advisory: report what would stop `file-move` in the categories it checks, with fixes; makes no ZFS changes and takes no locks. |
+| `file-move DATASET --check` | Advisory: report what may stop `file-move` in the categories it checks, with fixes; makes no ZFS changes and takes no locks. |
 | `file-move-status DATASET` | Print facts about a `file-move`: both datasets, the markers, the old copy and the lock. Read-only. |
 | `audit [--exact NAME]... [--subtree NAME]... POOL...` | List unencrypted datasets outside the allowlists; exit 1 if there are any. |
 
@@ -285,7 +285,7 @@ Takes the [shared options](#shared-options) and:
 | `--batch-size SIZE` | `ZFS_ENCRYPT_MIGRATE_BATCH_SIZE` | `100G` | Target bytes per batch, in the `--min-free` size syntax. A hard-linked file group bigger than this forms a batch of its own. |
 | `--delete-source` | none | off | Required. Confirms that each source file is deleted once its encrypted copy is verified. |
 | `--check-prompt-with-key-file` | none | off | With `--final-keylocation prompt`, check the final key against the key file instead of at a terminal; see below. |
-| `--check` | none | off | Only report what would stop the run, with fixes; advisory, it makes no ZFS changes and takes no locks; see [file-move --check](#file-move-check). It needs no `--delete-source`. |
+| `--check` | none | off | Only report what may stop the run, with fixes; advisory, it makes no ZFS changes and takes no locks; see [file-move --check](#file-move-check). It needs no `--delete-source`. |
 
 One run does the whole job, and a rerun after a stop before the swap continues where it left off.
 Stop everything that uses the dataset first, and keep it stopped until the swap.
@@ -535,7 +535,7 @@ When a `zfs` or `zpool` command fails, the message is the command followed by `f
 | Exit status | Meaning |
 | --- | --- |
 | `0` | Success; for `audit`, nothing unencrypted outside the allowlists. |
-| `1` | A refusal or a failed `zfs` command; for `audit`, an unencrypted dataset or a pool it couldn't list; for `file-move --check`, a problem that would stop the run. |
+| `1` | A refusal or a failed `zfs` command; for `audit`, an unencrypted dataset or a pool it couldn't list; for `file-move --check`, any problem it found (advisory: the run checks again). |
 | `2` | Usage error: a missing `--stage`, an invalid name, size or keylocation, or no pool for `audit`. |
 | `130` | A migration, tree or file-move command interrupted by Ctrl-C, SIGTERM or SIGHUP. `audit` and `file-move --check` have nothing to clean up: Ctrl-C ends them with 1, and SIGTERM or SIGHUP end them like any other process. |
 

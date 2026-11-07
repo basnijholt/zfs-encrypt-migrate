@@ -9,8 +9,10 @@ import pytest
 
 from zfs_encrypt_migrate import filemove, preflight, status
 from zfs_encrypt_migrate.constants import SCRATCH
+from zfs_encrypt_migrate.errors import ZfsError
 from zfs_encrypt_migrate.filemove import _run_lock
 from zfs_encrypt_migrate.preflight import check_file_move
+from zfs_encrypt_migrate.process import CommandResult
 
 from .fakeproc import SELF_PID, FakeProc, mount_line
 
@@ -265,3 +267,22 @@ def test_with_snapshots_the_run_s_snapshot_refusal_comes_without_a_scan(
         ),
     ]
     assert scanned == []
+
+
+def test_a_zfs_failure_while_checking_snapshots_is_an_error_not_a_problem(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    proc: FakeProc,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed zfs command in the snapshot check ends the check, like any other zfs failure."""
+    filemove_env.sim.snapshot(f"{DATASET}@auto")
+    failure = ZfsError(CommandResult(1, "", f"cannot open '{DATASET}': dataset does not exist"), ["zfs", "list"])
+
+    def gone(_zfs: object, _dataset: str) -> None:
+        raise failure
+
+    monkeypatch.setattr(preflight, "refuse_snapshots", gone)
+    with pytest.raises(ZfsError):
+        check(filemove_env, settings, proc, tmp_path)
