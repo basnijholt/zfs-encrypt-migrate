@@ -219,7 +219,9 @@ def _report_check(settings: Settings, dataset: str) -> None:
         for line in (f"problem: {problem.message}", *(f"  {hint}" for hint in problem.hints)):
             console.print(line, markup=False, highlight=False, soft_wrap=True)
     summary = (
-        f"{count} problem{'s' * (count > 1)} would stop file-move" if count else "no findings in the checked categories"
+        f"{count} problem{'s' * (count > 1)} found; the run checks again before it deletes anything"
+        if count
+        else "no findings in the checked categories"
     )
     console.print(summary, markup=False, highlight=False, soft_wrap=True)
     if count:
@@ -367,7 +369,7 @@ def file_move_command(
         bool,
         typer.Option(
             "--check",
-            help="Only report what would stop file-move, with fixes; advisory: makes no ZFS changes, takes no locks",
+            help="Only report what may stop file-move, with fixes; advisory: makes no ZFS changes, takes no locks",
         ),
     ] = False,
 ) -> None:

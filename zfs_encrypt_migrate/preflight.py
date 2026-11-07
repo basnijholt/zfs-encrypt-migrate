@@ -189,7 +189,14 @@ def check_file_move(
     try:
         # With snapshots the preflight would scan the dataset, which can update directory access times.
         if zfs.exists(dataset) and zfs.snapshots(dataset):
-            refuse_snapshots(zfs, dataset)
+            try:
+                refuse_snapshots(zfs, dataset)
+            except MigrationError as refusal:
+                late = (
+                    "the run refuses this while files remain; "
+                    "once only directories are left, after a stopped swap, it allows it"
+                )
+                raise MigrationError(refusal.message, [*refusal.hints, late]) from None
         preflight_file_move(zfs, settings, dataset)
     except MigrationError as refusal:
         if isinstance(refusal, ZfsError):

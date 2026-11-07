@@ -524,7 +524,7 @@ def test_file_move_help_lists_options() -> None:
     listing = runner.invoke(cli.app, ["--help"])
 
     assert result.exit_code == 0
-    for text in ("--batch-size", "--delete-source", "Target size of each batch", "Only report what would stop"):
+    for text in ("--batch-size", "--delete-source", "Target size of each batch", "Only report what may stop"):
         assert text in plain(result.output)
     assert "File-Move Commands" in plain(listing.output)
 
@@ -767,7 +767,7 @@ def test_file_move_check_lists_problems_and_exits_1(checked: FileMoveEnv, monkey
         "from deleting them or the files in them\n"
         "  clear the flags; the copies get none, so set them again after the swap:\n"
         f"    chattr -i {flagged}  # after the swap: chattr +i {flagged}\n"
-        "2 problems would stop file-move\n"
+        "2 problems found; the run checks again before it deletes anything\n"
     )
     assert checked.sim.ops() == []
 
@@ -779,7 +779,7 @@ def test_file_move_check_with_one_problem_says_so(checked: FileMoveEnv) -> None:
     result = runner.invoke(cli.app, ["file-move", "--check", "tank/media"])
 
     assert result.exit_code == 1
-    assert result.stdout.splitlines()[-1] == "1 problem would stop file-move"
+    assert result.stdout.splitlines()[-1] == "1 problem found; the run checks again before it deletes anything"
 
 
 def test_file_move_check_with_nothing_found_exits_0(checked: FileMoveEnv) -> None:
@@ -802,7 +802,7 @@ def test_file_move_check_prints_names_that_are_no_utf8(checked: FileMoveEnv, mon
 
     assert result.exit_code == 1, result.output
     assert f"    {checked.src}/bad\\xff: its name is not printable, so fix it by hand" in result.stdout
-    assert result.stdout.endswith("1 problem would stop file-move\n")
+    assert result.stdout.endswith("1 problem found; the run checks again before it deletes anything\n")
 
 
 def test_file_move_check_zfs_failure_is_one_error_line(checked: FileMoveEnv, monkeypatch: pytest.MonkeyPatch) -> None:

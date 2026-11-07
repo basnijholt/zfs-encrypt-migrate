@@ -255,7 +255,13 @@ def test_with_snapshots_the_run_s_snapshot_refusal_comes_without_a_scan(
     assert found(check(filemove_env, settings, proc, tmp_path)) == [
         (
             f"{DATASET} has snapshots, which keep deleted files allocated: {DATASET}@auto",
-            (f"disable snapshot tools for {DATASET}, then remove them: zfs destroy {DATASET}@auto",),
+            (
+                f"disable snapshot tools for {DATASET}, then remove them: zfs destroy {DATASET}@auto",
+                (
+                    "the run refuses this while files remain; "
+                    "once only directories are left, after a stopped swap, it allows it"
+                ),
+            ),
         ),
     ]
     assert scanned == []

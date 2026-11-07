@@ -422,12 +422,13 @@ A report starts with what it does not check, then lists each problem with its fi
 Not checked: processes or containers that hold the dataset, including container bind mounts. Stop them first. The run's unmount refuses while a holder is busy, but a container's private bind mount can survive it. Nor is a snapshot mount seen that lies outside the root of every process in its mount namespace, as with a chroot.
 problem: tank/media has snapshots, which keep deleted files allocated: tank/media@daily-1
   disable snapshot tools for tank/media, then remove them: zfs destroy tank/media@daily-1
+  the run refuses this while files remain; once only directories are left, after a stopped swap, it allows it
 problem: snapshot tank/media@daily-1 is mounted at /data/.zfs/snapshot/daily-1, as seen by PID 2345
   unmount it, or stop the processes or containers that hold it: zfs destroy cannot remove a mounted snapshot
 problem: tank/media has files or directories with the immutable or append-only flag, which keeps file-move from deleting them or the files in them
   clear the flags; the copies get none, so set them again after the swap:
     chattr -i /mnt/tank/media/a.txt  # after the swap: chattr +i /mnt/tank/media/a.txt
-3 problems would stop file-move
+3 problems found; the run checks again before it deletes anything
 ```
 
 It exits 1 on any problem. Exit 0, `no findings in the checked categories`, means only that: stop what holds the dataset first.
