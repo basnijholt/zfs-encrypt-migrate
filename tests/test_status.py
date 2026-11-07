@@ -15,7 +15,7 @@ import pytest
 from zfs_encrypt_migrate import status
 from zfs_encrypt_migrate.constants import MARK_ADMITTED, MARK_DIRS, MARK_KEY, MARK_SOURCE
 from zfs_encrypt_migrate.filemove import _run_lock
-from zfs_encrypt_migrate.status import _lock_state, file_move_status
+from zfs_encrypt_migrate.status import file_move_status, lock_state
 
 from .conftest import STAGE, FileMoveEnv
 
@@ -157,26 +157,26 @@ def test_lock_stat_error_is_unknown(lock: Path, monkeypatch: pytest.MonkeyPatch)
         raise PermissionError
 
     monkeypatch.setattr(Path, "stat", broken)
-    assert _lock_state(lock).startswith("unknown")
+    assert lock_state(lock).startswith("unknown")
 
 
 def test_lock_missing_is_no_run(lock: Path) -> None:
     """A missing lock file means no run, and the status does not create it."""
-    assert _lock_state(lock) == "not held"
+    assert lock_state(lock) == "not held"
     assert not lock.exists()
 
 
 def test_lock_unheld_file(lock: Path) -> None:
     """A lock file left by a finished run is not a running one."""
     lock.write_text("")
-    assert _lock_state(lock) == "not held"
+    assert lock_state(lock) == "not held"
 
 
 def test_lock_held_and_status_does_not_disturb(lock: Path) -> None:
     """A held lock is seen; looking never takes it, and a run can start right after."""
     with _run_lock(lock):
-        assert _lock_state(lock).startswith("held by pid")
-    assert _lock_state(lock) == "not held"
+        assert lock_state(lock).startswith("held by pid")
+    assert lock_state(lock) == "not held"
     with _run_lock(lock):
         pass
 
@@ -186,7 +186,7 @@ def test_lock_unreadable_proc_locks(lock: Path, monkeypatch: pytest.MonkeyPatch)
     lock.write_text("")
 
     monkeypatch.setattr(status, "_PROC_LOCKS", lock.parent / "missing-proc-locks")
-    assert _lock_state(lock).startswith("unknown")
+    assert lock_state(lock).startswith("unknown")
 
 
 def test_lock_ignores_waiters_and_other_files(lock: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -203,9 +203,9 @@ def test_lock_ignores_waiters_and_other_files(lock: Path, tmp_path: Path, monkey
         f"2: -> FLOCK  ADVISORY  WRITE 11 {dev}:{st.st_ino} 0 EOF\n"
     )
     fake_locks.write_text(text)
-    assert _lock_state(lock) == "not held"
+    assert lock_state(lock) == "not held"
     fake_locks.write_text(f"3: FLOCK  ADVISORY  WRITE 12 {dev}:{st.st_ino} 0 EOF\n")
-    assert _lock_state(lock) == "held by pid 12"
+    assert lock_state(lock) == "held by pid 12"
 
 
 def test_get_many_refuses_a_missing_property(filemove_env: FileMoveEnv) -> None:

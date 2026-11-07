@@ -199,17 +199,23 @@ def _refuse_unanswerable_prompt(final_keylocation: str, keyformat: Keyformat) ->
         raise typer.BadParameter(msg, param_hint="'--check-prompt-with-key-file'")
 
 
-def _report_check(dataset: str, check: Callable[[Zfs], list[MigrationError]]) -> None:
-    """Print each problem with its fixes, then a summary; exit 1 when anything would stop the run."""
+_NOT_CHECKED = (
+    "Not checked: processes or containers that hold the dataset, including container bind mounts. Stop them first. "
+    "The run's unmount refuses while a holder is busy, but a container's private bind mount can survive it."
+)
+
+
+def _report_check(settings: Settings, dataset: str) -> None:
+    """Print what is not checked, each problem with its fixes, and a summary; exit 1 on any problem."""
+    console.print(_NOT_CHECKED, markup=False, highlight=False, soft_wrap=True)
     try:
-        problems = check(Zfs(_runner()))
+        problems = check_file_move(Zfs(_runner()), settings, dataset)
     except MigrationError as error:
         print_error(error.message, error.hints)
         raise typer.Exit(1) from error
     count = len(problems)
     summary = {
-        0: f"nothing found that would stop file-move; the run still unmounts {dataset} first and refuses if a writer "
-        "holds it",
+        0: "no findings in the checked categories",
         1: "1 problem would stop file-move; fix it, then check again",
     }.get(count, f"{count} problems would stop file-move; fix them, then check again")
     for problem in problems:
@@ -369,8 +375,7 @@ def file_move_command(
     if check_prompt_with_key_file:
         _refuse_unanswerable_prompt(final_keylocation, keyformat)
     if check:
-        settings = Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation)
-        _report_check(dataset, lambda zfs: check_file_move(zfs, settings, dataset))
+        _report_check(Settings(stage, key_file, parse_size(min_free), keyformat.value, final_keylocation), dataset)
         return
     _run_migration(
         lambda zfs, settings, name: file_move(

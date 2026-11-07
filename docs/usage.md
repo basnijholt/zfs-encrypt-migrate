@@ -402,46 +402,38 @@ From the final unmount of step 8 on, the hints remount with `zfs mount -a` inste
 zfs-encrypt-migrate file-move tank/media --check
 ```
 
-Reports what would make `file-move` refuse or stall, each with the command or step that fixes it.
-It changes no ZFS state, mount or lock: it never mounts, unmounts, creates, snapshots, loads a key, sets a property or takes the run's lock, and it opens files only read-only, to read their flags.
+Reports what would make `file-move` refuse or stall, in the categories below, each with the command or step that fixes it.
+It changes no ZFS state, mount or lock: it never mounts, unmounts, creates, snapshots, loads a key, sets a property or takes the run's lock, and it opens files only read-only, without updating their access times, to read their flags.
 Give it the options of the real run (`--stage`, `--key-file` and the rest); it needs no `--delete-source`, and with `--delete-source` it still only checks.
-Run it as root on the host, like `file-move`, and again once you think everything is stopped; without root it reports only that it needs root.
+Run it as root, like `file-move`; without root it reports only that it needs root.
 
-It reports:
+It checks:
 
 - The first refusal of [step 2](#file-move), as the run gives it. Fix it and check again for the next.
-- What keeps the dataset busy or mounted, read from `/proc` in every mount namespace, containers included:
-  - each process with an open file, working directory, program or mapped file on the dataset;
-  - each filesystem mounted inside the dataset, such as a tmpfs, another dataset, a bind mount or a snapshot under `.zfs/snapshot`, which make the run's unmount fail with `busy`;
-  - each other mount of the dataset, or of a directory of it, that the run's unmount leaves in place: a second mount here, a container's bind mount, a copy in another user namespace (a rootless container), or a copy that holds mounts of its own (a service's `TemporaryFileSystem=`, say). A copy that the unmount takes along, as in the namespace of a sandboxed systemd service, is left out. A copy of a copy is listed, saying that the unmount may still reach it: the check can't tell;
-  - each snapshot of the dataset mounted elsewhere, which keeps `zfs destroy` from removing it.
-- Immutable and append-only files and directories, read with the `FS_IOC_GETFLAGS` ioctl, so `lsattr` need not be installed: the run cannot delete them, or the files in them, and would stop at the first. Each comes with the `chattr` command that clears its flags, and the one that sets them again after the swap. Files that an NFS client or Samba holds a lease on (a delegation or an oplock) are listed too, as the run would wait on each.
+- Snapshots of the dataset mounted in any mount namespace, found by name in the mount table of every process and thread: a mounted snapshot keeps `zfs destroy` from removing it, and one under `.zfs/snapshot` makes the run's unmount fail with `busy`.
+- Filesystems mounted inside the dataset here, such as a tmpfs, another dataset or a bind mount: the run's unmount fails on them with `busy`.
+- Immutable and append-only files and directories, read with the `FS_IOC_GETFLAGS` ioctl, so `lsattr` need not be installed: the run cannot delete them, or the files in them, and would stop at the first. Each comes with the `chattr` command that clears its flags, and the one that sets them again after the swap. An entry it cannot read is a problem too.
 
-These come only when the kernel lists the dataset as mounted where `zfs get mountpoint` says; nothing else there is read.
-Each finding prints as `problem:` followed by its fixes, and a last line sums up:
+It looks inside the dataset only when the kernel lists it as mounted where `zfs get mountpoint` says.
+Every report starts with what it does not check, then lists each problem with its fixes and ends with a summary:
 
 ```text
+Not checked: processes or containers that hold the dataset, including container bind mounts. Stop them first. The run's unmount refuses while a holder is busy, but a container's private bind mount can survive it.
 problem: tank/media has snapshots, which keep deleted files allocated: tank/media@daily-1
   disable snapshot tools for tank/media, then remove them: zfs destroy tank/media@daily-1
+problem: snapshot tank/media@daily-1 is mounted at /data/.zfs/snapshot/daily-1, as seen by PID 2345 (worker)
+  stop the processes or containers that hold it: a mounted snapshot keeps zfs destroy from removing it
 problem: tank/media has files or directories with the immutable or append-only flag, which keeps file-move from deleting them or the files in them
   clear the flags; the copies get none, so set them again after the swap:
     chattr -i /mnt/tank/media/a.txt  # after the swap: chattr +i /mnt/tank/media/a.txt
-problem: PID 2345 (worker) in /system.slice/app.service has tank/media mounted at /data in another mount namespace, which file-move's unmount does not reach
-  stop it, and keep whatever starts it again (a unit, a container's restart policy) disabled until file-move is done
-problem: PID 2345 (worker) in /system.slice/app.service uses tank/media from another mount namespace: open file /data/docs/b.txt
-  stop it, and keep whatever starts it again (a unit, a container's restart policy) disabled until file-move is done
-4 problems would stop file-move; fix them, then check again
+3 problems would stop file-move; fix them, then check again
 ```
 
-It exits 1 when anything would stop the run, and 0 otherwise.
+It exits 1 on any problem. Exit 0, `no findings in the checked categories`, means only that: stop what holds the dataset first.
+While a `file-move` holds its lock, or the lock's state can't be read, it reports only `a file-move is running; check skipped` and reads nothing else.
 It opens each regular file and directory of the dataset for its flags, so on a big dataset it takes a while; don't start the run meanwhile, as its unmount would find the check's open files.
-While a `file-move` runs, as `/proc/locks` shows, it reports only `a file-move is running; check skipped` and reads nothing else, so it can't keep that run's unmount busy.
-
-What it can't see:
-
-- A writer that starts after the check. The run's own unmount, which proves that nothing has the dataset open, still decides.
-- What holds the dataset without a process: the kernel NFS server, a loop device, a swap file. Stop the NFS and Samba exports first.
-- The free-space admission and the final key: both need the encrypted dataset, which the run creates (steps 6 and 7).
+A name that is not valid UTF-8 shows with `\x..` escapes.
+It can't check the free-space admission or the final key: both need the encrypted dataset, which the run creates (steps 6 and 7).
 
 ### file-move-status
 

@@ -192,18 +192,18 @@ Requirements, on top of the usual ones:
 A 30 TB dataset takes a day or two, and the dataset is not usable meanwhile: files vanish from it as they move.
 Stopping is not enough: a reboot mid-move would start the services again on a half-empty dataset, and some act on what they find missing (Plex's "empty trash", Sonarr and Radarr unmonitoring deleted episodes and movies).
 
-Run the check first, with the options you'll give the real run, and again once you have stopped everything:
+- Stop and disable the services that read or write it (`systemctl disable --now UNIT`), including containers that bind-mount it (turn off their restart policy, for example `docker update --restart=no CONTAINER`, then stop them). The tool refuses a dataset it can't unmount, but a container's bind mount is not detected.
+- Stop the NFS server and Samba exports of it.
+- Disable snapshot tools (sanoid, zfs-auto-snapshot) for the dataset, then destroy its snapshots. A snapshot keeps deleted files allocated, so no space would be freed; `file-move` refuses while one exists before it changes anything, and checks again before each batch is copied and before it is deleted.
+
+Then run the check, with the options you'll give the real run:
 
 ```bash
 zfs-encrypt-migrate file-move tank/media --check
 ```
 
-It changes no ZFS state, mount or lock. It gives the first refusal of the run, then what the run would only trip over once under way, each with its fix: the processes that still use the dataset and the mounts that would keep it busy or mounted, in any mount namespace (containers too), and immutable and append-only files.
-It exits 0 once nothing would stop the run; see [file-move --check](usage.md#file-move-check).
-
-- Stop and disable the services that read or write it (`systemctl disable --now UNIT`), including containers that bind-mount it (turn off their restart policy, for example `docker update --restart=no CONTAINER`, then stop them). The run refuses a dataset it can't unmount, but a container's private bind mount doesn't make the unmount fail; `--check` lists it.
-- Stop the NFS server and Samba exports of it.
-- Disable snapshot tools (sanoid, zfs-auto-snapshot) for the dataset, then destroy its snapshots. A snapshot keeps deleted files allocated, so no space would be freed; `file-move` refuses while one exists before it changes anything, and checks again before each batch is copied and before it is deleted.
+It changes no ZFS state, mount or lock. It reports the run's first refusal, snapshots of the dataset mounted in any mount namespace, filesystems mounted inside it, and immutable and append-only files, each with its fix; see [file-move --check](usage.md#file-move-check).
+It does not check for processes or containers that hold the dataset: stop and disable those first, as above.
 
 **2. Run it in tmux or screen, or [unattended](#running-unattended).**
 

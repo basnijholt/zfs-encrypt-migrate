@@ -738,17 +738,29 @@ def checked(filemove_env: FileMoveEnv, tmp_path: Path, monkeypatch: pytest.Monke
     return filemove_env
 
 
+NOT_CHECKED = (
+    "Not checked: processes or containers that hold the dataset, including container bind mounts. Stop them first. "
+    "The run's unmount refuses while a holder is busy, but a container's private bind mount can survive it.\n"
+)
+
+
+def immutable(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    """Make the file at ``path`` immutable to the check."""
+    inode = os.lstat(path).st_ino
+    monkeypatch.setattr(preflight, "_inode_flags", lambda fd: 0x10 if os.fstat(fd).st_ino == inode else 0)
+
+
 def test_file_move_check_lists_problems_and_exits_1(checked: FileMoveEnv, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Each problem with its fixes, without --delete-source; exit 1 as the run would stop."""
+    """What is not checked, then each problem with its fixes, without --delete-source; exit 1 as the run would stop."""
     checked.sim.prop("tank/media", "readonly", "on")
-    monkeypatch.setattr(preflight, "_inode_flags", lambda path: 0x10 if path.endswith("a.txt") else 0)
+    immutable(monkeypatch, checked.src / "a.txt")
 
     result = runner.invoke(cli.app, ["file-move", "--check", "tank/media"])
 
     assert result.exit_code == 1, result.output
     flagged = checked.src / "a.txt"
     assert result.stdout == (
-        "problem: tank/media is read-only; file-move must delete its files\n"
+        NOT_CHECKED + "problem: tank/media is read-only; file-move must delete its files\n"
         "problem: tank/media has files or directories with the immutable or append-only flag, which keeps file-move "
         "from deleting them or the files in them\n"
         "  clear the flags; the copies get none, so set them again after the swap:\n"
@@ -769,16 +781,26 @@ def test_file_move_check_with_one_problem_says_so(checked: FileMoveEnv) -> None:
 
 
 def test_file_move_check_with_nothing_found_exits_0(checked: FileMoveEnv) -> None:
-    """With --delete-source it still only checks; the summary says the run's unmount still decides."""
+    """Exit 0 means no findings in the checked categories, and the narrow promise is printed all the same."""
     result = runner.invoke(cli.app, ["file-move", "--check", "--delete-source", "tank/media"])
 
     assert result.exit_code == 0, result.output
-    assert result.stdout == (
-        "nothing found that would stop file-move; the run still unmounts tank/media first and refuses if a writer "
-        "holds it\n"
-    )
+    assert result.stdout == NOT_CHECKED + "no findings in the checked categories\n"
     assert checked.sim.ops() == []
     assert not [call for call in checked.runner.calls if call[0] == "rsync"]
+
+
+def test_file_move_check_prints_names_that_are_no_utf8(checked: FileMoveEnv, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A file name with a byte that is no UTF-8 shows as an escape; the report goes on to its end."""
+    bad = checked.src / os.fsdecode(b"bad\xff")
+    bad.write_text("x")
+    immutable(monkeypatch, bad)
+
+    result = runner.invoke(cli.app, ["file-move", "--check", "tank/media"])
+
+    assert result.exit_code == 1, result.output
+    assert f"chattr -i '{checked.src}/bad\\xff'" in result.stdout
+    assert result.stdout.endswith("1 problem would stop file-move; fix it, then check again\n")
 
 
 def test_file_move_check_zfs_failure_is_one_error_line(checked: FileMoveEnv, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -789,6 +811,6 @@ def test_file_move_check_zfs_failure_is_one_error_line(checked: FileMoveEnv, mon
     result = runner.invoke(cli.app, ["file-move", "--check", "tank/media"])
 
     assert result.exit_code == 1
-    assert result.stdout == ""
+    assert result.stdout == NOT_CHECKED
     assert "error: zfs list -H -o name tank/media failed" in result.stderr
     assert checked.sim.ops() == []
