@@ -288,7 +288,7 @@ Takes the [shared options](#shared-options) and:
 | `--check` | none | off | Only report what would stop the run, with how to fix it; no ZFS, mount or lock changes; see [file-move --check](#file-move-check). It needs no `--delete-source`. |
 
 One run does the whole job, and a rerun after a stop before the swap continues where it left off.
-Stop everything that uses the dataset first, and keep it stopped until the swap; [`--check`](#file-move-check) lists what still uses it.
+Stop everything that uses the dataset first, and keep it stopped until the swap.
 Without `--delete-source` it refuses before it touches anything: `file-move deletes each source file once its encrypted copy is verified; pass --delete-source to confirm`.
 
 **`--check-prompt-with-key-file`.**
@@ -403,36 +403,35 @@ zfs-encrypt-migrate file-move tank/media --check
 ```
 
 Reports what would make `file-move` refuse or stall, in the categories below, each with the command or step that fixes it.
-It changes no ZFS state, mount or lock: it never mounts, unmounts, creates, snapshots, loads a key, sets a property or takes the run's lock, and it opens files only read-only, without updating their access times, to read their flags.
+It changes no ZFS state, mount or lock: it never unmounts, creates, snapshots, loads a key, sets a property or takes the run's lock, and it opens files only read-only, without updating their access times, to read their flags. Opening a directory can still trigger an autofs or systemd automount point inside the dataset.
 Give it the options of the real run (`--stage`, `--key-file` and the rest); it needs no `--delete-source`, and with `--delete-source` it still only checks.
 Run it as root, like `file-move`; without root it reports only that it needs root.
 
 It checks:
 
 - The first refusal of [step 2](#file-move), as the run gives it. Fix it and check again for the next.
-- Snapshots of the dataset mounted in any mount namespace, found by name in the mount table of every process and thread: a mounted snapshot keeps `zfs destroy` from removing it, and one under `.zfs/snapshot` makes the run's unmount fail with `busy`.
-- Filesystems mounted inside the dataset here, such as a tmpfs, another dataset or a bind mount: the run's unmount fails on them with `busy`.
+- Snapshots of the dataset mounted in any mount namespace that has a process, found by name in the mount table of every process and thread: a mounted snapshot keeps `zfs destroy` from removing it, and one under `.zfs/snapshot` makes the run's unmount fail with `busy`.
 - Immutable and append-only files and directories, read with the `FS_IOC_GETFLAGS` ioctl, so `lsattr` need not be installed: the run cannot delete them, or the files in them, and would stop at the first. Each comes with the `chattr` command that clears its flags, and the one that sets them again after the swap. An entry it cannot read is a problem too.
 
-It looks inside the dataset only when the kernel lists it as mounted where `zfs get mountpoint` says.
+It reads the flags only when the kernel lists the dataset as mounted where `zfs get mountpoint` says; otherwise that is a problem too.
 Every report starts with what it does not check, then lists each problem with its fixes and ends with a summary:
 
 ```text
-Not checked: processes or containers that hold the dataset, including container bind mounts. Stop them first. The run's unmount refuses while a holder is busy, but a container's private bind mount can survive it.
+Not checked: processes or containers that hold the dataset, including container bind mounts. Stop them first. The run's unmount refuses while a holder is busy, but a container's private bind mount can survive it. Nor is a snapshot mount seen that lies outside the root of every process in its mount namespace, as with a chroot.
 problem: tank/media has snapshots, which keep deleted files allocated: tank/media@daily-1
   disable snapshot tools for tank/media, then remove them: zfs destroy tank/media@daily-1
-problem: snapshot tank/media@daily-1 is mounted at /data/.zfs/snapshot/daily-1, as seen by PID 2345 (worker)
-  stop the processes or containers that hold it: a mounted snapshot keeps zfs destroy from removing it
+problem: snapshot tank/media@daily-1 is mounted at /data/.zfs/snapshot/daily-1, as seen by PID 2345
+  unmount it, or stop the processes or containers that hold it: zfs destroy cannot remove a mounted snapshot
 problem: tank/media has files or directories with the immutable or append-only flag, which keeps file-move from deleting them or the files in them
   clear the flags; the copies get none, so set them again after the swap:
     chattr -i /mnt/tank/media/a.txt  # after the swap: chattr +i /mnt/tank/media/a.txt
-3 problems would stop file-move; fix them, then check again
+3 problems would stop file-move
 ```
 
 It exits 1 on any problem. Exit 0, `no findings in the checked categories`, means only that: stop what holds the dataset first.
 While a `file-move` holds its lock, or the lock's state can't be read, it reports only `a file-move is running; check skipped` and reads nothing else.
 It opens each regular file and directory of the dataset for its flags, so on a big dataset it takes a while; don't start the run meanwhile, as its unmount would find the check's open files.
-A name that is not valid UTF-8 shows with `\x..` escapes.
+A name that is not valid UTF-8 shows with `\x..` escapes, and its fix is left to you.
 It can't check the free-space admission or the final key: both need the encrypted dataset, which the run creates (steps 6 and 7).
 
 ### file-move-status

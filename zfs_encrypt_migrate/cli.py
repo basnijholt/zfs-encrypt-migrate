@@ -201,7 +201,8 @@ def _refuse_unanswerable_prompt(final_keylocation: str, keyformat: Keyformat) ->
 
 _NOT_CHECKED = (
     "Not checked: processes or containers that hold the dataset, including container bind mounts. Stop them first. "
-    "The run's unmount refuses while a holder is busy, but a container's private bind mount can survive it."
+    "The run's unmount refuses while a holder is busy, but a container's private bind mount can survive it. "
+    "Nor is a snapshot mount seen that lies outside the root of every process in its mount namespace, as with a chroot."
 )
 
 
@@ -214,13 +215,12 @@ def _report_check(settings: Settings, dataset: str) -> None:
         print_error(error.message, error.hints)
         raise typer.Exit(1) from error
     count = len(problems)
-    summary = {
-        0: "no findings in the checked categories",
-        1: "1 problem would stop file-move; fix it, then check again",
-    }.get(count, f"{count} problems would stop file-move; fix them, then check again")
     for problem in problems:
         for line in (f"problem: {problem.message}", *(f"  {hint}" for hint in problem.hints)):
             console.print(line, markup=False, highlight=False, soft_wrap=True)
+    summary = (
+        f"{count} problem{'s' * (count > 1)} would stop file-move" if count else "no findings in the checked categories"
+    )
     console.print(summary, markup=False, highlight=False, soft_wrap=True)
     if count:
         raise typer.Exit(1)

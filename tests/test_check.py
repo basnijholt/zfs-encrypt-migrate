@@ -12,7 +12,7 @@ from zfs_encrypt_migrate.constants import SCRATCH
 from zfs_encrypt_migrate.filemove import _run_lock
 from zfs_encrypt_migrate.preflight import check_file_move
 
-from .fakeproc import FakeProc, mount_line
+from .fakeproc import SELF_PID, FakeProc, mount_line
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -92,27 +92,20 @@ def test_the_first_refusal_comes_with_what_only_the_check_finds(
     key_file: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The run's preflight stops at its first refusal; the snapshot mounts, mounts inside and flags still follow."""
+    """The run's preflight stops at its first refusal; the snapshot mounts and the flags still follow."""
     env = filemove_env
     key_file.chmod(0o644)
     env.sim.prop(DATASET, "readonly", "on")
     flagged(monkeypatch, str(env.src / "a.txt"))
     src = os.path.realpath(env.src)
-    extra = mount_line(200, 100, f"{src}/.zfs/snapshot/auto", f"{DATASET}@auto") + mount_line(
-        201,
-        100,
-        f"{src}/cache",
-        "tmpfs",
-        fstype="tmpfs",
-    )
+    extra = mount_line(200, 100, f"{src}/.zfs/snapshot/auto", f"{DATASET}@auto")
     proc = FakeProc(tmp_path / "proc", env.sim.mountinfo().decode() + extra)
 
     problems = check(env, settings, proc, tmp_path)
 
     assert [problem.message for problem in problems] == [
         f"key file {key_file} must have mode 600",
-        f"snapshot {DATASET}@auto is mounted at {src}/.zfs/snapshot/auto",
-        f"tmpfs tmpfs is mounted at {src}/cache, inside {DATASET}, which makes the run's unmount fail with busy",
+        f"snapshot {DATASET}@auto is mounted at {src}/.zfs/snapshot/auto, as seen by PID {SELF_PID}",
         (
             f"{DATASET} has files or directories with the immutable or append-only flag, which keeps file-move from "
             "deleting them or the files in them"
@@ -133,8 +126,26 @@ def test_a_path_that_is_not_the_dataset_is_never_read(
     read = flagged(monkeypatch, str(filemove_env.src / "a.txt"))
     assert [problem.message for problem in check(filemove_env, settings, proc, tmp_path)] == [
         f"{filemove_env.src} is not where {DATASET} is mounted (nothing is mounted there)",
+        f"could not check flags: {DATASET} is not mounted at {filemove_env.src}",
     ]
     assert read == []
+
+
+def test_a_dataset_gone_from_its_mountpoint_before_the_walk_is_reported(
+    filemove_env: FileMoveEnv,
+    settings: Settings,
+    proc: FakeProc,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A category the check could not cover is a problem, never a silent pass."""
+    monkeypatch.setattr(preflight, "mounted_at", lambda _path: None)
+    assert found(check(filemove_env, settings, proc, tmp_path)) == [
+        (
+            f"could not check flags: {DATASET} is not mounted at {filemove_env.src}",
+            ("mount it there, then check again",),
+        ),
+    ]
 
 
 def test_a_missing_dataset_is_the_refusal_alone(

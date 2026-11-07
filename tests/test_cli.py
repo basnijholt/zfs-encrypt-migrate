@@ -740,7 +740,9 @@ def checked(filemove_env: FileMoveEnv, tmp_path: Path, monkeypatch: pytest.Monke
 
 NOT_CHECKED = (
     "Not checked: processes or containers that hold the dataset, including container bind mounts. Stop them first. "
-    "The run's unmount refuses while a holder is busy, but a container's private bind mount can survive it.\n"
+    "The run's unmount refuses while a holder is busy, but a container's private bind mount can survive it. "
+    "Nor is a snapshot mount seen that lies outside the root of every process in its mount namespace, "
+    "as with a chroot.\n"
 )
 
 
@@ -765,19 +767,19 @@ def test_file_move_check_lists_problems_and_exits_1(checked: FileMoveEnv, monkey
         "from deleting them or the files in them\n"
         "  clear the flags; the copies get none, so set them again after the swap:\n"
         f"    chattr -i {flagged}  # after the swap: chattr +i {flagged}\n"
-        "2 problems would stop file-move; fix them, then check again\n"
+        "2 problems would stop file-move\n"
     )
     assert checked.sim.ops() == []
 
 
 def test_file_move_check_with_one_problem_says_so(checked: FileMoveEnv) -> None:
     """The summary counts in the singular too."""
-    checked.sim.prop("tank/media", "mounted", "no")
+    checked.sim.prop("tank/media", "readonly", "on")
 
     result = runner.invoke(cli.app, ["file-move", "--check", "tank/media"])
 
     assert result.exit_code == 1
-    assert result.stdout.splitlines()[-1] == "1 problem would stop file-move; fix it, then check again"
+    assert result.stdout.splitlines()[-1] == "1 problem would stop file-move"
 
 
 def test_file_move_check_with_nothing_found_exits_0(checked: FileMoveEnv) -> None:
@@ -799,8 +801,8 @@ def test_file_move_check_prints_names_that_are_no_utf8(checked: FileMoveEnv, mon
     result = runner.invoke(cli.app, ["file-move", "--check", "tank/media"])
 
     assert result.exit_code == 1, result.output
-    assert f"chattr -i '{checked.src}/bad\\xff'" in result.stdout
-    assert result.stdout.endswith("1 problem would stop file-move; fix it, then check again\n")
+    assert f"    {checked.src}/bad\\xff: its name is no valid UTF-8, so fix it by hand" in result.stdout
+    assert result.stdout.endswith("1 problem would stop file-move\n")
 
 
 def test_file_move_check_zfs_failure_is_one_error_line(checked: FileMoveEnv, monkeypatch: pytest.MonkeyPatch) -> None:
